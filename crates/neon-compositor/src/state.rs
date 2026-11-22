@@ -99,6 +99,9 @@ impl ClientData for NeonClientData {
 /// Callback invoked by `DmabufHandler::dmabuf_imported` to validate GPU buffer import.
 pub type DmabufImportHook = Box<dyn FnMut(&Dmabuf) -> bool>;
 
+/// Callback invoked when the user presses `Ctrl+Alt+F1..F12` on a bare-metal TTY session.
+pub type VtSwitchHook = Box<dyn FnMut(i32)>;
+
 /// Core NEON DE compositor state passed through `calloop` and `wayland-server` dispatch.
 pub struct NeonState {
     pub display_handle: DisplayHandle,
@@ -166,6 +169,8 @@ pub struct NeonState {
     pub frames_rendered: u64,
     pub idle_frames_skipped: u64,
     pub last_frame_time_us: u64,
+    /// Optional VT switching hook (wired to `LibSeatSession::change_vt` on DRM/KMS).
+    pub vt_switch_hook: Option<VtSwitchHook>,
 }
 
 impl NeonState {
@@ -250,6 +255,7 @@ impl NeonState {
             frames_rendered: 0,
             idle_frames_skipped: 0,
             last_frame_time_us: 0,
+            vt_switch_hook: None,
         }
     }
 
@@ -1078,9 +1084,49 @@ impl NeonState {
         }
     }
 
+    /// Clamps a logical pointer coordinate cleanly within the active output layout bounds.
+    pub fn clamp_pointer_location(&self, pos: Point<f64, Logical>) -> Point<f64, Logical> {
+        let outputs = self.output_manager.all_outputs();
+        if outputs.is_empty() {
+            let sz = self.output_logical_size();
+            return (
+                pos.x.clamp(0.0, (sz.w - 1).max(0) as f64),
+                pos.y.clamp(0.0, (sz.h - 1).max(0) as f64),
+            )
+                .into();
+        }
+        let mut min_x = f64::INFINITY;
+        let mut min_y = f64::INFINITY;
+        let mut max_x = f64::NEG_INFINITY;
+        let mut max_y = f64::NEG_INFINITY;
+        for out in outputs {
+            let r = out.logical_rect();
+            min_x = min_x.min(r.loc.x as f64);
+            min_y = min_y.min(r.loc.y as f64);
+            max_x = max_x.max((r.loc.x + r.size.w - 1).max(r.loc.x) as f64);
+            max_y = max_y.max((r.loc.y + r.size.h - 1).max(r.loc.y) as f64);
+        }
+        (pos.x.clamp(min_x, max_x), pos.y.clamp(min_y, max_y)).into()
+    }
+
+    /// Requests a VT switch (`1..=12`) on bare-metal sessions via `libseat`.
+    pub fn switch_vt(&mut self, vt: i32) {
+        if let Some(hook) = self.vt_switch_hook.as_mut() {
+            info!(vt, "Switching virtual terminal via libseat");
+            hook(vt);
+        }
+    }
+
     /// Spawns the first available Wayland-native terminal inside NEON DE.
     pub fn spawn_terminal(&self) {
-        const CANDIDATES: &[&str] = &["weston-terminal", "alacritty", "kitty", "foot"];
+        const CANDIDATES: &[&str] = &[
+            "alacritty",
+            "kitty",
+            "weston-terminal",
+            "foot",
+            "gnome-terminal",
+            "xterm",
+        ];
         for candidate in CANDIDATES {
             let found = Command::new("which")
                 .arg(candidate)

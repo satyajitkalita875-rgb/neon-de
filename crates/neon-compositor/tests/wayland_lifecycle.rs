@@ -1406,3 +1406,157 @@ fn ext_session_lock_isolates_focus_and_restores_on_unlock() {
         "compositor must return to unlocked state cleanly"
     );
 }
+
+#[test]
+fn relative_pointer_motion_and_vt_switch_work_for_bare_metal_input() {
+    use neon_compositor::input::process_input_event;
+    use smithay::backend::input::{
+        Device, DeviceCapability, Event as InputEventTrait, InputBackend, InputEvent, KeyState,
+        KeyboardKeyEvent, PointerMotionEvent, UnusedEvent,
+    };
+    use std::sync::{Arc, Mutex};
+
+    struct MockBackend;
+    #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+    struct MockDevice;
+    impl Device for MockDevice {
+        fn id(&self) -> String {
+            "mock".into()
+        }
+        fn name(&self) -> String {
+            "Mock Libinput".into()
+        }
+        fn has_capability(&self, _: DeviceCapability) -> bool {
+            true
+        }
+        fn usb_id(&self) -> Option<(u32, u32)> {
+            None
+        }
+        fn syspath(&self) -> Option<std::path::PathBuf> {
+            None
+        }
+    }
+    struct MockMotion {
+        dx: f64,
+        dy: f64,
+    }
+    impl InputEventTrait<MockBackend> for MockMotion {
+        fn time(&self) -> u64 {
+            1000
+        }
+        fn device(&self) -> MockDevice {
+            MockDevice
+        }
+    }
+    impl PointerMotionEvent<MockBackend> for MockMotion {
+        fn delta_x(&self) -> f64 {
+            self.dx
+        }
+        fn delta_y(&self) -> f64 {
+            self.dy
+        }
+        fn delta_x_unaccel(&self) -> f64 {
+            self.dx
+        }
+        fn delta_y_unaccel(&self) -> f64 {
+            self.dy
+        }
+    }
+    struct MockKey {
+        code: u32,
+        state: KeyState,
+    }
+    impl InputEventTrait<MockBackend> for MockKey {
+        fn time(&self) -> u64 {
+            2000
+        }
+        fn device(&self) -> MockDevice {
+            MockDevice
+        }
+    }
+    impl KeyboardKeyEvent<MockBackend> for MockKey {
+        fn key_code(&self) -> smithay::backend::input::Keycode {
+            self.code.into()
+        }
+        fn state(&self) -> KeyState {
+            self.state
+        }
+        fn count(&self) -> u32 {
+            1
+        }
+    }
+    impl InputBackend for MockBackend {
+        type Device = MockDevice;
+        type KeyboardKeyEvent = MockKey;
+        type PointerAxisEvent = UnusedEvent;
+        type PointerButtonEvent = UnusedEvent;
+        type PointerMotionEvent = MockMotion;
+        type PointerMotionAbsoluteEvent = UnusedEvent;
+        type GestureSwipeBeginEvent = UnusedEvent;
+        type GestureSwipeUpdateEvent = UnusedEvent;
+        type GestureSwipeEndEvent = UnusedEvent;
+        type GesturePinchBeginEvent = UnusedEvent;
+        type GesturePinchUpdateEvent = UnusedEvent;
+        type GesturePinchEndEvent = UnusedEvent;
+        type GestureHoldBeginEvent = UnusedEvent;
+        type GestureHoldEndEvent = UnusedEvent;
+        type TouchDownEvent = UnusedEvent;
+        type TouchMotionEvent = UnusedEvent;
+        type TouchUpEvent = UnusedEvent;
+        type TouchCancelEvent = UnusedEvent;
+        type TouchFrameEvent = UnusedEvent;
+        type TabletToolAxisEvent = UnusedEvent;
+        type TabletToolProximityEvent = UnusedEvent;
+        type TabletToolTipEvent = UnusedEvent;
+        type TabletToolButtonEvent = UnusedEvent;
+        type SwitchToggleEvent = UnusedEvent;
+        type SpecialEvent = UnusedEvent;
+    }
+
+    let (_event_loop, _display, mut state) = create_headless_server();
+    let start = state.pointer_location;
+    process_input_event::<MockBackend>(
+        &mut state,
+        InputEvent::PointerMotion {
+            event: MockMotion {
+                dx: 120.0,
+                dy: -50.0,
+            },
+        },
+    );
+    assert_eq!(state.pointer_location.x, start.x + 120.0);
+    assert_eq!(state.pointer_location.y, start.y - 50.0);
+
+    // Clamping prevents cursor from escaping output bounds
+    process_input_event::<MockBackend>(
+        &mut state,
+        InputEvent::PointerMotion {
+            event: MockMotion {
+                dx: 9999.0,
+                dy: 9999.0,
+            },
+        },
+    );
+    assert_eq!(state.pointer_location.x, 1279.0);
+    assert_eq!(state.pointer_location.y, 799.0);
+
+    // Verify Ctrl+Alt+F3 invokes vt_switch_hook(3)
+    let switched_vt = Arc::new(Mutex::new(None::<i32>));
+    let switched_clone = Arc::clone(&switched_vt);
+    state.vt_switch_hook = Some(Box::new(move |vt| {
+        *switched_clone.lock().unwrap() = Some(vt);
+    }));
+    // XKB keycodes: Left Ctrl = 37 (evdev 29+8), Left Alt = 64 (evdev 56+8), F3 = 69 (evdev 61+8)
+    for code in [37u32, 64, 69] {
+        process_input_event::<MockBackend>(
+            &mut state,
+            InputEvent::Keyboard {
+                event: MockKey {
+                    code,
+                    state: KeyState::Pressed,
+                },
+            },
+        );
+    }
+    assert_eq!(*switched_vt.lock().unwrap(), Some(3));
+}

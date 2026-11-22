@@ -109,6 +109,8 @@ pub struct NeonRenderer {
     border_cache: HashMap<WindowId, CachedBorder>,
     glass_cache: HashMap<WindowId, CachedGlass>,
     backdrop_cache: Option<CachedBackdrop>,
+    cursor_outer: SolidColorBuffer,
+    cursor_inner: SolidColorBuffer,
 }
 
 impl NeonRenderer {
@@ -140,6 +142,14 @@ impl NeonRenderer {
             border_cache: HashMap::new(),
             glass_cache: HashMap::new(),
             backdrop_cache: None,
+            cursor_outer: SolidColorBuffer::new(
+                Size::from((16, 16)),
+                Color32F::new(0.04, 0.06, 0.12, 0.96),
+            ),
+            cursor_inner: SolidColorBuffer::new(
+                Size::from((10, 10)),
+                Color32F::new(0.22, 0.74, 0.97, 1.0),
+            ),
         }
     }
 
@@ -191,28 +201,26 @@ impl NeonRenderer {
             .render_output(renderer, framebuffer, age, &elements, LOCK_CURTAIN_COLOR)
     }
 
-    /// Builds a crisp software pointer cursor overlay for bare-metal DRM/KMS outputs.
+    /// Builds a crisp software pointer cursor overlay for bare-metal DRM/KMS outputs using
+    /// persistent cached buffers so idle frames generate zero spurious damage.
     pub fn cursor_elements(
         &self,
         pointer_loc: Point<f64, Logical>,
+        output_origin: Point<i32, Logical>,
         scale_f: f64,
     ) -> Vec<NeonRenderElement> {
-        let px = pointer_loc.x.round() as i32;
-        let py = pointer_loc.y.round() as i32;
-        let outer =
-            SolidColorBuffer::new(Size::from((14, 14)), Color32F::new(0.05, 0.08, 0.14, 0.95));
-        let inner =
-            SolidColorBuffer::new(Size::from((10, 10)), Color32F::new(0.22, 0.74, 0.97, 1.0));
+        let px = pointer_loc.x.round() as i32 - output_origin.x;
+        let py = pointer_loc.y.round() as i32 - output_origin.y;
         vec![
             NeonRenderElement::from(SolidColorRenderElement::from_buffer(
-                &inner,
-                Point::<i32, Logical>::from((px + 2, py + 2)).to_physical_precise_round(scale_f),
+                &self.cursor_inner,
+                Point::<i32, Logical>::from((px + 3, py + 3)).to_physical_precise_round(scale_f),
                 scale_f,
                 1.0,
                 Kind::Cursor,
             )),
             NeonRenderElement::from(SolidColorRenderElement::from_buffer(
-                &outer,
+                &self.cursor_outer,
                 Point::<i32, Logical>::from((px, py)).to_physical_precise_round(scale_f),
                 scale_f,
                 1.0,

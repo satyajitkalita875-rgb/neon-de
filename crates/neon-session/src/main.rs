@@ -6,13 +6,10 @@
 
 use std::{
     collections::VecDeque,
-    fs,
+    fs::{self, OpenOptions},
     path::{Path, PathBuf},
-    process::{Child, Command, ExitCode},
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
+    process::{Child, Command, ExitCode, Stdio},
+    sync::atomic::{AtomicBool, Ordering},
     thread,
     time::{Duration, Instant},
 };
@@ -27,6 +24,26 @@ use tracing_subscriber::EnvFilter;
 
 const MAX_SHELL_RESTARTS_IN_WINDOW: usize = 5;
 const RESTART_WINDOW: Duration = Duration::from_secs(30);
+
+static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn handle_shutdown_signal(_sig: libc::c_int) {
+    SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
+}
+
+fn install_signal_handlers() {
+    // SAFETY: `handle_shutdown_signal` is async-signal-safe (only performs an atomic store).
+    unsafe {
+        libc::signal(
+            libc::SIGTERM,
+            handle_shutdown_signal as *const () as libc::sighandler_t,
+        );
+        libc::signal(
+            libc::SIGINT,
+            handle_shutdown_signal as *const () as libc::sighandler_t,
+        );
+    }
+}
 
 /// NEON DE Production Session Supervisor
 #[derive(Debug, Parser)]
@@ -137,6 +154,9 @@ fn run_session(cli: Cli) -> Result<ExitCode> {
 
     let state_dir = neon_state_dir();
     let _ = fs::create_dir_all(&state_dir);
+    let session_log_path = state_dir.join("session.log");
+    let standalone_drm = cli.drm || (std::env::var_os("WAYLAND_DISPLAY").is_none() && !cli.nested);
+    install_signal_handlers();
 
     info!(
         compositor = %compositor_bin.display(),
@@ -144,6 +164,7 @@ fn run_session(cli: Cli) -> Result<ExitCode> {
         wayland_display = %socket_name,
         ipc_socket = %ipc_socket.display(),
         safe_mode = cli.safe_mode,
+        standalone_drm,
         "Starting NEON DE supervised session"
     );
 
@@ -153,6 +174,18 @@ fn run_session(cli: Cli) -> Result<ExitCode> {
         .arg(&socket_name)
         .arg("--ipc-socket")
         .arg(&ipc_socket);
+
+    if standalone_drm
+        && let Ok(log_file) = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&session_log_path)
+        && let Ok(err_file) = log_file.try_clone()
+    {
+        comp_cmd.stdout(Stdio::from(log_file));
+        comp_cmd.stderr(Stdio::from(err_file));
+    }
 
     if cli.nested {
         comp_cmd
@@ -214,11 +247,11 @@ fn run_session(cli: Cli) -> Result<ExitCode> {
     };
 
     let mut restart_tracker = RestartTracker::new(MAX_SHELL_RESTARTS_IN_WINDOW, RESTART_WINDOW);
-    let shutdown_requested = Arc::new(AtomicBool::new(false));
 
     // Supervisor poll loop: monitors compositor health & auto-restarts `neon-shell` on crash.
     let exit_code = loop {
-        if shutdown_requested.load(Ordering::Relaxed) {
+        if SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
+            info!("Shutdown signal received; terminating NEON DE session cleanly");
             terminate_child(&mut shell_child);
             terminate_process(&mut compositor);
             break ExitCode::SUCCESS;
@@ -355,12 +388,12 @@ fn allocate_free_socket_name() -> String {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/tmp"));
     for idx in 0..64 {
-        let candidate = format!("neon-{idx}");
+        let candidate = format!("wayland-{idx}");
         if !runtime_dir.join(&candidate).exists() {
             return candidate;
         }
     }
-    format!("neon-{}", std::process::id())
+    format!("wayland-{}", std::process::id())
 }
 
 fn neon_state_dir() -> PathBuf {

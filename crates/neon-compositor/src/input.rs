@@ -5,6 +5,7 @@ use smithay::{
         AbsolutePositionEvent, Axis, AxisSource, ButtonState, Event, GestureBeginEvent,
         GestureEndEvent, GesturePinchUpdateEvent, GestureSwipeUpdateEvent, InputBackend,
         InputEvent, KeyState, KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent,
+        PointerMotionEvent,
     },
     input::{
         keyboard::{FilterResult, Keysym, keysyms},
@@ -33,6 +34,7 @@ const BTN_RIGHT: u32 = 0x111;
 
 enum CompositorAction {
     Quit,
+    SwitchVt(i32),
     SpawnTerminal,
     ToggleOverview,
     LockSession,
@@ -55,11 +57,31 @@ enum CompositorAction {
 pub fn process_input_event<B: InputBackend>(state: &mut NeonState, event: InputEvent<B>) {
     match event {
         InputEvent::Keyboard { event } => handle_keyboard::<B>(state, event),
+        InputEvent::PointerMotion { event } => handle_pointer_motion::<B>(state, event),
         InputEvent::PointerMotionAbsolute { event } => {
             handle_pointer_motion_absolute::<B>(state, event)
         }
         InputEvent::PointerButton { event } => handle_pointer_button::<B>(state, event),
         InputEvent::PointerAxis { event } => handle_pointer_axis::<B>(state, event),
+        InputEvent::TouchDown { event } => {
+            handle_touch_pointer::<B, _>(state, &event, Some(ButtonState::Pressed))
+        }
+        InputEvent::TouchMotion { event } => handle_touch_pointer::<B, _>(state, &event, None),
+        InputEvent::TouchUp { event } => {
+            if let Some(pointer) = state.seat.get_pointer() {
+                let serial = SERIAL_COUNTER.next_serial();
+                pointer.button(
+                    state,
+                    &ButtonEvent {
+                        button: BTN_LEFT,
+                        state: ButtonState::Released,
+                        serial,
+                        time: event.time_msec(),
+                    },
+                );
+                pointer.frame(state);
+            }
+        }
         InputEvent::GestureSwipeBegin { event } => handle_gesture_swipe_begin::<B>(state, event),
         InputEvent::GestureSwipeUpdate { event } => handle_gesture_swipe_update::<B>(state, event),
         InputEvent::GestureSwipeEnd { event } => handle_gesture_swipe_end::<B>(state, event),
@@ -90,6 +112,17 @@ fn handle_keyboard<B: InputBackend>(state: &mut NeonState, event: B::KeyboardKey
         serial,
         time,
         |_state, modifiers, handle| {
+            let sym = handle.modified_sym();
+
+            // Bare-metal TTY VT switching (Ctrl+Alt+F1..F12): always honored, even while locked.
+            if key_state == KeyState::Pressed
+                && (keysyms::KEY_XF86Switch_VT_1..=keysyms::KEY_XF86Switch_VT_12)
+                    .contains(&sym.raw())
+            {
+                let vt = (sym.raw() - keysyms::KEY_XF86Switch_VT_1 + 1) as i32;
+                return FilterResult::Intercept(CompositorAction::SwitchVt(vt));
+            }
+
             // Security invariant: while locked via ext_session_lock_v1, forward all keys strictly
             // to the lock screen surface and suppress compositor shortcuts.
             if is_locked {
@@ -99,11 +132,17 @@ fn handle_keyboard<B: InputBackend>(state: &mut NeonState, event: B::KeyboardKey
                 return FilterResult::Forward;
             }
 
-            let sym = handle.modified_sym();
-
             // Emergency / nested exit
             if modifiers.ctrl && modifiers.alt && sym == Keysym::from(keysyms::KEY_Escape) {
                 return FilterResult::Intercept(CompositorAction::Quit);
+            }
+
+            // Standard Linux terminal shortcut: Ctrl+Alt+T
+            if modifiers.ctrl
+                && modifiers.alt
+                && (sym == Keysym::from(keysyms::KEY_t) || sym == Keysym::from(keysyms::KEY_T))
+            {
+                return FilterResult::Intercept(CompositorAction::SpawnTerminal);
             }
 
             // Dynamic workspace navigation: Ctrl+Alt+Left/Right or Super+Page_Up/Page_Down
@@ -200,6 +239,10 @@ fn handle_keyboard<B: InputBackend>(state: &mut NeonState, event: B::KeyboardKey
                 return FilterResult::Intercept(CompositorAction::CloseFocused);
             }
 
+            if modifiers.alt && sym == Keysym::from(keysyms::KEY_F1) {
+                return FilterResult::Intercept(CompositorAction::ToggleOverview);
+            }
+
             if modifiers.alt && sym == Keysym::from(keysyms::KEY_Tab) {
                 return FilterResult::Intercept(CompositorAction::CycleFocus);
             }
@@ -211,9 +254,10 @@ fn handle_keyboard<B: InputBackend>(state: &mut NeonState, event: B::KeyboardKey
     if let Some(action) = action {
         match action {
             CompositorAction::Quit => {
-                info!("Ctrl+Alt+Escape pressed; exiting NEON DE nested session");
+                info!("Ctrl+Alt+Escape pressed; exiting NEON DE session");
                 state.loop_signal.stop();
             }
+            CompositorAction::SwitchVt(vt) => state.switch_vt(vt),
             CompositorAction::SpawnTerminal => state.spawn_terminal(),
             CompositorAction::ToggleOverview => {
                 state.toggle_overview(serial);
@@ -257,13 +301,11 @@ fn digit_keysym_to_workspace_index(sym: Keysym) -> Option<usize> {
     }
 }
 
-fn handle_pointer_motion_absolute<B: InputBackend>(
+fn apply_pointer_motion_at(
     state: &mut NeonState,
-    event: B::PointerMotionAbsoluteEvent,
+    pos: smithay::utils::Point<f64, smithay::utils::Logical>,
+    time: u32,
 ) {
-    let output_size = state.output_logical_size();
-    let output_geo = Rectangle::from_size(output_size);
-    let pos = event.position_transformed(output_geo.size) + output_geo.loc.to_f64();
     state.pointer_location = pos;
 
     let serial = SERIAL_COUNTER.next_serial();
@@ -292,6 +334,48 @@ fn handle_pointer_motion_absolute<B: InputBackend>(
             under,
             &MotionEvent {
                 location: pos,
+                serial,
+                time,
+            },
+        );
+        pointer.frame(state);
+    }
+}
+
+fn handle_pointer_motion<B: InputBackend>(state: &mut NeonState, event: B::PointerMotionEvent) {
+    let new_pos = state.clamp_pointer_location(state.pointer_location + event.delta());
+    apply_pointer_motion_at(state, new_pos, event.time_msec());
+}
+
+fn handle_pointer_motion_absolute<B: InputBackend>(
+    state: &mut NeonState,
+    event: B::PointerMotionAbsoluteEvent,
+) {
+    let output_size = state.output_logical_size();
+    let output_geo = Rectangle::from_size(output_size);
+    let pos = event.position_transformed(output_geo.size) + output_geo.loc.to_f64();
+    apply_pointer_motion_at(state, pos, event.time_msec());
+}
+
+fn handle_touch_pointer<B: InputBackend, E: AbsolutePositionEvent<B>>(
+    state: &mut NeonState,
+    event: &E,
+    button_state: Option<ButtonState>,
+) {
+    let output_size = state.output_logical_size();
+    let output_geo = Rectangle::from_size(output_size);
+    let pos = event.position_transformed(output_geo.size) + output_geo.loc.to_f64();
+    apply_pointer_motion_at(state, pos, event.time_msec());
+
+    if let Some(bstate) = button_state
+        && let Some(pointer) = state.seat.get_pointer()
+    {
+        let serial = SERIAL_COUNTER.next_serial();
+        pointer.button(
+            state,
+            &ButtonEvent {
+                button: BTN_LEFT,
+                state: bstate,
                 serial,
                 time: event.time_msec(),
             },

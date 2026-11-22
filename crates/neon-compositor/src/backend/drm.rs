@@ -31,6 +31,7 @@ use smithay::{
             output::{DrmOutput, DrmOutputManager, DrmOutputRenderElements},
         },
         egl::{EGLContext, EGLDisplay},
+        input::InputEvent,
         libinput::{LibinputInputBackend, LibinputSessionInterface},
         renderer::{ImportDma, gles::GlesRenderer},
         session::{Event as SessionEvent, Session, libseat::LibSeatSession},
@@ -45,7 +46,7 @@ use smithay::{
             timer::{TimeoutAction, Timer},
         },
         drm::control::{Device as ControlDevice, connector, crtc},
-        input::Libinput,
+        input::{DeviceCapability, Libinput},
         rustix::fs::OFlags,
         wayland_server::Display,
     },
@@ -87,7 +88,7 @@ struct ActiveDrmOutput {
     output: Output,
     drm_output: NeonDrmOutput,
     neon_renderer: NeonRenderer,
-    pending_vblank: bool,
+    pending_vblank_since: Option<std::time::Instant>,
 }
 
 struct DrmRuntime {
@@ -136,6 +137,14 @@ pub fn run_drm(config: DrmConfig) -> Result<()> {
     );
     state.backend_name = "drm-kms".to_string();
     state.safe_mode = config.safe_mode;
+    {
+        let mut session_for_vt = session.clone();
+        state.vt_switch_hook = Some(Box::new(move |vt| {
+            if let Err(err) = session_for_vt.change_vt(vt) {
+                warn!(vt, ?err, "Failed to switch VT via libseat");
+            }
+        }));
+    }
 
     let loaded_cfg = neon_config::load_or_default(&neon_config::default_config_path());
     state.apply_config(loaded_cfg);
@@ -339,7 +348,7 @@ pub fn run_drm(config: DrmConfig) -> Result<()> {
                         output,
                         drm_output,
                         neon_renderer,
-                        pending_vblank: false,
+                        pending_vblank_since: None,
                     },
                 );
             }
@@ -386,7 +395,23 @@ pub fn run_drm(config: DrmConfig) -> Result<()> {
 
     event_loop
         .handle()
-        .insert_source(libinput_backend, move |event, _, state| {
+        .insert_source(libinput_backend, move |mut event, _, state| {
+            if let InputEvent::DeviceAdded { ref mut device } = event {
+                let is_kbd = device.has_capability(DeviceCapability::Keyboard);
+                let is_ptr = device.has_capability(DeviceCapability::Pointer);
+                let is_touch = device.has_capability(DeviceCapability::Touch);
+                if device.config_tap_finger_count() > 0 {
+                    let _ = device.config_tap_set_enabled(true);
+                    let _ = device.config_dwt_set_enabled(true);
+                }
+                info!(
+                    device = %device.name(),
+                    keyboard = is_kbd,
+                    pointer = is_ptr,
+                    touch = is_touch,
+                    "Attached libinput device"
+                );
+            }
             process_input_event(state, event);
         })
         .map_err(|err| anyhow::anyhow!("Failed to insert libinput event source: {err}"))?;
@@ -407,6 +432,7 @@ pub fn run_drm(config: DrmConfig) -> Result<()> {
                 }
                 SessionEvent::ActivateSession => {
                     info!("VT reactivated — resuming DRM and libinput");
+                    libinput_ctrl.suspend();
                     if let Err(()) = libinput_ctrl.resume() {
                         warn!("Failed to resume libinput context");
                     }
@@ -415,7 +441,7 @@ pub fn run_drm(config: DrmConfig) -> Result<()> {
                         warn!(?err, "Failed to reactivate DRM device");
                     }
                     for out in rt.outputs.values_mut() {
-                        out.pending_vblank = false;
+                        out.pending_vblank_since = None;
                         out.drm_output.reset_buffers();
                     }
                     rt.paused = false;
@@ -436,7 +462,7 @@ pub fn run_drm(config: DrmConfig) -> Result<()> {
                         if let Err(err) = out.drm_output.frame_submitted() {
                             warn!(?crtc_handle, ?err, "DRM frame_submitted error");
                         }
-                        out.pending_vblank = false;
+                        out.pending_vblank_since = None;
                     }
                 }
                 DrmEvent::Error(err) => {
@@ -566,13 +592,22 @@ fn render_all_drm_outputs(rt: &mut DrmRuntime, state: &mut NeonState) {
         let Some(active) = rt.outputs.get_mut(&crtc_handle) else {
             continue;
         };
-        if active.pending_vblank {
-            continue;
+        if let Some(since) = active.pending_vblank_since {
+            if since.elapsed() < Duration::from_millis(500) {
+                continue;
+            }
+            warn!(crtc = ?active.crtc, "DRM VBlank watchdog expired; recovering output swapchain");
+            let _ = active.drm_output.frame_submitted();
+            active.pending_vblank_since = None;
         }
 
         let frame_start = std::time::Instant::now();
         let scale_f = active.output.current_scale().fractional_scale();
-        let mut elements = active.neon_renderer.cursor_elements(pointer_loc, scale_f);
+        let output_origin = active.output.current_location();
+        let mut elements =
+            active
+                .neon_renderer
+                .cursor_elements(pointer_loc, output_origin, scale_f);
         let clear_color = if is_locked {
             let lock_surface = state.lock_state.surface_for_output(&active.output.name());
             elements.extend(active.neon_renderer.collect_locked_elements(
@@ -603,7 +638,7 @@ fn render_all_drm_outputs(rt: &mut DrmRuntime, state: &mut NeonState) {
                     if let Err(err) = active.drm_output.queue_frame(()) {
                         warn!(crtc = ?active.crtc, ?err, "Failed to queue DRM frame");
                     } else {
-                        active.pending_vblank = true;
+                        active.pending_vblank_since = Some(std::time::Instant::now());
                         state.frames_rendered += 1;
                         state.last_frame_time_us = frame_start.elapsed().as_micros() as u64;
                     }
