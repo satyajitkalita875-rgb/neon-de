@@ -131,6 +131,8 @@ impl Default for EffectsConfigData {
 pub struct WindowConfigData {
     pub focus_mode: FocusMode,
     pub snap_gap: i32,
+    pub auto_snap: bool,
+    pub center_dialogs: bool,
     pub dynamic_workspaces: bool,
     pub static_workspace_count: usize,
 }
@@ -140,6 +142,8 @@ impl Default for WindowConfigData {
         Self {
             focus_mode: FocusMode::ClickToFocus,
             snap_gap: 0,
+            auto_snap: true,
+            center_dialogs: true,
             dynamic_workspaces: true,
             static_workspace_count: 4,
         }
@@ -195,6 +199,7 @@ impl Default for PanelConfigData {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct InputConfigData {
+    pub keyboard_layout: String,
     pub keyboard_repeat_rate: i32,
     pub keyboard_repeat_delay: i32,
     pub natural_scroll: bool,
@@ -205,6 +210,7 @@ pub struct InputConfigData {
 impl Default for InputConfigData {
     fn default() -> Self {
         Self {
+            keyboard_layout: "us".into(),
             keyboard_repeat_rate: 25,
             keyboard_repeat_delay: 600,
             natural_scroll: true,

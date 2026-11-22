@@ -1,27 +1,20 @@
-//! macOS-inspired settings detail pages wired live to `neon-config` and `neon-ipc`.
+//! Core settings controller, macOS × GNOME 47 boxed-list UI builders, and
+//! Customization pages (Appearance, Displays, Dock & Panels, Windows & Effects).
 
 use std::{cell::RefCell, path::PathBuf, rc::Rc};
 
 use gtk4::{
-    Align, Box as GtkBox, Button, DropDown, Label, Orientation, PolicyType, Scale, ScrolledWindow,
-    Separator, StringList, Switch, prelude::*,
+    Align, Box as GtkBox, Button, ContentFit, DropDown, FlowBox, Label, Orientation, Picture,
+    PolicyType, Scale, ScrolledWindow, SelectionMode, Separator, StringList, Switch, gio,
+    prelude::*,
 };
 use neon_config::{
-    DockPosition, FocusMode, NeonConfig, PanelPosition, ThemeMode, UiDensity, export_config,
-    save_atomic,
+    DockPosition, FocusMode, NeonConfig, PanelPosition, ThemeMode, UiDensity, save_atomic,
 };
 use neon_ipc::{IpcClient, IpcPayload, IpcRequest, IpcResult, OutputInfo};
-use neon_system::{
-    audio::{set_sink_mute, set_sink_volume},
-    bluetooth::set_bluetooth_powered,
-    network::set_wifi_enabled,
-    notifications::{NESTED_BUS_NAME, NotificationUrgency, send_dbus_notification},
-    power::set_power_profile,
-    query_system_snapshot,
-};
 use tracing::warn;
 
-use crate::{style::SettingsTheme, system_info::collect_hardware_summary};
+use crate::style::SettingsTheme;
 
 /// Shared controller syncing changes atomically to disk and live to `neon-compositor`.
 pub struct SettingsController {
@@ -42,43 +35,51 @@ impl SettingsController {
             Ok(()) => true,
             Err(err) => {
                 warn!(?err, "Failed to persist NEON DE config");
+                self.status_label.set_text(&format!("Save failed: {err}"));
                 false
             }
         };
 
-        let mut ipc_ok = false;
-        if let Some(request) = req
-            && let Ok(mut client) = IpcClient::connect(&self.ipc_socket)
-        {
-            ipc_ok = matches!(client.request(request), Ok(IpcResult::Ok { .. }));
+        if let Some(request) = req {
+            match self.send_ipc(request) {
+                Ok(_) => {
+                    if saved_ok {
+                        self.status_label
+                            .set_text(&format!("{note} — applied live & saved"));
+                    }
+                }
+                Err(err) => {
+                    if saved_ok {
+                        self.status_label
+                            .set_text(&format!("{note} — saved (compositor offline: {err})"));
+                    }
+                }
+            }
+        } else if saved_ok {
+            self.status_label
+                .set_text(&format!("{note} — saved to {}", self.config_path.display()));
         }
+    }
 
-        let status = match (saved_ok, ipc_ok) {
-            (true, true) => format!("{note} — saved & applied live"),
-            (true, false) => format!("{note} — saved to {}", self.config_path.display()),
-            (false, _) => format!("{note} — warning: could not write config file"),
-        };
-        self.status_label.set_text(&status);
+    pub fn send_ipc(&self, req: IpcRequest) -> Result<IpcResult, String> {
+        let mut client = IpcClient::connect(&self.ipc_socket).map_err(|e| e.to_string())?;
+        client.request(req).map_err(|e| e.to_string())
+    }
+
+    pub fn fetch_outputs(&self) -> Vec<OutputInfo> {
+        match self.send_ipc(IpcRequest::GetOutputs) {
+            Ok(IpcResult::Ok {
+                payload: IpcPayload::Outputs { outputs },
+            }) => outputs,
+            _ => Vec::new(),
+        }
     }
 
     pub fn push_full_config_live(&self) {
         let cfg = self.config.borrow().clone();
-        if let Ok(mut client) = IpcClient::connect(&self.ipc_socket) {
-            let _ = client.request(build_effects_request(&cfg));
-            let _ = client.request(build_appearance_request(&cfg));
-            let _ = client.request(build_window_behavior_request(&cfg));
-        }
-    }
-
-    pub fn fetch_outputs(&self) -> Vec<OutputInfo> {
-        if let Ok(mut client) = IpcClient::connect(&self.ipc_socket)
-            && let Ok(IpcResult::Ok {
-                payload: IpcPayload::Outputs { outputs },
-            }) = client.request(IpcRequest::GetOutputs)
-        {
-            return outputs;
-        }
-        Vec::new()
+        let _ = self.send_ipc(build_effects_request(&cfg));
+        let _ = self.send_ipc(build_appearance_request(&cfg));
+        let _ = self.send_ipc(build_window_behavior_request(&cfg));
     }
 }
 
@@ -122,128 +123,328 @@ pub fn build_window_behavior_request(cfg: &NeonConfig) -> IpcRequest {
     }
 }
 
-fn page_shell(title: &str, subtitle: &str) -> (ScrolledWindow, GtkBox) {
-    let vbox = GtkBox::new(Orientation::Vertical, 6);
-    vbox.add_css_class("settings-content");
+/// Centered clamped scrollable page container matching GNOME 47 / macOS System Settings.
+pub fn page_clamp() -> (ScrolledWindow, GtkBox) {
+    let outer = GtkBox::new(Orientation::Vertical, 0);
+    outer.set_halign(Align::Center);
+    outer.set_hexpand(true);
 
-    let h = Label::new(Some(title));
-    h.add_css_class("settings-page-title");
-    h.set_halign(Align::Start);
-
-    let sub = Label::new(Some(subtitle));
-    sub.add_css_class("settings-page-subtitle");
-    sub.set_halign(Align::Start);
-
-    vbox.append(&h);
-    vbox.append(&sub);
+    let column = GtkBox::new(Orientation::Vertical, 4);
+    column.add_css_class("settings-content-clamp");
+    column.set_width_request(600);
+    outer.append(&column);
 
     let scroller = ScrolledWindow::builder()
         .hscrollbar_policy(PolicyType::Never)
         .vscrollbar_policy(PolicyType::Automatic)
         .hexpand(true)
         .vexpand(true)
-        .child(&vbox)
+        .child(&outer)
         .build();
-    (scroller, vbox)
+    (scroller, column)
 }
 
-fn card(heading: &str) -> GtkBox {
-    let box_ = GtkBox::new(Orientation::Vertical, 10);
-    box_.add_css_class("settings-card");
-    let lbl = Label::new(Some(heading));
-    lbl.add_css_class("settings-card-title");
+pub fn section_heading(title: &str) -> Label {
+    let lbl = Label::new(Some(title));
+    lbl.add_css_class("settings-section-title");
     lbl.set_halign(Align::Start);
-    box_.append(&lbl);
-    box_
+    lbl
 }
 
-fn labeled_row(title: &str, desc: &str, control: &impl IsA<gtk4::Widget>) -> GtkBox {
+pub fn boxed_card() -> GtkBox {
+    let box_card = GtkBox::new(Orientation::Vertical, 0);
+    box_card.add_css_class("settings-card");
+    box_card
+}
+
+pub fn row_separator() -> Separator {
+    let sep = Separator::new(Orientation::Horizontal);
+    sep.add_css_class("settings-row-sep");
+    sep
+}
+
+pub fn setting_row(title: &str, subtitle: &str, control: &impl IsA<gtk4::Widget>) -> GtkBox {
     let row = GtkBox::new(Orientation::Horizontal, 16);
-    let left = GtkBox::new(Orientation::Vertical, 2);
-    left.set_hexpand(true);
+    row.add_css_class("settings-row");
+    row.set_valign(Align::Center);
+
+    let text = GtkBox::new(Orientation::Vertical, 2);
+    text.set_hexpand(true);
+    text.set_valign(Align::Center);
 
     let t = Label::new(Some(title));
     t.add_css_class("settings-row-title");
     t.set_halign(Align::Start);
+    text.append(&t);
 
-    let d = Label::new(Some(desc));
-    d.add_css_class("settings-row-desc");
-    d.set_halign(Align::Start);
-    d.set_wrap(true);
+    if !subtitle.is_empty() {
+        let s = Label::new(Some(subtitle));
+        s.add_css_class("settings-row-desc");
+        s.set_halign(Align::Start);
+        s.set_wrap(true);
+        text.append(&s);
+    }
 
-    left.append(&t);
-    left.append(&d);
-    row.append(&left);
+    row.append(&text);
     row.append(control);
     row
 }
 
-pub fn build_appearance_page(ctrl: Rc<SettingsController>) -> ScrolledWindow {
-    let (scroller, page) = page_shell(
-        "Appearance",
-        "Customize NEON DE theme, accent color, typography, and visual density.",
-    );
+pub fn append_rows(card: &GtkBox, rows: Vec<GtkBox>) {
+    for (idx, row) in rows.into_iter().enumerate() {
+        if idx > 0 {
+            card.append(&row_separator());
+        }
+        card.append(&row);
+    }
+}
 
-    let theme_card = card("THEME & ACCENT");
-    let themes = StringList::new(&["Neon Dark", "Neon Light", "Automatic"]);
-    let theme_dd = DropDown::new(Some(themes), gtk4::Expression::NONE);
-    let initial_idx = match ctrl.config.borrow().appearance.theme {
-        ThemeMode::NeonDark => 0,
-        ThemeMode::NeonLight => 1,
-        ThemeMode::Auto => 2,
-    };
-    theme_dd.set_selected(initial_idx);
+// ============================================================================
+// 1. APPEARANCE (Visual Style Preview + Accent Circles + Wallpaper Grid + KDE Options)
+// ============================================================================
+
+pub fn build_appearance_page(ctrl: Rc<SettingsController>) -> ScrolledWindow {
+    let (scroller, page) = page_clamp();
+
+    // --- Style Preview Cards (Light vs Dark) ---
+    page.append(&section_heading("Style"));
+    let style_card = boxed_card();
+    let preview_row = GtkBox::new(Orientation::Horizontal, 24);
+    preview_row.set_halign(Align::Center);
+    preview_row.set_margin_top(14);
+    preview_row.set_margin_bottom(14);
+
+    let light_btn = build_style_preview_card("Default", false);
+    let dark_btn = build_style_preview_card("Dark", true);
+
+    if ctrl.config.borrow().appearance.theme == ThemeMode::NeonLight {
+        light_btn.add_css_class("active");
+    } else {
+        dark_btn.add_css_class("active");
+    }
+
     {
         let ctrl = Rc::clone(&ctrl);
-        theme_dd.connect_selected_notify(move |dd| {
-            let mode = match dd.selected() {
-                1 => ThemeMode::NeonLight,
-                2 => ThemeMode::Auto,
-                _ => ThemeMode::NeonDark,
-            };
-            ctrl.config.borrow_mut().appearance.theme = mode;
+        let l = light_btn.clone();
+        let d = dark_btn.clone();
+        light_btn.connect_clicked(move |_| {
+            ctrl.config.borrow_mut().appearance.theme = ThemeMode::NeonLight;
+            l.add_css_class("active");
+            d.remove_css_class("active");
             let req = build_appearance_request(&ctrl.config.borrow());
-            ctrl.persist_and_sync(Some(req), "Updated theme");
+            ctrl.persist_and_sync(Some(req), "Switched to Neon Light");
         });
     }
-    theme_card.append(&labeled_row(
-        "Color Theme",
-        "Switches Neon Dark / Neon Light across shell panels, dock, overview, and settings.",
-        &theme_dd,
-    ));
-
-    // Accent color swatches
-    let swatch_box = GtkBox::new(Orientation::Horizontal, 8);
-    const SWATCHES: &[(&str, &str)] = &[
-        ("Cyan", "#38BDF8"),
-        ("Violet", "#A855F7"),
-        ("Emerald", "#10B981"),
-        ("Amber", "#F59E0B"),
-        ("Rose", "#F43F5E"),
-    ];
-    for &(label, hex) in SWATCHES {
-        let btn = Button::with_label(label);
-        btn.add_css_class("settings-secondary-btn");
+    {
         let ctrl = Rc::clone(&ctrl);
-        let hex_owned = hex.to_string();
-        btn.connect_clicked(move |_| {
-            ctrl.config.borrow_mut().appearance.accent_color = hex_owned.clone();
+        let l = light_btn.clone();
+        let d = dark_btn.clone();
+        dark_btn.connect_clicked(move |_| {
+            ctrl.config.borrow_mut().appearance.theme = ThemeMode::NeonDark;
+            d.add_css_class("active");
+            l.remove_css_class("active");
             let req = build_appearance_request(&ctrl.config.borrow());
-            ctrl.persist_and_sync(Some(req), &format!("Accent set to {label}"));
+            ctrl.persist_and_sync(Some(req), "Switched to Neon Dark");
         });
-        swatch_box.append(&btn);
     }
-    theme_card.append(&Separator::new(Orientation::Horizontal));
-    theme_card.append(&labeled_row(
-        "Accent Colour",
-        "Updates active window focus rings, workspace pills, and controls live.",
-        &swatch_box,
-    ));
-    page.append(&theme_card);
 
-    let typo_card = card("TYPOGRAPHY & DENSITY");
-    let densities = StringList::new(&["Compact", "Comfortable", "Spacious"]);
-    let density_dd = DropDown::new(Some(densities), gtk4::Expression::NONE);
+    preview_row.append(&light_btn);
+    preview_row.append(&dark_btn);
+    style_card.append(&preview_row);
+    style_card.append(&row_separator());
+
+    // Circular Colored Accent Swatches
+    let swatch_row = GtkBox::new(Orientation::Horizontal, 10);
+    swatch_row.set_valign(Align::Center);
+    let current_accent = ctrl.config.borrow().appearance.accent_color.to_uppercase();
+    let swatch_defs = [
+        ("Blue", "#0A84FF", "accent-blue"),
+        ("Cyan", "#38BDF8", "accent-cyan"),
+        ("Violet", "#8B5CF6", "accent-violet"),
+        ("Emerald", "#10B981", "accent-emerald"),
+        ("Amber", "#F59E0B", "accent-amber"),
+        ("Rose", "#F43F5E", "accent-rose"),
+        ("Pink", "#EC4899", "accent-pink"),
+    ];
+    let swatch_buttons: Rc<RefCell<Vec<(Button, &'static str)>>> =
+        Rc::new(RefCell::new(Vec::new()));
+    for (name, hex, css_cls) in swatch_defs {
+        let btn = Button::new();
+        btn.add_css_class("accent-circle");
+        btn.add_css_class(css_cls);
+        btn.set_tooltip_text(Some(name));
+        if current_accent == hex {
+            btn.add_css_class("active");
+        }
+        swatch_buttons.borrow_mut().push((btn.clone(), hex));
+        swatch_row.append(&btn);
+    }
+    for (btn, hex) in swatch_buttons.borrow().iter() {
+        let ctrl = Rc::clone(&ctrl);
+        let all = Rc::clone(&swatch_buttons);
+        let hex_str = (*hex).to_string();
+        btn.connect_clicked(move |_| {
+            ctrl.config.borrow_mut().appearance.accent_color = hex_str.clone();
+            for (b, h) in all.borrow().iter() {
+                if *h == hex_str {
+                    b.add_css_class("active");
+                } else {
+                    b.remove_css_class("active");
+                }
+            }
+            let req = build_appearance_request(&ctrl.config.borrow());
+            ctrl.persist_and_sync(Some(req), &format!("Accent color set to {hex_str}"));
+        });
+    }
+    style_card.append(&setting_row(
+        "Accent Color",
+        "Applies live to focus rings, Control Center, dock dots, and controls.",
+        &swatch_row,
+    ));
+    page.append(&style_card);
+
+    // --- Background Wallpaper Visual Thumbnail Grid ---
+    let bg_header = GtkBox::new(Orientation::Horizontal, 8);
+    let bg_title = section_heading("Background");
+    bg_title.set_hexpand(true);
+    let auto_wp_btn = Button::with_label("Match Theme");
+    auto_wp_btn.add_css_class("settings-secondary-btn");
+    auto_wp_btn.set_valign(Align::Center);
+    bg_header.append(&bg_title);
+    bg_header.append(&auto_wp_btn);
+    page.append(&bg_header);
+
+    let wp_card = boxed_card();
+    let wp_flow = FlowBox::new();
+    wp_flow.set_selection_mode(SelectionMode::None);
+    wp_flow.set_column_spacing(10);
+    wp_flow.set_row_spacing(10);
+    wp_flow.set_max_children_per_line(3);
+    wp_flow.set_min_children_per_line(3);
+    wp_flow.set_homogeneous(true);
+    wp_flow.set_margin_top(12);
+    wp_flow.set_margin_bottom(12);
+    wp_flow.set_margin_start(14);
+    wp_flow.set_margin_end(14);
+
+    let wp_buttons: Rc<RefCell<Vec<(Button, String)>>> = Rc::new(RefCell::new(Vec::new()));
+    let active_wp = ctrl.config.borrow().appearance.wallpaper_path.clone();
+
+    for wp_path in discover_wallpapers().into_iter().take(12) {
+        let path_str = wp_path.to_string_lossy().into_owned();
+        let name = wp_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("Wallpaper")
+            .replace(['-', '_'], " ");
+
+        let pic = Picture::for_file(&gio::File::for_path(&wp_path));
+        pic.set_content_fit(ContentFit::Cover);
+        pic.set_can_shrink(true);
+        pic.set_size_request(164, 102);
+        pic.add_css_class("wp-thumb-pic");
+
+        let btn = Button::new();
+        btn.add_css_class("wp-thumb-btn");
+        btn.set_tooltip_text(Some(&name));
+        btn.set_child(Some(&pic));
+        if active_wp.as_deref() == Some(path_str.as_str()) {
+            btn.add_css_class("active");
+        }
+        wp_buttons.borrow_mut().push((btn.clone(), path_str));
+        wp_flow.insert(&btn, -1);
+    }
+
+    for (btn, path_str) in wp_buttons.borrow().iter() {
+        let ctrl = Rc::clone(&ctrl);
+        let all = Rc::clone(&wp_buttons);
+        let chosen = path_str.clone();
+        btn.connect_clicked(move |_| {
+            ctrl.config.borrow_mut().appearance.wallpaper_path = Some(chosen.clone());
+            for (b, p) in all.borrow().iter() {
+                if *p == chosen {
+                    b.add_css_class("active");
+                } else {
+                    b.remove_css_class("active");
+                }
+            }
+            let req = build_appearance_request(&ctrl.config.borrow());
+            ctrl.persist_and_sync(Some(req), "Updated desktop wallpaper");
+        });
+    }
+    {
+        let ctrl = Rc::clone(&ctrl);
+        let all = Rc::clone(&wp_buttons);
+        auto_wp_btn.connect_clicked(move |_| {
+            ctrl.config.borrow_mut().appearance.wallpaper_path = None;
+            for (b, _) in all.borrow().iter() {
+                b.remove_css_class("active");
+            }
+            let req = build_appearance_request(&ctrl.config.borrow());
+            ctrl.persist_and_sync(Some(req), "Reset wallpaper to automatic theme match");
+        });
+    }
+
+    wp_card.append(&wp_flow);
+    page.append(&wp_card);
+
+    // --- KDE-Level Icons, Cursor & Typography ---
+    page.append(&section_heading("Icons, Cursor & Typography"));
+    let kde_card = boxed_card();
+
+    let icon_themes =
+        StringList::new(&["WhiteSur-dark", "WhiteSur-light", "Papirus-Dark", "Adwaita"]);
+    let icon_dd = DropDown::new(Some(icon_themes), gtk4::Expression::NONE);
+    icon_dd.set_valign(Align::Center);
+    icon_dd.set_selected(match ctrl.config.borrow().appearance.icon_theme.as_str() {
+        "WhiteSur-light" => 1,
+        "Papirus-Dark" => 2,
+        "Adwaita" => 3,
+        _ => 0,
+    });
+    {
+        let ctrl = Rc::clone(&ctrl);
+        icon_dd.connect_selected_notify(move |dd| {
+            let name = match dd.selected() {
+                1 => "WhiteSur-light",
+                2 => "Papirus-Dark",
+                3 => "Adwaita",
+                _ => "WhiteSur-dark",
+            };
+            ctrl.config.borrow_mut().appearance.icon_theme = name.into();
+            if let Some(s) = gtk4::Settings::default() {
+                s.set_gtk_icon_theme_name(Some(name));
+            }
+            ctrl.persist_and_sync(None, &format!("Set icon theme to {name}"));
+        });
+    }
+
+    let cursor_themes = StringList::new(&["Bibata-Modern-Ice", "Adwaita", "breeze_cursors"]);
+    let cursor_dd = DropDown::new(Some(cursor_themes), gtk4::Expression::NONE);
+    cursor_dd.set_valign(Align::Center);
+    cursor_dd.set_selected(
+        match ctrl.config.borrow().appearance.cursor_theme.as_str() {
+            "Adwaita" => 1,
+            "breeze_cursors" => 2,
+            _ => 0,
+        },
+    );
+    {
+        let ctrl = Rc::clone(&ctrl);
+        cursor_dd.connect_selected_notify(move |dd| {
+            let name = match dd.selected() {
+                1 => "Adwaita",
+                2 => "breeze_cursors",
+                _ => "Bibata-Modern-Ice",
+            };
+            ctrl.config.borrow_mut().appearance.cursor_theme = name.into();
+            ctrl.persist_and_sync(None, &format!("Set cursor theme to {name}"));
+        });
+    }
+
+    let density_opts = StringList::new(&["Compact", "Comfortable", "Spacious"]);
+    let density_dd = DropDown::new(Some(density_opts), gtk4::Expression::NONE);
+    density_dd.set_valign(Align::Center);
     density_dd.set_selected(match ctrl.config.borrow().appearance.ui_density {
         UiDensity::Compact => 0,
         UiDensity::Comfortable => 1,
@@ -260,13 +461,9 @@ pub fn build_appearance_page(ctrl: Rc<SettingsController>) -> ScrolledWindow {
             ctrl.persist_and_sync(None, "Updated UI density");
         });
     }
-    typo_card.append(&labeled_row(
-        "Interface Density",
-        "Controls spacing across native NEON DE applications.",
-        &density_dd,
-    ));
 
     let font_scale = Scale::with_range(Orientation::Horizontal, 9.0, 18.0, 1.0);
+    font_scale.add_css_class("settings-scale");
     font_scale.set_width_request(180);
     font_scale.set_draw_value(true);
     font_scale.set_value(f64::from(ctrl.config.borrow().appearance.font_size));
@@ -274,54 +471,69 @@ pub fn build_appearance_page(ctrl: Rc<SettingsController>) -> ScrolledWindow {
         let ctrl = Rc::clone(&ctrl);
         font_scale.connect_value_changed(move |s| {
             ctrl.config.borrow_mut().appearance.font_size = s.value().round() as u8;
-            ctrl.persist_and_sync(None, "Updated font size");
+            ctrl.persist_and_sync(None, "Updated base font size");
         });
     }
-    typo_card.append(&Separator::new(Orientation::Horizontal));
-    typo_card.append(&labeled_row(
-        "Base Font Size",
-        "Preferred UI font point size.",
-        &font_scale,
-    ));
-    page.append(&typo_card);
 
-    // Live Desktop Wallpaper Picker
-    let wp_card = card("WALLPAPER");
-    let discovered = discover_wallpapers();
-    let mut wp_labels: Vec<String> = vec!["Automatic (Match Dark/Light Theme)".to_string()];
-    let mut wp_paths: Vec<Option<String>> = vec![None];
-    for p in discovered {
-        if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
-            wp_labels.push(stem.replace(['-', '_'], " "));
-            wp_paths.push(Some(p.to_string_lossy().into_owned()));
-        }
-    }
-    let wp_label_refs: Vec<&str> = wp_labels.iter().map(String::as_str).collect();
-    let wp_model = StringList::new(&wp_label_refs);
-    let wp_dd = DropDown::new(Some(wp_model), gtk4::Expression::NONE);
-    wp_dd.set_valign(Align::Center);
-    let current_wp = ctrl.config.borrow().appearance.wallpaper_path.clone();
-    if let Some(idx) = wp_paths.iter().position(|p| p == &current_wp) {
-        wp_dd.set_selected(idx as u32);
-    }
-    {
-        let ctrl = Rc::clone(&ctrl);
-        wp_dd.connect_selected_notify(move |dd| {
-            let idx = dd.selected() as usize;
-            let chosen = wp_paths.get(idx).cloned().flatten();
-            ctrl.config.borrow_mut().appearance.wallpaper_path = chosen;
-            let req = build_appearance_request(&ctrl.config.borrow());
-            ctrl.persist_and_sync(Some(req), "Updated desktop wallpaper");
-        });
-    }
-    wp_card.append(&labeled_row(
-        "Desktop Wallpaper",
-        "Applies live to NEON DE's background layer.",
-        &wp_dd,
-    ));
-    page.append(&wp_card);
+    append_rows(
+        &kde_card,
+        vec![
+            setting_row(
+                "Icon Pack",
+                "Default macOS WhiteSur squircle icons.",
+                &icon_dd,
+            ),
+            setting_row(
+                "Cursor Theme",
+                "Applied to bare-metal XCursor rendering.",
+                &cursor_dd,
+            ),
+            setting_row(
+                "Interface Density",
+                "Controls widget padding across NEON DE.",
+                &density_dd,
+            ),
+            setting_row("Font Size", "Preferred UI text point size.", &font_scale),
+        ],
+    );
+    page.append(&kde_card);
 
     scroller
+}
+
+fn build_style_preview_card(label: &str, dark: bool) -> Button {
+    let btn = Button::new();
+    btn.add_css_class("style-preview-btn");
+
+    let vbox = GtkBox::new(Orientation::Vertical, 8);
+    vbox.set_halign(Align::Center);
+
+    let frame = GtkBox::new(Orientation::Vertical, 0);
+    frame.add_css_class("style-preview-frame");
+    frame.add_css_class(if dark {
+        "style-preview-dark-bg"
+    } else {
+        "style-preview-light-bg"
+    });
+    frame.set_halign(Align::Center);
+    frame.set_valign(Align::Center);
+
+    let mini = GtkBox::new(Orientation::Vertical, 0);
+    mini.add_css_class(if dark {
+        "style-mini-win-dark"
+    } else {
+        "style-mini-win-light"
+    });
+    mini.set_halign(Align::Center);
+    mini.set_valign(Align::Center);
+    frame.append(&mini);
+
+    let lbl = Label::new(Some(label));
+    lbl.add_css_class("settings-row-title");
+    vbox.append(&frame);
+    vbox.append(&lbl);
+    btn.set_child(Some(&vbox));
+    btn
 }
 
 fn discover_wallpapers() -> Vec<PathBuf> {
@@ -352,40 +564,32 @@ fn discover_wallpapers() -> Vec<PathBuf> {
     found
 }
 
+// ============================================================================
+// 2. DISPLAYS
+// ============================================================================
+
 pub fn build_displays_page(ctrl: Rc<SettingsController>) -> ScrolledWindow {
-    let (scroller, page) = page_shell(
-        "Displays",
-        "Configure connected monitors, fractional HiDPI scaling, rotation, and primary output.",
-    );
+    let (scroller, page) = page_clamp();
+    page.append(&section_heading("Connected Displays"));
 
     let outputs = ctrl.fetch_outputs();
     if outputs.is_empty() {
-        let empty = card("CONNECTED DISPLAYS");
-        empty.append(&Label::new(Some(
-            "Connect neon-settings inside a running NEON DE session to configure live outputs.",
-        )));
-        page.append(&empty);
+        let card = boxed_card();
+        card.append(&setting_row(
+            "No Active Compositor Outputs",
+            "Launch neon-settings inside a running NEON DE session to configure live scaling and rotation.",
+            &Label::new(Some("Offline")),
+        ));
+        page.append(&card);
         return scroller;
     }
 
     for out in outputs {
-        let out_card = card(&format!(
-            "{}  ({}x{} @ {:.1} Hz)",
-            out.name,
-            out.width,
-            out.height,
-            out.refresh_mhz as f64 / 1000.0
-        ));
-
-        let scale_opts = StringList::new(&[
-            "1.0x (100%)",
-            "1.25x (125%)",
-            "1.5x (150%)",
-            "1.75x (175%)",
-            "2.0x (200%)",
-        ]);
+        let card = boxed_card();
+        let scale_opts = StringList::new(&["100%", "125%", "150%", "175%", "200%"]);
         let scale_dd = DropDown::new(Some(scale_opts), gtk4::Expression::NONE);
-        let init_scale_idx = if out.scale >= 1.9 {
+        scale_dd.set_valign(Align::Center);
+        scale_dd.set_selected(if out.scale >= 1.9 {
             4
         } else if out.scale >= 1.65 {
             3
@@ -395,12 +599,16 @@ pub fn build_displays_page(ctrl: Rc<SettingsController>) -> ScrolledWindow {
             1
         } else {
             0
-        };
-        scale_dd.set_selected(init_scale_idx);
+        });
 
-        let rot_opts =
-            StringList::new(&["Normal (0°)", "Rotate 90°", "Rotate 180°", "Rotate 270°"]);
+        let rot_opts = StringList::new(&[
+            "Landscape (0°)",
+            "Portrait Right (90°)",
+            "Flipped (180°)",
+            "Portrait Left (270°)",
+        ]);
         let rot_dd = DropDown::new(Some(rot_opts), gtk4::Expression::NONE);
+        rot_dd.set_valign(Align::Center);
         rot_dd.set_selected(match out.transform.as_str() {
             "rotate90" => 1,
             "rotate180" => 2,
@@ -408,22 +616,22 @@ pub fn build_displays_page(ctrl: Rc<SettingsController>) -> ScrolledWindow {
             _ => 0,
         });
 
-        let apply_btn = Button::with_label("Apply Display Changes");
+        let apply_btn = Button::with_label("Apply");
         apply_btn.add_css_class("settings-action-btn");
         {
             let ctrl = Rc::clone(&ctrl);
             let out_name = out.name.clone();
-            let scale_dd = scale_dd.clone();
-            let rot_dd = rot_dd.clone();
+            let scale_c = scale_dd.clone();
+            let rot_c = rot_dd.clone();
             apply_btn.connect_clicked(move |_| {
-                let scale = match scale_dd.selected() {
+                let scale = match scale_c.selected() {
                     1 => 1.25,
                     2 => 1.5,
                     3 => 1.75,
                     4 => 2.0,
                     _ => 1.0,
                 };
-                let transform = match rot_dd.selected() {
+                let transform = match rot_c.selected() {
                     1 => "rotate90",
                     2 => "rotate180",
                     3 => "rotate270",
@@ -434,132 +642,62 @@ pub fn build_displays_page(ctrl: Rc<SettingsController>) -> ScrolledWindow {
                     x: None,
                     y: None,
                     scale: Some(scale),
-                    primary: Some(true),
+                    primary: None,
                     transform: Some(transform.into()),
                 };
-                ctrl.persist_and_sync(Some(req), &format!("Configured {out_name} ({scale}x)"));
+                ctrl.persist_and_sync(Some(req), &format!("Updated display {out_name}"));
             });
         }
 
-        out_card.append(&labeled_row(
-            "Fractional Scale",
-            "Broadcasts wp_fractional_scale_v1 preferred scale live to all clients.",
-            &scale_dd,
-        ));
-        out_card.append(&Separator::new(Orientation::Horizontal));
-        out_card.append(&labeled_row(
-            "Rotation",
-            "Adjust display orientation.",
-            &rot_dd,
-        ));
-        out_card.append(&Separator::new(Orientation::Horizontal));
-        out_card.append(&labeled_row(
-            "Apply Layout",
-            "Updates the active compositor output immediately.",
-            &apply_btn,
-        ));
-        page.append(&out_card);
+        let res_lbl = Label::new(Some(&format!(
+            "{} × {} @ {:.0} Hz",
+            out.width,
+            out.height,
+            out.refresh_mhz as f64 / 1000.0
+        )));
+        res_lbl.add_css_class("settings-badge");
+
+        append_rows(
+            &card,
+            vec![
+                setting_row(
+                    &out.name,
+                    if out.primary {
+                        "Primary Display"
+                    } else {
+                        "Secondary Display"
+                    },
+                    &res_lbl,
+                ),
+                setting_row(
+                    "Scale",
+                    "Fractional HiDPI scaling (wp_fractional_scale_v1).",
+                    &scale_dd,
+                ),
+                setting_row("Orientation", "Display transform rotation.", &rot_dd),
+                setting_row(
+                    "Apply Output Changes",
+                    "Updates monitor geometry live without restart.",
+                    &apply_btn,
+                ),
+            ],
+        );
+        page.append(&card);
     }
 
     scroller
 }
 
-pub fn build_windows_desktop_page(ctrl: Rc<SettingsController>) -> ScrolledWindow {
-    let (scroller, page) = page_shell(
-        "Desktop & Windows",
-        "Manage floating window focus policies, smart edge snapping, and dynamic workspaces.",
-    );
-
-    let win_card = card("WINDOW BEHAVIOUR");
-    let ffm_switch = Switch::new();
-    ffm_switch.set_valign(Align::Center);
-    ffm_switch.set_active(ctrl.config.borrow().windows.focus_mode == FocusMode::FocusFollowsMouse);
-    {
-        let ctrl = Rc::clone(&ctrl);
-        ffm_switch.connect_state_set(move |_, active| {
-            ctrl.config.borrow_mut().windows.focus_mode = if active {
-                FocusMode::FocusFollowsMouse
-            } else {
-                FocusMode::ClickToFocus
-            };
-            let req = build_window_behavior_request(&ctrl.config.borrow());
-            ctrl.persist_and_sync(Some(req), "Updated window focus policy");
-            gtk4::glib::Propagation::Proceed
-        });
-    }
-    win_card.append(&labeled_row(
-        "Focus Follows Mouse",
-        "Hovering over a window transfers keyboard focus automatically without clicking.",
-        &ffm_switch,
-    ));
-
-    let gap_scale = Scale::with_range(Orientation::Horizontal, 0.0, 24.0, 2.0);
-    gap_scale.set_width_request(180);
-    gap_scale.set_draw_value(true);
-    gap_scale.set_value(f64::from(ctrl.config.borrow().windows.snap_gap));
-    {
-        let ctrl = Rc::clone(&ctrl);
-        gap_scale.connect_value_changed(move |s| {
-            ctrl.config.borrow_mut().windows.snap_gap = s.value().round() as i32;
-            let req = build_window_behavior_request(&ctrl.config.borrow());
-            ctrl.persist_and_sync(Some(req), "Updated snap gap");
-        });
-    }
-    win_card.append(&Separator::new(Orientation::Horizontal));
-    win_card.append(&labeled_row(
-        "Smart Snap Gap (px)",
-        "Spacing around half-screen and quarter-screen snapped windows.",
-        &gap_scale,
-    ));
-    page.append(&win_card);
-
-    let ws_card = card("WORKSPACES & OVERVIEW");
-    let dyn_ws_switch = Switch::new();
-    dyn_ws_switch.set_valign(Align::Center);
-    dyn_ws_switch.set_active(ctrl.config.borrow().windows.dynamic_workspaces);
-    {
-        let ctrl = Rc::clone(&ctrl);
-        dyn_ws_switch.connect_state_set(move |_, active| {
-            ctrl.config.borrow_mut().windows.dynamic_workspaces = active;
-            ctrl.persist_and_sync(None, "Updated dynamic workspaces preference");
-            gtk4::glib::Propagation::Proceed
-        });
-    }
-    ws_card.append(&labeled_row(
-        "Dynamic Workspaces",
-        "Automatically create a trailing workspace and prune unused empty workspaces.",
-        &dyn_ws_switch,
-    ));
-
-    let overview_btn = Button::with_label("Open Activities Overview");
-    overview_btn.add_css_class("settings-secondary-btn");
-    {
-        let ctrl = Rc::clone(&ctrl);
-        overview_btn.connect_clicked(move |_| {
-            ctrl.persist_and_sync(
-                Some(IpcRequest::ToggleOverview),
-                "Toggled Activities Overview",
-            );
-        });
-    }
-    ws_card.append(&Separator::new(Orientation::Horizontal));
-    ws_card.append(&labeled_row(
-        "Activities Overview",
-        "Preview workspaces, search open windows, and launch XDG applications (Super+Space).",
-        &overview_btn,
-    ));
-    page.append(&ws_card);
-
-    scroller
-}
+// ============================================================================
+// 3. DOCK & PANELS
+// ============================================================================
 
 pub fn build_dock_panels_page(ctrl: Rc<SettingsController>) -> ScrolledWindow {
-    let (scroller, page) = page_shell(
-        "Dock & Panels",
-        "Customize the NEON DE Top Panel and Floating Dock appearance and visibility.",
-    );
+    let (scroller, page) = page_clamp();
 
-    let panel_card = card("TOP PANEL");
+    page.append(&section_heading("Menu Bar (Top Panel)"));
+    let panel_card = boxed_card();
+
     let panel_vis = Switch::new();
     panel_vis.set_valign(Align::Center);
     panel_vis.set_active(ctrl.config.borrow().panel.visible);
@@ -568,153 +706,277 @@ pub fn build_dock_panels_page(ctrl: Rc<SettingsController>) -> ScrolledWindow {
         panel_vis.connect_state_set(move |_, active| {
             ctrl.config.borrow_mut().panel.visible = active;
             let req = build_appearance_request(&ctrl.config.borrow());
-            ctrl.persist_and_sync(Some(req), "Updated top panel visibility");
+            ctrl.persist_and_sync(Some(req), "Toggled Menu Bar visibility");
             gtk4::glib::Propagation::Proceed
         });
     }
-    panel_card.append(&labeled_row(
-        "Show Top Panel",
-        "Toggles the top shell bar live via IPC.",
-        &panel_vis,
-    ));
 
-    let clock_vis = Switch::new();
-    clock_vis.set_valign(Align::Center);
-    clock_vis.set_active(ctrl.config.borrow().panel.show_clock);
+    let clock_sw = Switch::new();
+    clock_sw.set_valign(Align::Center);
+    clock_sw.set_active(ctrl.config.borrow().panel.show_clock);
     {
         let ctrl = Rc::clone(&ctrl);
-        clock_vis.connect_state_set(move |_, active| {
+        clock_sw.connect_state_set(move |_, active| {
             ctrl.config.borrow_mut().panel.show_clock = active;
             let req = build_appearance_request(&ctrl.config.borrow());
-            ctrl.persist_and_sync(Some(req), "Updated panel clock visibility");
+            ctrl.persist_and_sync(Some(req), "Toggled Menu Bar clock");
             gtk4::glib::Propagation::Proceed
         });
     }
-    panel_card.append(&Separator::new(Orientation::Horizontal));
-    panel_card.append(&labeled_row(
-        "Show Clock",
-        "Display the centered clock & date in the top panel.",
-        &clock_vis,
-    ));
 
-    let ws_vis = Switch::new();
-    ws_vis.set_valign(Align::Center);
-    ws_vis.set_active(ctrl.config.borrow().panel.show_workspaces);
+    let ws_sw = Switch::new();
+    ws_sw.set_valign(Align::Center);
+    ws_sw.set_active(ctrl.config.borrow().panel.show_workspaces);
     {
         let ctrl = Rc::clone(&ctrl);
-        ws_vis.connect_state_set(move |_, active| {
+        ws_sw.connect_state_set(move |_, active| {
             ctrl.config.borrow_mut().panel.show_workspaces = active;
             let req = build_appearance_request(&ctrl.config.borrow());
-            ctrl.persist_and_sync(Some(req), "Updated workspace indicator pills");
+            ctrl.persist_and_sync(Some(req), "Toggled workspace indicator dots");
             gtk4::glib::Propagation::Proceed
         });
     }
-    panel_card.append(&Separator::new(Orientation::Horizontal));
-    panel_card.append(&labeled_row(
-        "Show Workspace Indicators",
-        "Display clickable dynamic workspace pills next to Activities.",
-        &ws_vis,
-    ));
 
-    let panel_alpha = Scale::with_range(Orientation::Horizontal, 0.35, 1.0, 0.05);
-    panel_alpha.set_width_request(180);
-    panel_alpha.set_draw_value(true);
-    panel_alpha.set_value(f64::from(ctrl.config.borrow().panel.transparency));
+    let panel_op = Scale::with_range(Orientation::Horizontal, 0.45, 1.0, 0.05);
+    panel_op.add_css_class("settings-scale");
+    panel_op.set_width_request(180);
+    panel_op.set_value(f64::from(ctrl.config.borrow().panel.transparency));
     {
         let ctrl = Rc::clone(&ctrl);
-        panel_alpha.connect_value_changed(move |s| {
+        panel_op.connect_value_changed(move |s| {
             ctrl.config.borrow_mut().panel.transparency = s.value() as f32;
             let req = build_appearance_request(&ctrl.config.borrow());
-            ctrl.persist_and_sync(Some(req), "Updated top panel opacity");
+            ctrl.persist_and_sync(Some(req), "Updated Menu Bar opacity");
         });
     }
-    panel_card.append(&Separator::new(Orientation::Horizontal));
-    panel_card.append(&labeled_row(
-        "Top Panel Opacity",
-        "Adjusts top panel surface translucency live.",
-        &panel_alpha,
-    ));
+
+    let panel_pos = DropDown::new(
+        Some(StringList::new(&["Top", "Bottom"])),
+        gtk4::Expression::NONE,
+    );
+    panel_pos.set_valign(Align::Center);
+    panel_pos.set_selected(match ctrl.config.borrow().panel.position {
+        PanelPosition::Top => 0,
+        PanelPosition::Bottom => 1,
+    });
+    {
+        let ctrl = Rc::clone(&ctrl);
+        panel_pos.connect_selected_notify(move |dd| {
+            ctrl.config.borrow_mut().panel.position = if dd.selected() == 1 {
+                PanelPosition::Bottom
+            } else {
+                PanelPosition::Top
+            };
+            ctrl.persist_and_sync(None, "Saved Menu Bar position");
+        });
+    }
+
+    append_rows(
+        &panel_card,
+        vec![
+            setting_row(
+                "Show Menu Bar",
+                "Full-width translucent bar across the top edge.",
+                &panel_vis,
+            ),
+            setting_row(
+                "Show Date & Time",
+                "Displays live clock on the right side of the Menu Bar.",
+                &clock_sw,
+            ),
+            setting_row(
+                "Show Workspace Dots",
+                "Dynamic GNOME-style workspace indicators.",
+                &ws_sw,
+            ),
+            setting_row(
+                "Menu Bar Opacity",
+                "Controls frosted glass translucency live.",
+                &panel_op,
+            ),
+            setting_row(
+                "Panel Edge",
+                "Preferred screen edge for the Menu Bar.",
+                &panel_pos,
+            ),
+        ],
+    );
     page.append(&panel_card);
 
-    let dock_card = card("FLOATING DOCK");
-    let pos_opts = StringList::new(&["Bottom", "Left", "Right"]);
-    let pos_dd = DropDown::new(Some(pos_opts), gtk4::Expression::NONE);
-    pos_dd.set_selected(match ctrl.config.borrow().dock.position {
+    page.append(&section_heading("Floating Dock"));
+    let dock_card = boxed_card();
+
+    let dock_op = Scale::with_range(Orientation::Horizontal, 0.40, 1.0, 0.05);
+    dock_op.add_css_class("settings-scale");
+    dock_op.set_width_request(180);
+    dock_op.set_value(f64::from(ctrl.config.borrow().dock.transparency));
+    {
+        let ctrl = Rc::clone(&ctrl);
+        dock_op.connect_value_changed(move |s| {
+            ctrl.config.borrow_mut().dock.transparency = s.value() as f32;
+            let req = build_appearance_request(&ctrl.config.borrow());
+            ctrl.persist_and_sync(Some(req), "Updated Dock opacity");
+        });
+    }
+
+    let dock_pos = DropDown::new(
+        Some(StringList::new(&["Bottom", "Left", "Right"])),
+        gtk4::Expression::NONE,
+    );
+    dock_pos.set_valign(Align::Center);
+    dock_pos.set_selected(match ctrl.config.borrow().dock.position {
         DockPosition::Bottom => 0,
         DockPosition::Left => 1,
         DockPosition::Right => 2,
     });
     {
         let ctrl = Rc::clone(&ctrl);
-        pos_dd.connect_selected_notify(move |dd| {
+        dock_pos.connect_selected_notify(move |dd| {
             ctrl.config.borrow_mut().dock.position = match dd.selected() {
                 1 => DockPosition::Left,
                 2 => DockPosition::Right,
                 _ => DockPosition::Bottom,
             };
-            ctrl.persist_and_sync(None, "Saved dock edge preference");
+            ctrl.persist_and_sync(None, "Saved Dock position");
         });
     }
-    dock_card.append(&labeled_row(
-        "Dock Position",
-        "Preferred screen edge for the NEON DE dock.",
-        &pos_dd,
-    ));
 
-    let dock_alpha = Scale::with_range(Orientation::Horizontal, 0.35, 1.0, 0.05);
-    dock_alpha.set_width_request(180);
-    dock_alpha.set_draw_value(true);
-    dock_alpha.set_value(f64::from(ctrl.config.borrow().dock.transparency));
+    let autohide_sw = Switch::new();
+    autohide_sw.set_valign(Align::Center);
+    autohide_sw.set_active(ctrl.config.borrow().dock.auto_hide);
     {
         let ctrl = Rc::clone(&ctrl);
-        dock_alpha.connect_value_changed(move |s| {
-            ctrl.config.borrow_mut().dock.transparency = s.value() as f32;
-            let req = build_appearance_request(&ctrl.config.borrow());
-            ctrl.persist_and_sync(Some(req), "Updated dock opacity");
+        autohide_sw.connect_state_set(move |_, active| {
+            ctrl.config.borrow_mut().dock.auto_hide = active;
+            ctrl.persist_and_sync(None, "Saved Dock auto-hide");
+            gtk4::glib::Propagation::Proceed
         });
     }
-    dock_card.append(&Separator::new(Orientation::Horizontal));
-    dock_card.append(&labeled_row(
-        "Dock Opacity",
-        "Adjusts floating dock glass translucency live.",
-        &dock_alpha,
-    ));
 
-    let panel_pos_opts = StringList::new(&["Top", "Bottom"]);
-    let panel_pos_dd = DropDown::new(Some(panel_pos_opts), gtk4::Expression::NONE);
-    panel_pos_dd.set_selected(match ctrl.config.borrow().panel.position {
-        PanelPosition::Top => 0,
-        PanelPosition::Bottom => 1,
-    });
-    {
-        let ctrl = Rc::clone(&ctrl);
-        panel_pos_dd.connect_selected_notify(move |dd| {
-            ctrl.config.borrow_mut().panel.position = if dd.selected() == 1 {
-                PanelPosition::Bottom
-            } else {
-                PanelPosition::Top
-            };
-            ctrl.persist_and_sync(None, "Saved panel position preference");
-        });
-    }
-    dock_card.append(&Separator::new(Orientation::Horizontal));
-    dock_card.append(&labeled_row(
-        "Panel Edge",
-        "Preferred anchor edge for the shell panel.",
-        &panel_pos_dd,
-    ));
+    append_rows(
+        &dock_card,
+        vec![
+            setting_row(
+                "Dock Opacity",
+                "Controls frosted glass dock capsule opacity live.",
+                &dock_op,
+            ),
+            setting_row(
+                "Position on Screen",
+                "Bottom, Left, or Right edge placement.",
+                &dock_pos,
+            ),
+            setting_row(
+                "Automatically Hide Dock",
+                "Intelligently hides the dock when windows maximize.",
+                &autohide_sw,
+            ),
+        ],
+    );
     page.append(&dock_card);
 
     scroller
 }
 
-pub fn build_effects_page(ctrl: Rc<SettingsController>) -> ScrolledWindow {
-    let (scroller, page) = page_shell(
-        "Visual Effects",
-        "Live GPU compositor controls for shadows, frosted-glass blur, rounded borders, and animations.",
-    );
+// ============================================================================
+// 4. WINDOWS & EFFECTS (KDE-Grade Compositor & Window Manager Controls)
+// ============================================================================
 
-    let gpu_card = card("GPU COMPOSITION EFFECTS");
+pub fn build_windows_effects_page(ctrl: Rc<SettingsController>) -> ScrolledWindow {
+    let (scroller, page) = page_clamp();
+
+    page.append(&section_heading("Window Management & Workspaces"));
+    let wm_card = boxed_card();
+
+    let focus_dd = DropDown::new(
+        Some(StringList::new(&["Click to Focus", "Focus Follows Mouse"])),
+        gtk4::Expression::NONE,
+    );
+    focus_dd.set_valign(Align::Center);
+    focus_dd.set_selected(match ctrl.config.borrow().windows.focus_mode {
+        FocusMode::ClickToFocus => 0,
+        FocusMode::FocusFollowsMouse => 1,
+    });
+    {
+        let ctrl = Rc::clone(&ctrl);
+        focus_dd.connect_selected_notify(move |dd| {
+            ctrl.config.borrow_mut().windows.focus_mode = if dd.selected() == 1 {
+                FocusMode::FocusFollowsMouse
+            } else {
+                FocusMode::ClickToFocus
+            };
+            let req = build_window_behavior_request(&ctrl.config.borrow());
+            ctrl.persist_and_sync(Some(req), "Updated window focus policy");
+        });
+    }
+
+    let gap_scale = Scale::with_range(Orientation::Horizontal, 0.0, 32.0, 2.0);
+    gap_scale.add_css_class("settings-scale");
+    gap_scale.set_width_request(180);
+    gap_scale.set_draw_value(true);
+    gap_scale.set_value(f64::from(ctrl.config.borrow().windows.snap_gap));
+    {
+        let ctrl = Rc::clone(&ctrl);
+        gap_scale.connect_value_changed(move |s| {
+            ctrl.config.borrow_mut().windows.snap_gap = s.value().round() as i32;
+            let req = build_window_behavior_request(&ctrl.config.borrow());
+            ctrl.persist_and_sync(Some(req), "Updated window snap gap");
+        });
+    }
+
+    let snap_sw = Switch::new();
+    snap_sw.set_valign(Align::Center);
+    snap_sw.set_active(ctrl.config.borrow().windows.auto_snap);
+    {
+        let ctrl = Rc::clone(&ctrl);
+        snap_sw.connect_state_set(move |_, active| {
+            ctrl.config.borrow_mut().windows.auto_snap = active;
+            ctrl.persist_and_sync(None, "Saved window snapping preference");
+            gtk4::glib::Propagation::Proceed
+        });
+    }
+
+    let center_sw = Switch::new();
+    center_sw.set_valign(Align::Center);
+    center_sw.set_active(ctrl.config.borrow().windows.center_dialogs);
+    {
+        let ctrl = Rc::clone(&ctrl);
+        center_sw.connect_state_set(move |_, active| {
+            ctrl.config.borrow_mut().windows.center_dialogs = active;
+            ctrl.persist_and_sync(None, "Saved dialog centering preference");
+            gtk4::glib::Propagation::Proceed
+        });
+    }
+
+    append_rows(
+        &wm_card,
+        vec![
+            setting_row(
+                "Focus Policy",
+                "Choose macOS click-to-focus or KDE focus-follows-mouse.",
+                &focus_dd,
+            ),
+            setting_row(
+                "Tiling / Snap Gap (px)",
+                "Margin between snapped half/quarter windows.",
+                &gap_scale,
+            ),
+            setting_row(
+                "Edge & Shortcut Snapping",
+                "Enable Super+Left/Right/Up smart window snapping.",
+                &snap_sw,
+            ),
+            setting_row(
+                "Center Transient Dialogs",
+                "Automatically center modal dialogs over parent windows.",
+                &center_sw,
+            ),
+        ],
+    );
+    page.append(&wm_card);
+
+    page.append(&section_heading("GPU Visual Effects"));
+    let fx_card = boxed_card();
 
     let shadows_sw = Switch::new();
     shadows_sw.set_valign(Align::Center);
@@ -724,15 +986,10 @@ pub fn build_effects_page(ctrl: Rc<SettingsController>) -> ScrolledWindow {
         shadows_sw.connect_state_set(move |_, active| {
             ctrl.config.borrow_mut().effects.shadows_enabled = active;
             let req = build_effects_request(&ctrl.config.borrow());
-            ctrl.persist_and_sync(Some(req), "Toggled window shadows");
+            ctrl.persist_and_sync(Some(req), "Toggled GPU drop shadows");
             gtk4::glib::Propagation::Proceed
         });
     }
-    gpu_card.append(&labeled_row(
-        "Window Drop Shadows",
-        "Analytical SDF soft drop shadows rendered on the GPU.",
-        &shadows_sw,
-    ));
 
     let borders_sw = Switch::new();
     borders_sw.set_valign(Align::Center);
@@ -742,16 +999,10 @@ pub fn build_effects_page(ctrl: Rc<SettingsController>) -> ScrolledWindow {
         borders_sw.connect_state_set(move |_, active| {
             ctrl.config.borrow_mut().effects.borders_enabled = active;
             let req = build_effects_request(&ctrl.config.borrow());
-            ctrl.persist_and_sync(Some(req), "Toggled window focus rings");
+            ctrl.persist_and_sync(Some(req), "Toggled accent focus rings");
             gtk4::glib::Propagation::Proceed
         });
     }
-    gpu_card.append(&Separator::new(Orientation::Horizontal));
-    gpu_card.append(&labeled_row(
-        "Accent Focus Rings",
-        "Subtle rim borders that glow with your accent color on the focused window.",
-        &borders_sw,
-    ));
 
     let blur_sw = Switch::new();
     blur_sw.set_valign(Align::Center);
@@ -765,14 +1016,9 @@ pub fn build_effects_page(ctrl: Rc<SettingsController>) -> ScrolledWindow {
             gtk4::glib::Propagation::Proceed
         });
     }
-    gpu_card.append(&Separator::new(Orientation::Horizontal));
-    gpu_card.append(&labeled_row(
-        "Frosted-Glass Blur",
-        "9-tap GPU diffusion backdrop behind translucent windows.",
-        &blur_sw,
-    ));
 
     let radius_scale = Scale::with_range(Orientation::Horizontal, 0.0, 24.0, 1.0);
+    radius_scale.add_css_class("settings-scale");
     radius_scale.set_width_request(180);
     radius_scale.set_draw_value(true);
     radius_scale.set_value(f64::from(ctrl.config.borrow().effects.corner_radius));
@@ -781,56 +1027,25 @@ pub fn build_effects_page(ctrl: Rc<SettingsController>) -> ScrolledWindow {
         radius_scale.connect_value_changed(move |s| {
             ctrl.config.borrow_mut().effects.corner_radius = s.value() as f32;
             let req = build_effects_request(&ctrl.config.borrow());
-            ctrl.persist_and_sync(Some(req), "Updated corner radius");
+            ctrl.persist_and_sync(Some(req), "Updated window corner radius");
         });
     }
-    gpu_card.append(&Separator::new(Orientation::Horizontal));
-    gpu_card.append(&labeled_row(
-        "Corner Radius (px)",
-        "Adjusts shadow, border, and frosted-glass corner curvature live.",
-        &radius_scale,
-    ));
 
-    let opacity_scale = Scale::with_range(Orientation::Horizontal, 0.70, 1.0, 0.02);
-    opacity_scale.set_width_request(180);
-    opacity_scale.set_draw_value(true);
-    opacity_scale.set_value(f64::from(ctrl.config.borrow().effects.inactive_opacity));
+    let inactive_scale = Scale::with_range(Orientation::Horizontal, 0.70, 1.0, 0.02);
+    inactive_scale.add_css_class("settings-scale");
+    inactive_scale.set_width_request(180);
+    inactive_scale.set_value(f64::from(ctrl.config.borrow().effects.inactive_opacity));
     {
         let ctrl = Rc::clone(&ctrl);
-        opacity_scale.connect_value_changed(move |s| {
+        inactive_scale.connect_value_changed(move |s| {
             ctrl.config.borrow_mut().effects.inactive_opacity = s.value() as f32;
             let req = build_effects_request(&ctrl.config.borrow());
             ctrl.persist_and_sync(Some(req), "Updated inactive window opacity");
         });
     }
-    gpu_card.append(&Separator::new(Orientation::Horizontal));
-    gpu_card.append(&labeled_row(
-        "Inactive Window Opacity",
-        "Subtle translucency on unfocused windows to emphasize active work.",
-        &opacity_scale,
-    ));
-    page.append(&gpu_card);
-
-    let anim_card = card("MOTION & ANIMATIONS");
-    let reduced_sw = Switch::new();
-    reduced_sw.set_valign(Align::Center);
-    reduced_sw.set_active(ctrl.config.borrow().effects.reduced_motion);
-    {
-        let ctrl = Rc::clone(&ctrl);
-        reduced_sw.connect_state_set(move |_, active| {
-            ctrl.config.borrow_mut().effects.reduced_motion = active;
-            let req = build_effects_request(&ctrl.config.borrow());
-            ctrl.persist_and_sync(Some(req), "Updated reduced motion mode");
-            gtk4::glib::Propagation::Proceed
-        });
-    }
-    anim_card.append(&labeled_row(
-        "Reduce Motion",
-        "Disables sliding and fade animations immediately for accessibility or low-power mode.",
-        &reduced_sw,
-    ));
 
     let speed_scale = Scale::with_range(Orientation::Horizontal, 0.25, 2.5, 0.25);
+    speed_scale.add_css_class("settings-scale");
     speed_scale.set_width_request(180);
     speed_scale.set_draw_value(true);
     speed_scale.set_value(ctrl.config.borrow().effects.speed_scale);
@@ -839,466 +1054,46 @@ pub fn build_effects_page(ctrl: Rc<SettingsController>) -> ScrolledWindow {
         speed_scale.connect_value_changed(move |s| {
             ctrl.config.borrow_mut().effects.speed_scale = s.value();
             let req = build_effects_request(&ctrl.config.borrow());
-            ctrl.persist_and_sync(Some(req), "Updated animation speed");
+            ctrl.persist_and_sync(Some(req), "Updated animation speed scale");
         });
     }
-    anim_card.append(&Separator::new(Orientation::Horizontal));
-    anim_card.append(&labeled_row(
-        "Animation Speed Multiplier",
-        "Scales window open, focus, and workspace transition speed.",
-        &speed_scale,
-    ));
-    page.append(&anim_card);
 
-    scroller
-}
-
-pub fn build_input_page(ctrl: Rc<SettingsController>) -> ScrolledWindow {
-    let (scroller, page) = page_shell(
-        "Input & Shortcuts",
-        "Configure keyboard repeat timing, touchpad preferences, and inspect NEON DE shortcuts.",
+    append_rows(
+        &fx_card,
+        vec![
+            setting_row(
+                "Drop Shadows",
+                "Soft analytical SDF shadows rendered on the GPU.",
+                &shadows_sw,
+            ),
+            setting_row(
+                "Accent Focus Rings",
+                "Subtle glowing rim around the active window.",
+                &borders_sw,
+            ),
+            setting_row(
+                "Frosted-Glass Blur",
+                "9-tap GPU diffusion backdrop behind windows.",
+                &blur_sw,
+            ),
+            setting_row(
+                "Corner Radius (px)",
+                "Curvature for shadows, focus rings, and frosted glass.",
+                &radius_scale,
+            ),
+            setting_row(
+                "Inactive Window Opacity",
+                "Dim unfocused windows slightly for focus clarity.",
+                &inactive_scale,
+            ),
+            setting_row(
+                "Animation Speed",
+                "Scale compositor transition speed (0.25× – 2.5×).",
+                &speed_scale,
+            ),
+        ],
     );
-
-    let kbd_card = card("KEYBOARD & TOUCHPAD");
-    let nat_scroll = Switch::new();
-    nat_scroll.set_valign(Align::Center);
-    nat_scroll.set_active(ctrl.config.borrow().input.natural_scroll);
-    {
-        let ctrl = Rc::clone(&ctrl);
-        nat_scroll.connect_state_set(move |_, active| {
-            ctrl.config.borrow_mut().input.natural_scroll = active;
-            ctrl.persist_and_sync(None, "Saved natural scrolling preference");
-            gtk4::glib::Propagation::Proceed
-        });
-    }
-    kbd_card.append(&labeled_row(
-        "Natural Scrolling",
-        "Content tracks finger movement direction on touchpads.",
-        &nat_scroll,
-    ));
-
-    let tap_click = Switch::new();
-    tap_click.set_valign(Align::Center);
-    tap_click.set_active(ctrl.config.borrow().input.tap_to_click);
-    {
-        let ctrl = Rc::clone(&ctrl);
-        tap_click.connect_state_set(move |_, active| {
-            ctrl.config.borrow_mut().input.tap_to_click = active;
-            ctrl.persist_and_sync(None, "Saved tap-to-click preference");
-            gtk4::glib::Propagation::Proceed
-        });
-    }
-    kbd_card.append(&Separator::new(Orientation::Horizontal));
-    kbd_card.append(&labeled_row(
-        "Tap to Click",
-        "Single-finger tap triggers primary click on libinput touchpads.",
-        &tap_click,
-    ));
-    page.append(&kbd_card);
-
-    let sc_card = card("ACTIVE COMPOSITOR SHORTCUTS");
-    for (keys, desc) in [
-        (
-            "Super + Space / Super + A",
-            "Toggle Activities Overview & Application Grid",
-        ),
-        ("Super + Return", "Launch Terminal"),
-        (
-            "Super + Left / Right",
-            "Smart Snap Window Left / Right Half",
-        ),
-        ("Super + Up / Down", "Toggle Maximize / Restore or Minimize"),
-        (
-            "Super + H / Super + Shift + H",
-            "Minimize Focused / Restore Last Minimized",
-        ),
-        (
-            "Ctrl + Alt + Left / Right",
-            "Switch Dynamic Workspaces (or 3-finger swipe)",
-        ),
-        ("Super + L", "Lock Session (ext_session_lock_v1)"),
-        (
-            "Alt + Left / Right Drag",
-            "Interactive Move / Resize Window",
-        ),
-    ] {
-        let lbl = Label::new(Some(keys));
-        lbl.add_css_class("settings-row-title");
-        sc_card.append(&labeled_row(desc, "Active in neon-compositor", &lbl));
-    }
-    page.append(&sc_card);
-
-    scroller
-}
-
-pub fn build_privacy_accessibility_page(ctrl: Rc<SettingsController>) -> ScrolledWindow {
-    let (scroller, page) = page_shell(
-        "Privacy, Security & Accessibility",
-        "Session lock controls, accessibility options, and verified compositor security boundaries.",
-    );
-
-    let sec_card = card("SESSION LOCK & SECURITY");
-    let lock_btn = Button::with_label("Lock Screen Now");
-    lock_btn.add_css_class("settings-action-btn");
-    {
-        let ctrl = Rc::clone(&ctrl);
-        lock_btn.connect_clicked(move |_| {
-            ctrl.persist_and_sync(
-                Some(IpcRequest::LockSession),
-                "Requested ext_session_lock_v1 lock",
-            );
-        });
-    }
-    sec_card.append(&labeled_row(
-        "Screen Lock (ext_session_lock_v1)",
-        "Immediately isolates rendering & input behind neon-lockscreen (Super+L).",
-        &lock_btn,
-    ));
-
-    let ipc_badge = Label::new(Some("Active (SO_PEERCRED + 0600)"));
-    ipc_badge.add_css_class("settings-row-title");
-    sec_card.append(&Separator::new(Orientation::Horizontal));
-    sec_card.append(&labeled_row(
-        "IPC Peer Authentication",
-        "Only same-UID processes can communicate with neon-compositor.",
-        &ipc_badge,
-    ));
-    page.append(&sec_card);
-
-    let a11y_card = card("ACCESSIBILITY");
-    let hc_sw = Switch::new();
-    hc_sw.set_valign(Align::Center);
-    hc_sw.set_active(ctrl.config.borrow().privacy_accessibility.high_contrast);
-    {
-        let ctrl = Rc::clone(&ctrl);
-        hc_sw.connect_state_set(move |_, active| {
-            ctrl.config.borrow_mut().privacy_accessibility.high_contrast = active;
-            let req = build_appearance_request(&ctrl.config.borrow());
-            ctrl.persist_and_sync(Some(req), "Updated high-contrast accessibility mode");
-            gtk4::glib::Propagation::Proceed
-        });
-    }
-    a11y_card.append(&labeled_row(
-        "High Contrast",
-        "Applies crisp opaque high-contrast borders and text live across neon-shell.",
-        &hc_sw,
-    ));
-    page.append(&a11y_card);
-
-    scroller
-}
-
-pub fn build_system_page(ctrl: Rc<SettingsController>) -> ScrolledWindow {
-    let (scroller, page) = page_shell(
-        "System & About NEON DE",
-        "Live host hardware details, Linux system service status, and configuration backup/reset.",
-    );
-
-    let info = collect_hardware_summary();
-    let about_card = card("ABOUT NEON DE");
-    for (k, v) in [
-        (
-            "Desktop Environment",
-            "NEON DE 0.1.0 (Rust + Smithay 0.7 + Wayland + GTK4)".to_string(),
-        ),
-        ("Operating System", info.os_name),
-        ("Linux Kernel", info.kernel),
-        ("Processor", info.cpu_model),
-        ("System Memory", info.memory_gib),
-    ] {
-        let val = Label::new(Some(&v));
-        val.add_css_class("settings-row-desc");
-        val.set_selectable(true);
-        about_card.append(&labeled_row(k, "", &val));
-    }
-    if let Ok(mut client) = IpcClient::connect(&ctrl.ipc_socket)
-        && let Ok(IpcResult::Ok {
-            payload: IpcPayload::Diagnostics { diagnostics },
-        }) = client.request(IpcRequest::GetDiagnostics)
-    {
-        let diag_text = format!(
-            "{} · {} frames rendered · {} idle skipped · {} µs last frame{}",
-            diagnostics.backend,
-            diagnostics.frames_rendered,
-            diagnostics.idle_frames_skipped,
-            diagnostics.last_frame_time_us,
-            if diagnostics.safe_mode {
-                " · SAFE MODE"
-            } else {
-                ""
-            }
-        );
-        let val = Label::new(Some(&diag_text));
-        val.add_css_class("settings-row-desc");
-        val.set_selectable(true);
-        about_card.append(&labeled_row("Compositor Telemetry", "", &val));
-    }
-    page.append(&about_card);
-
-    let sys = query_system_snapshot();
-
-    // Live Audio (PipeWire / WirePlumber)
-    let audio_card = card("AUDIO (PIPEWIRE / WIREPLUMBER)");
-    let vol_scale = Scale::with_range(Orientation::Horizontal, 0.0, 150.0, 2.0);
-    vol_scale.set_width_request(180);
-    vol_scale.set_draw_value(true);
-    vol_scale.set_sensitive(sys.audio.available);
-    vol_scale.set_value(f64::from(sys.audio.volume_percent()));
-    {
-        let ctrl = Rc::clone(&ctrl);
-        vol_scale.connect_value_changed(move |s| {
-            let vol = (s.value() as f32) / 100.0;
-            match set_sink_volume(vol) {
-                Ok(()) => ctrl
-                    .status_label
-                    .set_text(&format!("Set PipeWire volume to {:.0}%", s.value())),
-                Err(err) => ctrl.status_label.set_text(&format!("Audio error: {err}")),
-            }
-        });
-    }
-    let sink_desc = sys
-        .audio
-        .default_sink_name
-        .as_deref()
-        .unwrap_or("PipeWire default output sink");
-    audio_card.append(&labeled_row("Output Volume", sink_desc, &vol_scale));
-
-    let mute_sw = Switch::new();
-    mute_sw.set_valign(Align::Center);
-    mute_sw.set_sensitive(sys.audio.available);
-    mute_sw.set_active(sys.audio.muted);
-    {
-        let ctrl = Rc::clone(&ctrl);
-        mute_sw.connect_state_set(move |_, muted| {
-            match set_sink_mute(muted) {
-                Ok(()) => ctrl.status_label.set_text(if muted {
-                    "Muted PipeWire audio output"
-                } else {
-                    "Unmuted PipeWire audio output"
-                }),
-                Err(err) => ctrl.status_label.set_text(&format!("Mute error: {err}")),
-            }
-            gtk4::glib::Propagation::Proceed
-        });
-    }
-    audio_card.append(&Separator::new(Orientation::Horizontal));
-    audio_card.append(&labeled_row(
-        "Mute Audio Output",
-        "Controls @DEFAULT_AUDIO_SINK@ via WirePlumber.",
-        &mute_sw,
-    ));
-    page.append(&audio_card);
-
-    // Live Connectivity & Power (NetworkManager, BlueZ, UPower)
-    let dev_card = card("NETWORK, BLUETOOTH & POWER (D-BUS)");
-
-    let wifi_sw = Switch::new();
-    wifi_sw.set_valign(Align::Center);
-    wifi_sw.set_sensitive(sys.network.available);
-    wifi_sw.set_active(sys.network.wifi_enabled);
-    {
-        let ctrl = Rc::clone(&ctrl);
-        wifi_sw.connect_state_set(move |_, enabled| {
-            match set_wifi_enabled(enabled) {
-                Ok(()) => ctrl.status_label.set_text(if enabled {
-                    "Enabled Wi-Fi via NetworkManager"
-                } else {
-                    "Disabled Wi-Fi via NetworkManager"
-                }),
-                Err(err) => ctrl.status_label.set_text(&format!("Network error: {err}")),
-            }
-            gtk4::glib::Propagation::Proceed
-        });
-    }
-    dev_card.append(&labeled_row(
-        "Wi-Fi (NetworkManager)",
-        &format!("Status: {}", sys.network.panel_label()),
-        &wifi_sw,
-    ));
-
-    let bt_sw = Switch::new();
-    bt_sw.set_valign(Align::Center);
-    bt_sw.set_sensitive(sys.bluetooth.available);
-    bt_sw.set_active(sys.bluetooth.powered);
-    {
-        let ctrl = Rc::clone(&ctrl);
-        bt_sw.connect_state_set(move |_, powered| {
-            match set_bluetooth_powered(powered) {
-                Ok(()) => ctrl.status_label.set_text(if powered {
-                    "Powered on BlueZ Bluetooth adapter"
-                } else {
-                    "Powered off BlueZ Bluetooth adapter"
-                }),
-                Err(err) => ctrl
-                    .status_label
-                    .set_text(&format!("Bluetooth error: {err}")),
-            }
-            gtk4::glib::Propagation::Proceed
-        });
-    }
-    dev_card.append(&Separator::new(Orientation::Horizontal));
-    dev_card.append(&labeled_row(
-        "Bluetooth (BlueZ)",
-        &format!(
-            "{} paired · {} connected",
-            sys.bluetooth.devices.len(),
-            sys.bluetooth.connected_count()
-        ),
-        &bt_sw,
-    ));
-
-    let profile_model = StringList::new(&["power-saver", "balanced", "performance"]);
-    let profile_dd = DropDown::new(Some(profile_model), gtk4::Expression::NONE);
-    profile_dd.set_valign(Align::Center);
-    profile_dd.set_sensitive(sys.power.active_profile.is_some());
-    profile_dd.set_selected(match sys.power.active_profile.as_deref() {
-        Some("power-saver") => 0,
-        Some("performance") => 2,
-        _ => 1,
-    });
-    {
-        let ctrl = Rc::clone(&ctrl);
-        profile_dd.connect_selected_notify(move |dd| {
-            let prof = match dd.selected() {
-                0 => "power-saver",
-                2 => "performance",
-                _ => "balanced",
-            };
-            match set_power_profile(prof) {
-                Ok(()) => ctrl
-                    .status_label
-                    .set_text(&format!("Switched power profile to {prof}")),
-                Err(err) => ctrl
-                    .status_label
-                    .set_text(&format!("Power profile error: {err}")),
-            }
-        });
-    }
-    let power_desc = if sys.power.has_battery {
-        format!(
-            "Battery: {:.0}% ({})",
-            sys.power.battery_percentage,
-            sys.power.battery_state.label()
-        )
-    } else {
-        "AC Power (UPower)".to_string()
-    };
-    dev_card.append(&Separator::new(Orientation::Horizontal));
-    dev_card.append(&labeled_row(
-        "Power Profile (UPower)",
-        &power_desc,
-        &profile_dd,
-    ));
-    page.append(&dev_card);
-
-    // Desktop Services (Notifications, PolicyKit1, XDG Desktop Portals)
-    let svc_card = card("DESKTOP SERVICES (D-BUS, POLKIT & PORTALS)");
-    let notif_bus = sys
-        .notifications
-        .active_bus_name
-        .clone()
-        .unwrap_or_else(|| NESTED_BUS_NAME.to_string());
-    let test_notif_btn = Button::with_label("Test Toast");
-    test_notif_btn.add_css_class("settings-secondary-btn");
-    {
-        let ctrl = Rc::clone(&ctrl);
-        let bus = notif_bus.clone();
-        test_notif_btn.connect_clicked(move |_| {
-            match send_dbus_notification(
-                &bus,
-                "NEON DE Settings",
-                "Notifications Active",
-                "Freedesktop Notifications v1.2 D-Bus integration verified.",
-                NotificationUrgency::Normal,
-                4000,
-            ) {
-                Ok(id) => ctrl
-                    .status_label
-                    .set_text(&format!("Sent D-Bus notification #{id} via {bus}")),
-                Err(err) => ctrl
-                    .status_label
-                    .set_text(&format!("Notification error: {err}")),
-            }
-        });
-    }
-    svc_card.append(&labeled_row(
-        "Desktop Notifications (v1.2)",
-        &format!("Active bus: {notif_bus}"),
-        &test_notif_btn,
-    ));
-
-    let polkit_badge = Label::new(Some(if sys.polkit.daemon_available {
-        "Available"
-    } else {
-        "Unavailable"
-    }));
-    polkit_badge.add_css_class("settings-row-title");
-    svc_card.append(&Separator::new(Orientation::Horizontal));
-    svc_card.append(&labeled_row(
-        "PolicyKit1 Authority",
-        &format!("Agent path: {}", sys.polkit.agent_object_path),
-        &polkit_badge,
-    ));
-
-    let portal_badge = Label::new(Some(if sys.portals.desktop_portal_running {
-        "Active"
-    } else {
-        "Inactive"
-    }));
-    portal_badge.add_css_class("settings-row-title");
-    let backends = if sys.portals.installed_backends.is_empty() {
-        "none detected".to_string()
-    } else {
-        sys.portals.installed_backends.join(", ")
-    };
-    svc_card.append(&Separator::new(Orientation::Horizontal));
-    svc_card.append(&labeled_row(
-        "XDG Desktop Portals",
-        &format!(
-            "Desktop: {} · Backends: {backends}",
-            sys.portals.current_desktop
-        ),
-        &portal_badge,
-    ));
-    page.append(&svc_card);
-
-    let cfg_card = card("CONFIGURATION MANAGEMENT");
-    let btn_row = GtkBox::new(Orientation::Horizontal, 10);
-
-    let export_btn = Button::with_label("Export Backup");
-    export_btn.add_css_class("settings-secondary-btn");
-    {
-        let ctrl = Rc::clone(&ctrl);
-        export_btn.connect_clicked(move |_| {
-            let export_path = ctrl.config_path.with_extension("backup.toml");
-            match export_config(&export_path, &ctrl.config.borrow()) {
-                Ok(()) => ctrl
-                    .status_label
-                    .set_text(&format!("Exported backup to {}", export_path.display())),
-                Err(err) => ctrl.status_label.set_text(&format!("Export failed: {err}")),
-            }
-        });
-    }
-
-    let reset_btn = Button::with_label("Reset to Defaults");
-    reset_btn.add_css_class("settings-action-btn");
-    {
-        let ctrl = Rc::clone(&ctrl);
-        reset_btn.connect_clicked(move |_| {
-            *ctrl.config.borrow_mut() = NeonConfig::default();
-            ctrl.persist_and_sync(None, "Reset NEON DE configuration to defaults");
-            ctrl.push_full_config_live();
-        });
-    }
-
-    btn_row.append(&export_btn);
-    btn_row.append(&reset_btn);
-    cfg_card.append(&labeled_row(
-        "Configuration File",
-        &ctrl.config_path.display().to_string(),
-        &btn_row,
-    ));
-    page.append(&cfg_card);
+    page.append(&fx_card);
 
     scroller
 }
