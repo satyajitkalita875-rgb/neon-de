@@ -33,7 +33,7 @@ NEON SESSION (planned — Milestone 8)
 └── Linux System Services (PipeWire, NetworkManager, UPower, BlueZ, polkit, portals)
 ```
 
-## 3. Current Workspace Crate Structure (Milestone 7)
+## 3. Current Workspace Crate Structure (Milestone 8 — Complete)
 
 ```text
 crates/
@@ -42,14 +42,15 @@ crates/
 ├── neon-output/              # Multi-monitor discovery, arrangement, fractional scale, rotation, mirroring, hotplug
 ├── neon-effects/             # Time-based interruptible animations (Bézier, spring, focus/open/workspace slide, blur config)
 ├── neon-scene/               # Retained Z-layered scene graph (Background..Cursor, shadows, borders, dirty regions)
-├── neon-renderer/            # Modular GLES/Glow pipeline, SDF shadow/border/backdrop/frosted-glass shaders, lock curtain
+├── neon-renderer/            # Modular GLES/Glow pipeline, SDF shadow/border/backdrop/frosted-glass shaders, lock curtain, cursor
 ├── neon-config/              # Versioned TOML XDG configuration service (atomic saves, validation, migration, backup)
-├── neon-ipc/                 # Versioned Unix domain socket IPC + SO_PEERCRED auth + typed snapshots/events
+├── neon-ipc/                 # Versioned Unix domain socket IPC + SO_PEERCRED auth + typed snapshots/diagnostics/events
 ├── neon-system/              # Linux D-Bus & PipeWire integration (NetworkManager, WirePlumber, BlueZ, UPower, Notifications v1.2, Polkit, Portals)
-├── neon-compositor/          # Smithay 0.7.0 compositor (layer-shell, session-lock, fractional-scale, gestures, XWayland, DMA-BUF)
+├── neon-compositor/          # Smithay 0.7.0 compositor (winit + bare-metal DRM/KMS/libseat/libinput, layer-shell, session-lock, gestures, XWayland, DMA-BUF)
 ├── neon-shell/               # Custom Rust + GTK4 + gtk4-layer-shell Desktop Shell (Panel, System Tray, Control Center, Toasts, Dock, Overview)
 ├── neon-lockscreen/          # Standalone ext_session_lock_v1 Wayland lock screen client
-└── neon-settings/            # macOS-inspired GTK4 Settings application wired live to neon-config, neon-ipc & neon-system
+├── neon-settings/            # macOS-inspired GTK4 Settings application wired live to neon-config, neon-ipc & neon-system
+└── neon-session/             # Production session supervisor (automatic neon-shell crash recovery, --safe-mode, --diagnostics)
 ```
 
 ## 4. Key Architectural Decisions & Trade-offs

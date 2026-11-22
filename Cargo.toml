@@ -14,6 +14,7 @@ members = [
     "crates/neon-shell",
     "crates/neon-lockscreen",
     "crates/neon-settings",
+    "crates/neon-session",
 ]
 
 [workspace.package]
@@ -35,6 +36,12 @@ neon-ipc = { path = "crates/neon-ipc" }
 neon-system = { path = "crates/neon-system" }
 zbus = "5"
 smithay = { version = "0.7.0", default-features = false, features = [
+    "backend_drm",
+    "backend_egl",
+    "backend_gbm",
+    "backend_libinput",
+    "backend_session_libseat",
+    "backend_udev",
     "backend_winit",
     "desktop",
     "renderer_glow",

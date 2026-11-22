@@ -21,6 +21,7 @@ impl ShellThemeController {
             panel_visible: true,
             show_clock: true,
             show_workspaces: true,
+            high_contrast: false,
         };
         provider.load_from_string(&build_shell_css(&default_appearance));
         if let Some(display) = Display::default() {
@@ -47,9 +48,18 @@ impl ShellThemeController {
 
 pub fn build_shell_css(appearance: &AppearanceInfo) -> String {
     let is_light = appearance.theme == "neon_light" || appearance.theme == "light";
+    let high_contrast = appearance.high_contrast;
     let accent = &appearance.accent_color;
-    let panel_a = appearance.panel_transparency.clamp(0.25, 1.0);
-    let dock_a = appearance.dock_transparency.clamp(0.25, 1.0);
+    let panel_a = if high_contrast {
+        1.0
+    } else {
+        appearance.panel_transparency.clamp(0.25, 1.0)
+    };
+    let dock_a = if high_contrast {
+        1.0
+    } else {
+        appearance.dock_transparency.clamp(0.25, 1.0)
+    };
 
     let (
         panel_bg,
@@ -65,24 +75,48 @@ pub fn build_shell_css(appearance: &AppearanceInfo) -> String {
         (
             format!("rgba(244, 247, 252, {panel_a:.2})"),
             format!("rgba(248, 250, 252, {dock_a:.2})"),
-            "rgba(255, 255, 255, 0.88)",
-            "rgba(226, 232, 240, 0.78)",
-            "rgba(241, 245, 249, 0.90)",
-            "#0F172A",
-            "#475569",
-            "rgba(15, 23, 42, 0.14)",
+            if high_contrast {
+                "#FFFFFF"
+            } else {
+                "rgba(255, 255, 255, 0.88)"
+            },
+            if high_contrast {
+                "#E2E8F0"
+            } else {
+                "rgba(226, 232, 240, 0.78)"
+            },
+            "rgba(241, 245, 249, 0.94)",
+            "#000000",
+            if high_contrast { "#0F172A" } else { "#475569" },
+            if high_contrast {
+                "#0F172A"
+            } else {
+                "rgba(15, 23, 42, 0.14)"
+            },
             "#FFFFFF",
         )
     } else {
         (
             format!("rgba(12, 16, 26, {panel_a:.2})"),
             format!("rgba(15, 21, 34, {dock_a:.2})"),
-            "rgba(24, 33, 52, 0.82)",
-            "rgba(30, 41, 59, 0.55)",
-            "rgba(9, 13, 22, 0.86)",
-            "#E2E8F0",
-            "#94A3B8",
-            "rgba(148, 163, 184, 0.18)",
+            if high_contrast {
+                "#0B1120"
+            } else {
+                "rgba(24, 33, 52, 0.82)"
+            },
+            if high_contrast {
+                "#1E293B"
+            } else {
+                "rgba(30, 41, 59, 0.55)"
+            },
+            "rgba(9, 13, 22, 0.92)",
+            if high_contrast { "#FFFFFF" } else { "#E2E8F0" },
+            if high_contrast { "#E2E8F0" } else { "#94A3B8" },
+            if high_contrast {
+                "#F8FAFC"
+            } else {
+                "rgba(148, 163, 184, 0.18)"
+            },
             "#09101D",
         )
     };

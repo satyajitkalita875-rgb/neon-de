@@ -1116,6 +1116,7 @@ fn ipc_server_state_overview_workspace_and_effects_roundtrip() {
                 panel_visible: Some(true),
                 show_clock: Some(true),
                 show_workspaces: Some(true),
+                high_contrast: Some(true),
             })
             .unwrap();
         let IpcResult::Ok {
@@ -1126,6 +1127,17 @@ fn ipc_server_state_overview_workspace_and_effects_roundtrip() {
         };
         assert_eq!(appearance.theme, "neon_light");
         assert_eq!(appearance.accent_color, "#A855F7");
+        assert!(appearance.high_contrast);
+
+        let diag_res = client.request(IpcRequest::GetDiagnostics).unwrap();
+        let IpcResult::Ok {
+            payload: IpcPayload::Diagnostics { diagnostics },
+        } = diag_res
+        else {
+            panic!("Expected Diagnostics payload");
+        };
+        assert_eq!(diagnostics.output_count, 1);
+        assert!(!diagnostics.safe_mode);
 
         let wb_res = client
             .request(IpcRequest::UpdateWindowBehavior {

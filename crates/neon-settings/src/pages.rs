@@ -110,6 +110,7 @@ pub fn build_appearance_request(cfg: &NeonConfig) -> IpcRequest {
         panel_visible: Some(cfg.panel.visible),
         show_clock: Some(cfg.panel.show_clock),
         show_workspaces: Some(cfg.panel.show_workspaces),
+        high_contrast: Some(cfg.privacy_accessibility.high_contrast),
     }
 }
 
@@ -907,13 +908,14 @@ pub fn build_privacy_accessibility_page(ctrl: Rc<SettingsController>) -> Scrolle
         let ctrl = Rc::clone(&ctrl);
         hc_sw.connect_state_set(move |_, active| {
             ctrl.config.borrow_mut().privacy_accessibility.high_contrast = active;
-            ctrl.persist_and_sync(None, "Saved high contrast preference");
+            let req = build_appearance_request(&ctrl.config.borrow());
+            ctrl.persist_and_sync(Some(req), "Updated high-contrast accessibility mode");
             gtk4::glib::Propagation::Proceed
         });
     }
     a11y_card.append(&labeled_row(
         "High Contrast",
-        "Persists high-contrast preference in neon-config.",
+        "Applies crisp opaque high-contrast borders and text live across neon-shell.",
         &hc_sw,
     ));
     page.append(&a11y_card);
@@ -943,6 +945,28 @@ pub fn build_system_page(ctrl: Rc<SettingsController>) -> ScrolledWindow {
         val.add_css_class("settings-row-desc");
         val.set_selectable(true);
         about_card.append(&labeled_row(k, "", &val));
+    }
+    if let Ok(mut client) = IpcClient::connect(&ctrl.ipc_socket)
+        && let Ok(IpcResult::Ok {
+            payload: IpcPayload::Diagnostics { diagnostics },
+        }) = client.request(IpcRequest::GetDiagnostics)
+    {
+        let diag_text = format!(
+            "{} · {} frames rendered · {} idle skipped · {} µs last frame{}",
+            diagnostics.backend,
+            diagnostics.frames_rendered,
+            diagnostics.idle_frames_skipped,
+            diagnostics.last_frame_time_us,
+            if diagnostics.safe_mode {
+                " · SAFE MODE"
+            } else {
+                ""
+            }
+        );
+        let val = Label::new(Some(&diag_text));
+        val.add_css_class("settings-row-desc");
+        val.set_selectable(true);
+        about_card.append(&labeled_row("Compositor Telemetry", "", &val));
     }
     page.append(&about_card);
 

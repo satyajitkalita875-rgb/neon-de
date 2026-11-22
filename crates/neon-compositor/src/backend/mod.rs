@@ -1,6 +1,9 @@
 //! Display & rendering backends for **NEON DE**.
 //!
-//! Milestone 1 provides the nested `winit` + OpenGL ES (`GlesRenderer`) backend so that
-//! development and verification run safely inside an existing Wayland or X11 host session.
+//! - `winit`: Nested `winit` + OpenGL ES (`GlesRenderer`) backend for running safely inside
+//!   an existing Wayland or X11 host session.
+//! - `drm`: Bare-metal DRM/KMS + GBM + EGL/GLES + libseat + libinput + udev backend for
+//!   standalone TTY / display-manager sessions.
 
+pub mod drm;
 pub mod winit;

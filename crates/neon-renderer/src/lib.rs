@@ -147,18 +147,13 @@ impl NeonRenderer {
         self.shaders.is_some()
     }
 
-    /// Renders ONLY the active `ext_session_lock_v1` lock surface over an opaque security curtain.
-    ///
-    /// Guarantees that zero regular desktop windows, panels, dock, or overview surfaces are drawn
-    /// while the session is locked.
-    pub fn render_locked<'a>(
-        &'a mut self,
+    /// Collects render elements for a locked session (`ext_session_lock_v1`).
+    pub fn collect_locked_elements(
+        &self,
         output: &Output,
         renderer: &mut GlesRenderer,
-        framebuffer: &mut GlesTarget<'_>,
-        age: usize,
         lock_surface: Option<&LockSurface>,
-    ) -> Result<RenderOutputResult<'a>, OutputDamageTrackerError<GlesError>> {
+    ) -> Vec<NeonRenderElement> {
         let scale_f = output.current_scale().fractional_scale();
         let scale = Scale::from(scale_f);
         let mut elements: Vec<NeonRenderElement> = Vec::new();
@@ -175,23 +170,66 @@ impl NeonRenderer {
                 );
             elements.extend(lock_elements.into_iter().map(NeonRenderElement::from));
         }
-
-        self.damage_tracker
-            .render_output(renderer, framebuffer, age, &elements, LOCK_CURTAIN_COLOR)
+        elements
     }
 
-    /// Renders the retained [`SceneGraph`] into `framebuffer` with full `OutputDamageTracker` support.
-    #[allow(clippy::too_many_arguments)]
-    pub fn render_scene<'a, F>(
+    /// Renders ONLY the active `ext_session_lock_v1` lock surface over an opaque security curtain.
+    ///
+    /// Guarantees that zero regular desktop windows, panels, dock, or overview surfaces are drawn
+    /// while the session is locked.
+    pub fn render_locked<'a>(
         &'a mut self,
         output: &Output,
         renderer: &mut GlesRenderer,
         framebuffer: &mut GlesTarget<'_>,
         age: usize,
+        lock_surface: Option<&LockSurface>,
+    ) -> Result<RenderOutputResult<'a>, OutputDamageTrackerError<GlesError>> {
+        let elements = self.collect_locked_elements(output, renderer, lock_surface);
+
+        self.damage_tracker
+            .render_output(renderer, framebuffer, age, &elements, LOCK_CURTAIN_COLOR)
+    }
+
+    /// Builds a crisp software pointer cursor overlay for bare-metal DRM/KMS outputs.
+    pub fn cursor_elements(
+        &self,
+        pointer_loc: Point<f64, Logical>,
+        scale_f: f64,
+    ) -> Vec<NeonRenderElement> {
+        let px = pointer_loc.x.round() as i32;
+        let py = pointer_loc.y.round() as i32;
+        let outer =
+            SolidColorBuffer::new(Size::from((14, 14)), Color32F::new(0.05, 0.08, 0.14, 0.95));
+        let inner =
+            SolidColorBuffer::new(Size::from((10, 10)), Color32F::new(0.22, 0.74, 0.97, 1.0));
+        vec![
+            NeonRenderElement::from(SolidColorRenderElement::from_buffer(
+                &inner,
+                Point::<i32, Logical>::from((px + 2, py + 2)).to_physical_precise_round(scale_f),
+                scale_f,
+                1.0,
+                Kind::Cursor,
+            )),
+            NeonRenderElement::from(SolidColorRenderElement::from_buffer(
+                &outer,
+                Point::<i32, Logical>::from((px, py)).to_physical_precise_round(scale_f),
+                scale_f,
+                1.0,
+                Kind::Cursor,
+            )),
+        ]
+    }
+
+    /// Collects all front-to-back [`NeonRenderElement`]s for the current [`SceneGraph`] on `output`.
+    pub fn collect_scene_elements<'a, F>(
+        &mut self,
+        output: &Output,
+        renderer: &mut GlesRenderer,
         scene: &SceneGraph,
         blur: BlurSettings,
         mut resolve_window: F,
-    ) -> Result<RenderOutputResult<'a>, OutputDamageTrackerError<GlesError>>
+    ) -> Vec<NeonRenderElement>
     where
         F: FnMut(WindowId) -> Option<&'a Window>,
     {
@@ -245,7 +283,6 @@ impl NeonRenderer {
         let mut inserted_lower_layers = false;
         for node in nodes {
             if !inserted_lower_layers && matches!(node.content, NodeContent::Backdrop { .. }) {
-                // Insert Bottom and Background layer surfaces just above the compositor backdrop.
                 for (layer, loc) in &lower_layers {
                     let phys_loc: Point<i32, Physical> = loc.to_physical_precise_round(scale_f);
                     let layer_elements =
@@ -271,7 +308,6 @@ impl NeonRenderer {
                 } => {
                     seen_windows.insert(*window_id);
 
-                    // 1. Client Wayland surface tree (top-most within this window subtree).
                     if let Some(window) = resolve_window(*window_id) {
                         let win_geo = window.geometry();
                         let render_loc: Point<i32, Logical> =
@@ -287,7 +323,6 @@ impl NeonRenderer {
                         elements.extend(surface_elements.into_iter().map(NeonRenderElement::from));
                     }
 
-                    // 2. Frosted-glass blur plate behind translucent non-fullscreen windows.
                     if blur.enabled
                         && !fullscreen
                         && eff_rect.size.w > 0
@@ -303,7 +338,6 @@ impl NeonRenderer {
                         elements.push(NeonRenderElement::from(elem));
                     }
 
-                    // 3. Rounded focus ring / subtle rim border behind the client surface.
                     if let Some(border) = node.border
                         && eff_rect.size.w > 0
                         && eff_rect.size.h > 0
@@ -313,7 +347,6 @@ impl NeonRenderer {
                         elements.push(NeonRenderElement::from(elem));
                     }
 
-                    // 3. Analytical soft drop shadow behind the border.
                     if let Some(shadow) = node.shadow
                         && eff_rect.size.w > 0
                         && eff_rect.size.h > 0
@@ -358,6 +391,26 @@ impl NeonRenderer {
         self.shadow_cache.retain(|id, _| seen_windows.contains(id));
         self.border_cache.retain(|id, _| seen_windows.contains(id));
         self.glass_cache.retain(|id, _| seen_windows.contains(id));
+
+        elements
+    }
+
+    /// Renders the retained [`SceneGraph`] into `framebuffer` with full `OutputDamageTracker` support.
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_scene<'a, F>(
+        &'a mut self,
+        output: &Output,
+        renderer: &mut GlesRenderer,
+        framebuffer: &mut GlesTarget<'_>,
+        age: usize,
+        scene: &SceneGraph,
+        blur: BlurSettings,
+        resolve_window: F,
+    ) -> Result<RenderOutputResult<'a>, OutputDamageTrackerError<GlesError>>
+    where
+        F: FnMut(WindowId) -> Option<&'a Window>,
+    {
+        let elements = self.collect_scene_elements(output, renderer, scene, blur, resolve_window);
 
         self.damage_tracker.render_output(
             renderer,

@@ -45,6 +45,7 @@ pub struct WinitConfig {
     pub reduced_motion: bool,
     pub shadows_enabled: bool,
     pub blur_enabled: bool,
+    pub safe_mode: bool,
 }
 
 /// Runs the NEON DE Wayland compositor inside a nested `winit` window on the host desktop.
@@ -82,9 +83,16 @@ pub fn run_winit(config: WinitConfig) -> Result<()> {
         event_loop.get_signal(),
         socket_name.clone(),
     );
+    state.backend_name = "winit".to_string();
+    state.safe_mode = config.safe_mode;
     // Load persisted user configuration from XDG config path, then apply CLI overrides.
     let loaded_cfg = neon_config::load_or_default(&neon_config::default_config_path());
     state.apply_config(loaded_cfg);
+    if config.safe_mode {
+        state.effects.config.reduced_motion = true;
+        state.effects.config.shadows_enabled = false;
+        state.effects.config.blur_enabled = false;
+    }
     if config.reduced_motion {
         state.effects.config.reduced_motion = true;
     }
@@ -339,6 +347,7 @@ fn render_frame(
     output: &Output,
     state: &mut NeonState,
 ) {
+    let frame_start = std::time::Instant::now();
     let is_locked = state.is_locked();
     if !is_locked {
         let _animating = state.sync_scene_graph();
@@ -400,7 +409,11 @@ fn render_frame(
             warn!(?err, "Failed to submit winit swapchain frame");
         } else {
             *presented_once = true;
+            state.frames_rendered += 1;
+            state.last_frame_time_us = frame_start.elapsed().as_micros() as u64;
         }
+    } else {
+        state.idle_frames_skipped += 1;
     }
 
     let now = state.clock.now();

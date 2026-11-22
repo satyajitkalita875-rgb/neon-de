@@ -2,7 +2,7 @@
 
 **NEON DE** is an independent, next-generation Linux desktop environment built in **Rust** with **Smithay** and **Wayland**.
 
-> **Project Status**: **Milestone 7 (Linux System Integration)** — Custom Smithay `0.7.0` Wayland compositor + GTK4 Desktop Shell (Top Panel, Live System Tray, Control Center, Notification Toasts, Dock, Overview) + macOS-inspired GTK4 Settings App + `ext_session_lock_v1` Lock Screen + `neon-system` Linux D-Bus/PipeWire integration across 13 modular crates (`neon-compositor`, `neon-shell`, `neon-settings`, `neon-lockscreen`, `neon-system`, `neon-config`, `neon-output`, `neon-ipc`, `neon-renderer`, `neon-scene`, `neon-effects`, `neon-window-manager`, `neon-workspaces`). Bare-metal session packaging & production hardening follow in Milestone 8.
+> **Project Status**: **Milestone 8 (Production Readiness — All 8 Milestones Complete)** — Full independent Wayland Desktop Environment across 14 modular Rust crates (`neon-compositor` with both nested `winit` and bare-metal `DRM/KMS + libseat + libinput` backends, `neon-session` crash-recovery supervisor, `neon-shell` GTK4 Top Panel/System Tray/Control Center/Toasts/Dock/Overview, `neon-settings` macOS-inspired GTK4 Settings App, `neon-lockscreen`, `neon-system`, `neon-config`, `neon-output`, `neon-ipc`, `neon-renderer`, `neon-scene`, `neon-effects`, `neon-window-manager`, `neon-workspaces`). Ready for nested testing or system installation via `./scripts/install.sh`.
 
 ## Vision
 
@@ -51,6 +51,7 @@ cargo run -p neon-compositor -- --command weston-terminal
 - [IPC Specification](docs/IPC_SPECIFICATION.md)
 - [Configuration Specification](docs/CONFIGURATION_SPECIFICATION.md)
 - [Linux System Integration](docs/SYSTEM_INTEGRATION.md)
+- [Production Readiness & Packaging](docs/PRODUCTION_AND_PACKAGING.md)
 - [Security Model](docs/SECURITY_MODEL.md)
 - [Build Instructions](docs/BUILD_INSTRUCTIONS.md)
 - [Testing Guide](docs/TESTING_GUIDE.md)

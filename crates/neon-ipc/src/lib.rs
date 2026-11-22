@@ -186,6 +186,22 @@ pub struct AppearanceInfo {
     pub panel_visible: bool,
     pub show_clock: bool,
     pub show_workspaces: bool,
+    #[serde(default)]
+    pub high_contrast: bool,
+}
+
+/// Live compositor frame-timing, uptime, and runtime diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiagnosticsInfo {
+    pub backend: String,
+    pub uptime_secs: u64,
+    pub frames_rendered: u64,
+    pub idle_frames_skipped: u64,
+    pub last_frame_time_us: u64,
+    pub window_count: usize,
+    pub workspace_count: usize,
+    pub output_count: usize,
+    pub safe_mode: bool,
 }
 
 /// Snapshot of live window manager behavior settings.
@@ -222,6 +238,7 @@ pub struct IpcRequestEnvelope {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum IpcRequest {
     GetState,
+    GetDiagnostics,
     GetWindows,
     GetWorkspaces,
     GetOutputs,
@@ -276,6 +293,8 @@ pub enum IpcRequest {
         panel_visible: Option<bool>,
         show_clock: Option<bool>,
         show_workspaces: Option<bool>,
+        #[serde(default)]
+        high_contrast: Option<bool>,
     },
     UpdateWindowBehavior {
         focus_follows_mouse: Option<bool>,
@@ -315,6 +334,7 @@ pub enum IpcResult {
 pub enum IpcPayload {
     Ack,
     State { snapshot: DesktopSnapshot },
+    Diagnostics { diagnostics: DiagnosticsInfo },
     Windows { windows: Vec<WindowInfo> },
     Workspaces { workspaces: Vec<WorkspaceInfo> },
     Outputs { outputs: Vec<OutputInfo> },

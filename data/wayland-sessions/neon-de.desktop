@@ -1,0 +1,8 @@
+[Desktop Entry]
+Name=NEON DE
+Comment=Independent Wayland Desktop Environment built in Rust and Smithay
+Exec=/usr/local/bin/neon-session
+TryExec=/usr/local/bin/neon-session
+Type=Application
+DesktopNames=NEON-DE
+Keywords=wayland;desktop;neon;smithay;

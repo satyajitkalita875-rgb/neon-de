@@ -1,0 +1,21 @@
+[package]
+name = "neon-session"
+description = "NEON DE production session supervisor with crash recovery, safe mode, and diagnostics"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "neon-session"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+libc.workspace = true
+neon-config.workspace = true
+neon-ipc.workspace = true
+neon-system.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

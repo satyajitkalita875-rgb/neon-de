@@ -158,6 +158,14 @@ pub struct NeonState {
     pub pointer_location: Point<f64, Logical>,
     pub cursor_status: CursorImageStatus,
     pub primary_output: Option<Output>,
+
+    // Runtime diagnostics & frame telemetry (Milestone 8)
+    pub backend_name: String,
+    pub safe_mode: bool,
+    pub started_at: std::time::Instant,
+    pub frames_rendered: u64,
+    pub idle_frames_skipped: u64,
+    pub last_frame_time_us: u64,
 }
 
 impl NeonState {
@@ -236,6 +244,12 @@ impl NeonState {
             pointer_location: (640.0, 400.0).into(),
             cursor_status: CursorImageStatus::default_named(),
             primary_output: None,
+            backend_name: "headless".to_string(),
+            safe_mode: false,
+            started_at: std::time::Instant::now(),
+            frames_rendered: 0,
+            idle_frames_skipped: 0,
+            last_frame_time_us: 0,
         }
     }
 

@@ -11,7 +11,7 @@ NEON DE is built in eight verifiable milestones. Every milestone produces a comp
 | **M5 — Advanced Compositor** | GPU frosted-glass blur & translucency, touchpad gestures (`zwp_pointer_gestures_v1`), multi-monitor (`neon-output`) & hotplugging, fractional scaling (`wp_fractional_scale_v1` + `wp_viewporter`), XWayland (`X11Wm`), `ext_session_lock_v1` + `neon-lockscreen` | **Completed (Verified)** |
 | **M6 — Settings Application** | Versioned XDG config service (`neon-config`), GTK4 macOS-inspired `neon-settings` app with live IPC updates across Appearance, Displays, Desktop/Windows, Dock/Panels, Effects, Input, Privacy/Accessibility, and System | **Completed (Verified)** |
 | **M7 — System Integration** | D-Bus integration (`neon-system`): NetworkManager, PipeWire/WirePlumber, BlueZ, UPower, notifications daemon, polkit, XDG Desktop Portals | **Completed (Verified)** |
-| **M8 — Production Readiness** | Crash recovery, profiling, accessibility, packaging, session `.desktop` files (`neon-session`), bare-metal QA | **Next** |
+| **M8 — Production Readiness** | Bare-metal DRM/KMS backend (`libseat` + `libinput` + `udev` + `GBM`), `neon-session` supervisor with crash recovery & `--safe-mode`, frame diagnostics telemetry, high-contrast accessibility, Wayland `.desktop` sessions, systemd user units, release `install.sh`/`uninstall.sh` | **Completed (Verified)** |
 
 ## Milestone 1 Acceptance Criteria
 
@@ -68,3 +68,11 @@ NEON DE is built in eight verifiable milestones. Every milestone produces a comp
 - [x] Integrated live Top Panel status pills (Network, PipeWire Volume, UPower Battery), Control Center / Quick Settings overlay, and live Notification Toast overlay into `neon-shell` off the UI thread.
 - [x] Upgraded `neon-settings` *System* page with live PipeWire audio, NetworkManager Wi-Fi, BlueZ Bluetooth, UPower Power Profiles, Notification test, PolicyKit1, and XDG Portal status & controls.
 - [x] Verified unit tests, live D-Bus `org.freedesktop.Notifications` v1.2 roundtrip test, live Linux subsystem snapshot probe, and live nested NEON DE session with `neon-shell` + `neon-settings` + D-Bus notification toast delivery.
+
+## Milestone 8 Acceptance Criteria
+
+- [x] Implemented bare-metal DRM/KMS + GBM + EGL/GLES + `libseat` + `libinput` + `udev` backend in `crates/neon-compositor/src/backend/drm.rs` alongside nested `winit` with `--backend auto|winit|drm` and `--safe-mode`.
+- [x] Built `crates/neon-session` production supervisor with `neon-shell` automatic crash recovery, crash-loop protection, `--safe-mode`, and `--diagnostics`.
+- [x] Added live compositor frame-timing telemetry (`IpcRequest::GetDiagnostics` / `DiagnosticsInfo`) and live high-contrast accessibility mode across `neon-compositor`, `neon-shell`, and `neon-settings`.
+- [x] Packaged Wayland session `.desktop` entries (`neon-de.desktop`, `neon-de-safe.desktop`), desktop launchers, XDG portal config, systemd user units, and `scripts/install.sh` + `scripts/uninstall.sh`.
+- [x] Verified full release build, zero clippy warnings, all unit & integration tests, live `neon-session` crash recovery test (killing `neon-shell` and confirming automatic respawn while `neon-compositor` stays alive), and system installation.

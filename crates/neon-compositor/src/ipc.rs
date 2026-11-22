@@ -9,10 +9,10 @@ use std::{
 
 use neon_config::{FocusMode, ThemeMode};
 use neon_ipc::{
-    AppearanceInfo, DesktopSnapshot, EffectsInfo, EventTopic, IpcEvent, IpcPayload, IpcRequest,
-    IpcRequestEnvelope, IpcResult, IpcServerMessage, MAX_FRAME_BYTES, OutputInfo, PROTOCOL_VERSION,
-    WindowBehaviorInfo, WindowInfo, WorkspaceInfo, bind_ipc_listener, encode_frame,
-    verify_peer_credentials,
+    AppearanceInfo, DesktopSnapshot, DiagnosticsInfo, EffectsInfo, EventTopic, IpcEvent,
+    IpcPayload, IpcRequest, IpcRequestEnvelope, IpcResult, IpcServerMessage, MAX_FRAME_BYTES,
+    OutputInfo, PROTOCOL_VERSION, WindowBehaviorInfo, WindowInfo, WorkspaceInfo, bind_ipc_listener,
+    encode_frame, verify_peer_credentials,
 };
 use neon_output::{OutputConfigPatch, OutputTransform};
 use neon_window_manager::{WindowId, geometry::Point as WmPoint};
@@ -279,6 +279,21 @@ fn handle_ipc_request(
                 snapshot: build_snapshot(state),
             },
         },
+        IpcRequest::GetDiagnostics => IpcResult::Ok {
+            payload: IpcPayload::Diagnostics {
+                diagnostics: DiagnosticsInfo {
+                    backend: state.backend_name.clone(),
+                    uptime_secs: state.started_at.elapsed().as_secs(),
+                    frames_rendered: state.frames_rendered,
+                    idle_frames_skipped: state.idle_frames_skipped,
+                    last_frame_time_us: state.last_frame_time_us,
+                    window_count: state.managed_windows.len(),
+                    workspace_count: state.wm.workspaces().len(),
+                    output_count: state.output_manager.all_outputs().len(),
+                    safe_mode: state.safe_mode,
+                },
+            },
+        },
         IpcRequest::GetWindows => IpcResult::Ok {
             payload: IpcPayload::Windows {
                 windows: build_windows(state),
@@ -543,6 +558,7 @@ fn handle_ipc_request(
             panel_visible,
             show_clock,
             show_workspaces,
+            high_contrast,
         } => {
             if let Some(t) = theme {
                 state.config.appearance.theme = match t.as_str() {
@@ -568,6 +584,9 @@ fn handle_ipc_request(
             }
             if let Some(v) = show_workspaces {
                 state.config.panel.show_workspaces = v;
+            }
+            if let Some(v) = high_contrast {
+                state.config.privacy_accessibility.high_contrast = v;
             }
             state.config.validate_and_clamp();
             IpcResult::Ok {
@@ -723,6 +742,7 @@ fn build_appearance(state: &NeonState) -> AppearanceInfo {
         panel_visible: state.config.panel.visible,
         show_clock: state.config.panel.show_clock,
         show_workspaces: state.config.panel.show_workspaces,
+        high_contrast: state.config.privacy_accessibility.high_contrast,
     }
 }
 

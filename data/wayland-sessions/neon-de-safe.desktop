@@ -1,0 +1,8 @@
+[Desktop Entry]
+Name=NEON DE (Safe Mode)
+Comment=NEON DE minimal recovery session with blur, shadows, and animations disabled
+Exec=/usr/local/bin/neon-session --safe-mode
+TryExec=/usr/local/bin/neon-session
+Type=Application
+DesktopNames=NEON-DE
+Keywords=wayland;desktop;neon;recovery;safe;

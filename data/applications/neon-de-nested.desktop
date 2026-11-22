@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=NEON DE (Nested Session)
+Comment=Launch NEON DE inside a nested Wayland window without leaving your current desktop
+Exec=/usr/local/bin/neon-session --nested
+TryExec=/usr/local/bin/neon-session
+Icon=preferences-desktop-display
+Terminal=false
+Type=Application
+Categories=System;Utility;
+StartupNotify=true
