@@ -7,6 +7,7 @@ mod notifications;
 mod overview;
 mod panel;
 mod quick_settings;
+mod screenshot_ui;
 mod style;
 mod wallpaper;
 
@@ -31,6 +32,7 @@ use crate::{
     overview::Overview,
     panel::TopPanel,
     quick_settings::QuickSettingsPanel,
+    screenshot_ui::ScreenshotOverlay,
     wallpaper::WallpaperLayer,
 };
 
@@ -93,6 +95,7 @@ fn main() {
 
         // Background wallpaper layer renders behind all desktop windows & panels.
         let wallpaper_layer = WallpaperLayer::build(app);
+        let screenshot_overlay = ScreenshotOverlay::build(app, ipc_sender.clone());
         let toast_overlay = NotificationOverlay::build(app, Arc::clone(&notif_store));
         let quick_settings = QuickSettingsPanel::build(
             app,
@@ -123,12 +126,16 @@ fn main() {
                         theme_ctrl.apply_if_changed(&snapshot.appearance);
                         wallpaper_layer.update(&snapshot.appearance);
                         quick_settings.update_appearance(&snapshot.appearance);
+                        screenshot_overlay.update_snapshot(&snapshot);
                         top_panel.update(&snapshot);
                         dock.update(&snapshot);
                         overview.update(&snapshot);
                     }
                     ShellIpcUpdate::OverviewToggled(open) => {
                         overview.set_open(open);
+                    }
+                    ShellIpcUpdate::ScreenshotUiRequested => {
+                        screenshot_overlay.open();
                     }
                 }
             }

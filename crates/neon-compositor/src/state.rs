@@ -45,7 +45,7 @@ use smithay::{
         pointer_gestures::PointerGesturesState,
         presentation::PresentationState,
         seat::WaylandFocus,
-        selection::data_device::DataDeviceState,
+        selection::{data_device::DataDeviceState, wlr_data_control::DataControlState},
         session_lock::SessionLockManagerState,
         shell::{
             wlr_layer::{
@@ -127,6 +127,7 @@ pub struct NeonState {
     pub output_manager_state: OutputManagerState,
     pub seat_state: SeatState<Self>,
     pub data_device_state: DataDeviceState,
+    pub data_control_state: DataControlState,
     pub popups: PopupManager,
 
     // XWayland state
@@ -171,8 +172,10 @@ pub struct NeonState {
     pub last_frame_time_us: u64,
     /// Optional VT switching hook (wired to `LibSeatSession::change_vt` on DRM/KMS).
     pub vt_switch_hook: Option<VtSwitchHook>,
-    /// Queued native screenshot destination captured on the next render frame.
-    pub pending_screenshot: Option<PathBuf>,
+    /// Queued native screenshot destination + optional `[x, y, w, h]` logical crop region.
+    pub pending_screenshot: Option<(PathBuf, Option<[i32; 4]>)>,
+    /// Signals `neon-shell` to open the GNOME-style interactive screenshot overlay.
+    pub pending_screenshot_ui: bool,
 }
 
 impl NeonState {
@@ -201,6 +204,7 @@ impl NeonState {
         let dmabuf_state = DmabufState::new();
         let output_manager_state = OutputManagerState::new_with_xdg_output::<Self>(&display_handle);
         let data_device_state = DataDeviceState::new::<Self>(&display_handle);
+        let data_control_state = DataControlState::new::<Self, _>(&display_handle, None, |_| true);
 
         let mut seat_state = SeatState::new();
         let mut seat = seat_state.new_wl_seat(&display_handle, "neon-seat-0");
@@ -232,6 +236,7 @@ impl NeonState {
             output_manager_state,
             seat_state,
             data_device_state,
+            data_control_state,
             popups: PopupManager::default(),
             xwm: None,
             xwayland_display: None,
@@ -259,6 +264,7 @@ impl NeonState {
             last_frame_time_us: 0,
             vt_switch_hook: None,
             pending_screenshot: None,
+            pending_screenshot_ui: false,
         }
     }
 
@@ -1120,8 +1126,12 @@ impl NeonState {
         }
     }
 
-    /// Queues a native PNG screenshot to be captured on the next render pass.
-    pub fn request_screenshot(&mut self, custom_path: Option<PathBuf>) -> PathBuf {
+    /// Queues a native PNG screenshot (full display or `[x, y, w, h]` crop) for the next render pass.
+    pub fn request_screenshot(
+        &mut self,
+        custom_path: Option<PathBuf>,
+        region: Option<[i32; 4]>,
+    ) -> PathBuf {
         let dest = custom_path.unwrap_or_else(|| {
             let base = std::env::var_os("HOME")
                 .map(PathBuf::from)
@@ -1133,8 +1143,8 @@ impl NeonState {
                 .unwrap_or(0);
             base.join(format!("NEON-Screenshot-{ts}.png"))
         });
-        info!(path = %dest.display(), "Queued native NEON DE screenshot");
-        self.pending_screenshot = Some(dest.clone());
+        info!(path = %dest.display(), ?region, "Queued native NEON DE screenshot");
+        self.pending_screenshot = Some((dest.clone(), region));
         dest
     }
 

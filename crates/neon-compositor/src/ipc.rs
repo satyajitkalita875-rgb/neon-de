@@ -200,12 +200,23 @@ impl IpcServer {
     }
 
     /// Broadcasts `IpcEvent::StateChanged` to subscribed clients whenever the desktop snapshot changes.
-    pub fn broadcast_if_changed(&mut self, state: &NeonState) {
+    pub fn broadcast_if_changed(&mut self, state: &mut NeonState) {
         if !self.clients.iter().any(|c| !c.subscriptions.is_empty()) {
             return;
         }
+        let screenshot_ui_frame = if state.pending_screenshot_ui {
+            state.pending_screenshot_ui = false;
+            Some(encode_frame(&IpcServerMessage::Event {
+                version: PROTOCOL_VERSION,
+                event: IpcEvent::ScreenshotUiRequested,
+            }))
+        } else {
+            None
+        };
+
         let snapshot = build_snapshot(state);
-        if self.last_broadcast_snapshot.as_ref() == Some(&snapshot) {
+        if screenshot_ui_frame.is_none() && self.last_broadcast_snapshot.as_ref() == Some(&snapshot)
+        {
             return;
         }
 
@@ -245,6 +256,14 @@ impl IpcServer {
             if !failed
                 && client.subscriptions.contains(&EventTopic::Overview)
                 && let Some(Ok(bytes)) = &overview_frame
+                && client.stream.write_all(bytes).is_err()
+            {
+                failed = true;
+            }
+
+            if !failed
+                && !client.subscriptions.is_empty()
+                && let Some(Ok(bytes)) = &screenshot_ui_frame
                 && client.stream.write_all(bytes).is_err()
             {
                 failed = true;
@@ -463,8 +482,14 @@ fn handle_ipc_request(
                 payload: IpcPayload::Ack,
             }
         }
-        IpcRequest::TakeScreenshot { path } => {
-            let dest = state.request_screenshot(path.map(std::path::PathBuf::from));
+        IpcRequest::OpenScreenshotUi => {
+            state.pending_screenshot_ui = true;
+            IpcResult::Ok {
+                payload: IpcPayload::Ack,
+            }
+        }
+        IpcRequest::TakeScreenshot { path, region } => {
+            let dest = state.request_screenshot(path.map(std::path::PathBuf::from), region);
             IpcResult::Ok {
                 payload: IpcPayload::Screenshot {
                     path: dest.to_string_lossy().into_owned(),

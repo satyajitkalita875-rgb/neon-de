@@ -327,9 +327,9 @@ impl QuickSettingsPanel {
                 overlay.set_suppressed(false);
                 let ipc_c = ipc.clone();
                 gtk4::glib::timeout_add_local_once(
-                    std::time::Duration::from_millis(120),
+                    std::time::Duration::from_millis(80),
                     move || {
-                        ipc_c.send(IpcRequest::TakeScreenshot { path: None });
+                        ipc_c.send(IpcRequest::OpenScreenshotUi);
                     },
                 );
             });

@@ -38,6 +38,7 @@ enum CompositorAction {
     SpawnTerminal,
     ToggleOverview,
     LockSession,
+    OpenScreenshotUi,
     TakeScreenshot,
     CloseFocused,
     CycleFocus,
@@ -138,15 +139,23 @@ fn handle_keyboard<B: InputBackend>(state: &mut NeonState, event: B::KeyboardKey
                 return FilterResult::Intercept(CompositorAction::Quit);
             }
 
-            // Native screenshot shortcuts: Print key, Super+Shift+S, or macOS Super+Shift+3
+            // GNOME-style interactive screenshot UI: Print key, Super+Shift+S, or Super+Shift+4
             if sym == Keysym::from(keysyms::KEY_Print) {
-                return FilterResult::Intercept(CompositorAction::TakeScreenshot);
+                return FilterResult::Intercept(CompositorAction::OpenScreenshotUi);
             }
             if modifiers.logo
                 && modifiers.shift
                 && (sym == Keysym::from(keysyms::KEY_s)
                     || sym == Keysym::from(keysyms::KEY_S)
-                    || sym == Keysym::from(keysyms::KEY_3)
+                    || sym == Keysym::from(keysyms::KEY_4)
+                    || sym == Keysym::from(keysyms::KEY_dollar))
+            {
+                return FilterResult::Intercept(CompositorAction::OpenScreenshotUi);
+            }
+            // Instant full-screen screenshot: macOS Super+Shift+3
+            if modifiers.logo
+                && modifiers.shift
+                && (sym == Keysym::from(keysyms::KEY_3)
                     || sym == Keysym::from(keysyms::KEY_numbersign))
             {
                 return FilterResult::Intercept(CompositorAction::TakeScreenshot);
@@ -280,8 +289,11 @@ fn handle_keyboard<B: InputBackend>(state: &mut NeonState, event: B::KeyboardKey
             CompositorAction::LockSession => {
                 state.lock_session();
             }
+            CompositorAction::OpenScreenshotUi => {
+                state.pending_screenshot_ui = true;
+            }
             CompositorAction::TakeScreenshot => {
-                state.request_screenshot(None);
+                state.request_screenshot(None, None);
             }
             CompositorAction::CloseFocused => state.close_focused_window(),
             CompositorAction::CycleFocus => state.cycle_focus(serial),

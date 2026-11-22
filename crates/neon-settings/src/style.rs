@@ -10,6 +10,7 @@ pub struct SettingsTheme {
 impl SettingsTheme {
     pub fn init(mode: ThemeMode, accent: &str) -> Self {
         let provider = CssProvider::new();
+        apply_settings_icon_theme(mode);
         provider.load_from_string(&build_css(mode, accent));
         if let Some(display) = Display::default() {
             gtk4::style_context_add_provider_for_display(
@@ -22,7 +23,20 @@ impl SettingsTheme {
     }
 
     pub fn update(&self, mode: ThemeMode, accent: &str) {
+        apply_settings_icon_theme(mode);
         self.provider.load_from_string(&build_css(mode, accent));
+    }
+}
+
+fn apply_settings_icon_theme(mode: ThemeMode) {
+    if let Some(settings) = gtk4::Settings::default() {
+        let light = mode == ThemeMode::NeonLight;
+        settings.set_gtk_icon_theme_name(Some(if light {
+            "WhiteSur-light"
+        } else {
+            "WhiteSur-dark"
+        }));
+        settings.set_gtk_application_prefer_dark_theme(!light);
     }
 }
 

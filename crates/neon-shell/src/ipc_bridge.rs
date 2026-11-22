@@ -19,6 +19,7 @@ use tracing::{debug, info, warn};
 pub enum ShellIpcUpdate {
     Snapshot(DesktopSnapshot),
     OverviewToggled(bool),
+    ScreenshotUiRequested,
 }
 
 /// Handle used by GTK4 widgets to send fire-and-forget commands to `neon-compositor`.
@@ -110,6 +111,14 @@ pub fn start_ipc_bridge(socket_path: PathBuf) -> (IpcCommandSender, Receiver<She
                                     IpcEvent::OverviewToggled { open } => {
                                         if update_tx
                                             .send(ShellIpcUpdate::OverviewToggled(open))
+                                            .is_err()
+                                        {
+                                            return;
+                                        }
+                                    }
+                                    IpcEvent::ScreenshotUiRequested => {
+                                        if update_tx
+                                            .send(ShellIpcUpdate::ScreenshotUiRequested)
                                             .is_err()
                                         {
                                             return;

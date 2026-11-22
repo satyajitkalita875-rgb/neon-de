@@ -367,7 +367,7 @@ fn render_frame(
         let pending_shot = state.pending_screenshot.take();
         match backend.bind() {
             Ok((renderer, mut framebuffer)) => {
-                if let Some(shot_path) = pending_shot {
+                if let Some((shot_path, region)) = pending_shot {
                     match capture_output_to_png(
                         renderer,
                         neon_renderer,
@@ -375,6 +375,7 @@ fn render_frame(
                         &state.scene,
                         blur,
                         is_locked,
+                        region,
                         |id| state.managed_windows.get(&id),
                         &shot_path,
                     ) {

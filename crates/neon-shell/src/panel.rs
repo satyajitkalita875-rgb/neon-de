@@ -117,11 +117,11 @@ impl TopPanel {
         let shot_btn = Button::new();
         shot_btn.add_css_class("neon-tray-btn");
         shot_btn.set_child(Some(&shot_icon));
-        shot_btn.set_tooltip_text(Some("Take Screenshot (Print / Super+Shift+3)"));
+        shot_btn.set_tooltip_text(Some("Screenshot (Print / Super+Shift+4)"));
         {
             let ipc = ipc.clone();
             shot_btn.connect_clicked(move |_| {
-                ipc.send(IpcRequest::TakeScreenshot { path: None });
+                ipc.send(IpcRequest::OpenScreenshotUi);
             });
         }
 

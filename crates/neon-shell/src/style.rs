@@ -25,6 +25,7 @@ impl ShellThemeController {
             wallpaper: None,
         };
         provider.load_from_string(&build_shell_css(&default_appearance));
+        apply_gtk_icon_theme(false);
         if let Some(display) = Display::default() {
             gtk4::style_context_add_provider_for_display(
                 &display,
@@ -42,8 +43,22 @@ impl ShellThemeController {
         if self.last_applied.as_ref() == Some(appearance) {
             return;
         }
+        let is_light = appearance.theme == "neon_light" || appearance.theme == "light";
+        apply_gtk_icon_theme(is_light);
         self.provider.load_from_string(&build_shell_css(appearance));
         self.last_applied = Some(appearance.clone());
+    }
+}
+
+fn apply_gtk_icon_theme(is_light: bool) {
+    if let Some(settings) = gtk4::Settings::default() {
+        let icon_theme = if is_light {
+            "WhiteSur-light"
+        } else {
+            "WhiteSur-dark"
+        };
+        settings.set_gtk_icon_theme_name(Some(icon_theme));
+        settings.set_gtk_application_prefer_dark_theme(!is_light);
     }
 }
 
@@ -152,7 +167,8 @@ window.neon-panel-window,
 window.neon-dock-window,
 window.neon-overview-window,
 window.neon-quicksettings-window,
-window.neon-toast-window {{
+window.neon-toast-window,
+window.neon-screenshot-window {{
     background-color: transparent;
 }}
 
@@ -597,6 +613,54 @@ window.neon-wallpaper-window {{
 
 .neon-toast-card.critical {{
     border-color: #EF4444;
+}}
+
+/* ===================== GNOME 47 INTERACTIVE SCREENSHOT UI ===================== */
+
+.neon-gnome-shot-bar {{
+    background-color: rgba(24, 26, 34, 0.92);
+    border: 1px solid rgba(255, 255, 255, 0.16);
+    border-radius: 26px;
+    padding: 14px 20px;
+    box-shadow: 0 20px 48px rgba(0, 0, 0, 0.55);
+    color: #F8FAFC;
+}}
+
+.neon-shot-mode-btn {{
+    background-color: rgba(255, 255, 255, 0.08);
+    color: #CBD5E1;
+    border: 1px solid transparent;
+    border-radius: 999px;
+    padding: 7px 14px;
+    font-size: 13px;
+    font-weight: 600;
+    transition: background-color 140ms ease, color 140ms ease;
+}}
+
+.neon-shot-mode-btn:hover {{
+    background-color: rgba(255, 255, 255, 0.16);
+    color: #FFFFFF;
+}}
+
+.neon-shot-mode-btn.active {{
+    background-color: {accent};
+    color: #FFFFFF;
+}}
+
+.neon-shot-shutter {{
+    background-color: #FFFFFF;
+    color: #0F172A;
+    border: 4px solid rgba(255, 255, 255, 0.35);
+    border-radius: 999px;
+    min-width: 54px;
+    min-height: 54px;
+    padding: 0;
+    box-shadow: 0 6px 20px rgba(0, 0, 0, 0.40);
+    transition: background-color 120ms ease;
+}}
+
+.neon-shot-shutter:hover {{
+    background-color: #E2E8F0;
 }}
 "#
     )

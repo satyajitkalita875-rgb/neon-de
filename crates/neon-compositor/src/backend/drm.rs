@@ -590,7 +590,7 @@ fn render_all_drm_outputs(rt: &mut DrmRuntime, state: &mut NeonState) {
 
     let crtcs: Vec<crtc::Handle> = rt.outputs.keys().copied().collect();
     // Fulfill queued native screenshot capture cleanly via offscreen GLES readback.
-    if let Some(shot_path) = state.pending_screenshot.take()
+    if let Some((shot_path, region)) = state.pending_screenshot.take()
         && let Some(&primary_crtc) = crtcs.first()
         && let Some(active) = rt.outputs.get_mut(&primary_crtc)
     {
@@ -601,6 +601,7 @@ fn render_all_drm_outputs(rt: &mut DrmRuntime, state: &mut NeonState) {
             &state.scene,
             blur,
             is_locked,
+            region,
             |id| state.managed_windows.get(&id),
             &shot_path,
         ) {

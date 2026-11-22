@@ -11,6 +11,7 @@ use smithay::{
                 ClientDndGrabHandler, DataDeviceHandler, DataDeviceState, ServerDndGrabHandler,
                 set_data_device_focus,
             },
+            wlr_data_control::{DataControlHandler, DataControlState},
         },
     },
 };
@@ -46,6 +47,12 @@ impl ServerDndGrabHandler for NeonState {}
 impl DataDeviceHandler for NeonState {
     fn data_device_state(&self) -> &DataDeviceState {
         &self.data_device_state
+    }
+}
+
+impl DataControlHandler for NeonState {
+    fn data_control_state(&self) -> &DataControlState {
+        &self.data_control_state
     }
 }
 

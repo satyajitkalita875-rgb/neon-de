@@ -88,8 +88,8 @@ impl Default for AppearanceConfig {
             accent_color: "#38BDF8".into(),
             font_family: "Inter".into(),
             font_size: 11,
-            icon_theme: "Adwaita".into(),
-            cursor_theme: "default".into(),
+            icon_theme: "WhiteSur-dark".into(),
+            cursor_theme: "Bibata-Modern-Ice".into(),
             ui_density: UiDensity::Comfortable,
             wallpaper_path: None,
         }

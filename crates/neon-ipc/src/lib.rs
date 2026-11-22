@@ -268,8 +268,11 @@ pub enum IpcRequest {
         open: bool,
     },
     LockSession,
+    OpenScreenshotUi,
     TakeScreenshot {
         path: Option<String>,
+        #[serde(default)]
+        region: Option<[i32; 4]>,
     },
     ConfigureOutput {
         name: String,
@@ -360,6 +363,7 @@ pub enum IpcPayload {
 pub enum IpcEvent {
     StateChanged { snapshot: DesktopSnapshot },
     OverviewToggled { open: bool },
+    ScreenshotUiRequested,
 }
 
 /// Encodes a serializable IPC message as a newline-delimited JSON line.
