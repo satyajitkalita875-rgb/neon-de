@@ -3,6 +3,9 @@ resolver = "2"
 members = [
     "crates/neon-workspaces",
     "crates/neon-window-manager",
+    "crates/neon-effects",
+    "crates/neon-scene",
+    "crates/neon-renderer",
     "crates/neon-compositor",
 ]
 
@@ -16,6 +19,9 @@ repository = "https://github.com/neon-de/neon-de"
 [workspace.dependencies]
 neon-workspaces = { path = "crates/neon-workspaces" }
 neon-window-manager = { path = "crates/neon-window-manager" }
+neon-effects = { path = "crates/neon-effects" }
+neon-scene = { path = "crates/neon-scene" }
+neon-renderer = { path = "crates/neon-renderer" }
 smithay = { version = "0.7.0", default-features = false, features = [
     "backend_winit",
     "desktop",

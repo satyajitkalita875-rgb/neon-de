@@ -907,6 +907,9 @@ dependencies = [
  "anyhow",
  "bitflags 2.13.2",
  "clap",
+ "neon-effects",
+ "neon-renderer",
+ "neon-scene",
  "neon-window-manager",
  "neon-workspaces",
  "smithay",
@@ -915,6 +918,32 @@ dependencies = [
  "tracing-subscriber",
  "wayland-client",
  "wayland-protocols",
+]
+
+[[package]]
+name = "neon-effects"
+version = "0.1.0"
+dependencies = [
+ "neon-window-manager",
+ "tracing",
+]
+
+[[package]]
+name = "neon-renderer"
+version = "0.1.0"
+dependencies = [
+ "neon-scene",
+ "neon-window-manager",
+ "smithay",
+ "tracing",
+]
+
+[[package]]
+name = "neon-scene"
+version = "0.1.0"
+dependencies = [
+ "neon-window-manager",
+ "tracing",
 ]
 
 [[package]]

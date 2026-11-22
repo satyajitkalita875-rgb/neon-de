@@ -1,7 +1,7 @@
-//! `wl_compositor`, `wl_subcompositor`, `wl_shm`, and `wl_buffer` handlers.
+//! `wl_compositor`, `wl_subcompositor`, `wl_shm`, `zwp_linux_dmabuf_v1`, and `wl_buffer` handlers.
 
 use smithay::{
-    backend::renderer::utils::on_commit_buffer_handler,
+    backend::{allocator::dmabuf::Dmabuf, renderer::utils::on_commit_buffer_handler},
     reexports::wayland_server::{
         Client,
         protocol::{wl_buffer::WlBuffer, wl_surface::WlSurface},
@@ -13,11 +13,12 @@ use smithay::{
             CompositorClientState, CompositorHandler, CompositorState, is_sync_subsurface,
             with_states,
         },
+        dmabuf::{DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier},
         shell::xdg::{XdgPopupSurfaceData, XdgToplevelSurfaceData},
         shm::{ShmHandler, ShmState},
     },
 };
-use tracing::trace;
+use tracing::{debug, trace};
 
 use crate::{
     state::{NeonClientData, NeonState},
@@ -31,6 +32,32 @@ impl BufferHandler for NeonState {
 impl ShmHandler for NeonState {
     fn shm_state(&self) -> &ShmState {
         &self.shm_state
+    }
+}
+
+impl DmabufHandler for NeonState {
+    fn dmabuf_state(&mut self) -> &mut DmabufState {
+        &mut self.dmabuf_state
+    }
+
+    fn dmabuf_imported(
+        &mut self,
+        _global: &DmabufGlobal,
+        dmabuf: Dmabuf,
+        notifier: ImportNotifier,
+    ) {
+        let imported = self
+            .dmabuf_import_hook
+            .as_mut()
+            .map(|hook| hook(&dmabuf))
+            .unwrap_or(false);
+
+        if imported {
+            let _ = notifier.successful::<Self>();
+        } else {
+            debug!("Rejecting unsupported DMA-BUF import");
+            notifier.failed();
+        }
     }
 }
 
@@ -105,6 +132,8 @@ impl CompositorHandler for NeonState {
                         .map(|w| w.is_visible_on(self.wm.active_workspace_id()))
                         .unwrap_or(false)
                 {
+                    let now = self.now_duration();
+                    self.effects.animate_window_open(id, now);
                     let serial = SERIAL_COUNTER.next_serial();
                     self.focus_window(Some(&window), serial);
                 }

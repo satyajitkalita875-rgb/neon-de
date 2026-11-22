@@ -5,7 +5,7 @@ use clap::Parser;
 use neon_compositor::backend::winit::{WinitConfig, run_winit};
 use tracing_subscriber::EnvFilter;
 
-/// NEON DE Wayland Compositor (Milestone 1 — Nested Development Backend)
+/// NEON DE Wayland Compositor (Nested Development Backend)
 #[derive(Debug, Parser)]
 #[command(name = "neon-compositor", version, about)]
 struct Cli {
@@ -21,6 +21,14 @@ struct Cli {
     #[arg(long)]
     socket: Option<String>,
 
+    /// Disable compositor animations (accessibility reduced-motion mode).
+    #[arg(long, default_value_t = false)]
+    reduced_motion: bool,
+
+    /// Disable analytical GPU window shadows.
+    #[arg(long, default_value_t = false)]
+    no_shadows: bool,
+
     /// Optional Wayland client command to launch automatically inside NEON DE.
     #[arg(short = 'c', long = "command")]
     command: Option<String>,
@@ -32,7 +40,7 @@ struct Cli {
 
 fn main() -> Result<()> {
     let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("neon_compositor=info,smithay=warn"));
+        .unwrap_or_else(|_| EnvFilter::new("neon_compositor=info,neon_renderer=info,smithay=warn"));
 
     tracing_subscriber::fmt()
         .with_env_filter(filter)
@@ -47,5 +55,7 @@ fn main() -> Result<()> {
         socket_name: cli.socket,
         startup_command: cli.command,
         startup_args: cli.command_args,
+        reduced_motion: cli.reduced_motion,
+        shadows_enabled: !cli.no_shadows,
     })
 }

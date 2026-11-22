@@ -71,6 +71,8 @@ impl XdgShellHandler for NeonState {
             self.space.unmap_elem(&window);
             self.managed_windows.remove(&id);
             self.wm.remove_window(id);
+            self.effects.remove_window(id);
+            self.scene.remove_window(id);
             info!(?id, "Destroyed xdg_toplevel window");
             if was_focused {
                 self.focus_topmost_window(SERIAL_COUNTER.next_serial());

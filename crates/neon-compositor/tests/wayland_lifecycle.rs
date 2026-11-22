@@ -930,3 +930,99 @@ fn rules_snap_minimize_restore_and_fullscreen_state_machine() {
         "Fullscreen and Maximized must never be active simultaneously"
     );
 }
+
+#[test]
+fn scene_graph_and_animations_sync_with_window_and_workspace_events() {
+    let (_event_loop, mut display, mut state) = create_headless_server();
+    let (server_sock, client_sock) = UnixStream::pair().unwrap();
+    state.insert_client(server_sock);
+
+    let mapped = Arc::new(AtomicBool::new(false));
+    let mapped_clone = Arc::clone(&mapped);
+    let allow_exit = Arc::new(AtomicBool::new(false));
+    let allow_exit_clone = Arc::clone(&allow_exit);
+
+    let client_handle = thread::spawn(move || {
+        let conn = Connection::from_socket(client_sock).unwrap();
+        let mut queue = conn.new_event_queue::<TestClientState>();
+        let qh = queue.handle();
+        let mut cstate = TestClientState::default();
+
+        let _registry = conn.display().get_registry(&qh, ());
+        queue.roundtrip(&mut cstate).unwrap();
+
+        let compositor = cstate.compositor.clone().unwrap();
+        let shm = cstate.shm.clone().unwrap();
+        let wm_base = cstate.wm_base.clone().unwrap();
+
+        let surface = compositor.create_surface(&qh, ());
+        let xdg_surface = wm_base.get_xdg_surface(&surface, &qh, ());
+        let toplevel = xdg_surface.get_toplevel(&qh, ());
+        toplevel.set_title("Scene Test Window".into());
+        surface.commit();
+        queue.roundtrip(&mut cstate).unwrap();
+
+        let (_f, pool, buffer) = create_shm_buffer(&shm, &qh, 480, 320);
+        surface.attach(Some(&buffer), 0, 0);
+        surface.commit();
+        queue.roundtrip(&mut cstate).unwrap();
+
+        mapped_clone.store(true, Ordering::SeqCst);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !allow_exit_clone.load(Ordering::SeqCst) && Instant::now() < deadline {
+            queue.roundtrip(&mut cstate).unwrap();
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        toplevel.destroy();
+        xdg_surface.destroy();
+        buffer.destroy();
+        pool.destroy();
+        surface.destroy();
+        conn.flush().unwrap();
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !mapped.load(Ordering::SeqCst) && Instant::now() < deadline {
+        pump_server(&mut display, &mut state);
+        thread::sleep(Duration::from_millis(5));
+    }
+    pump_server(&mut display, &mut state);
+
+    // Sync scene graph right after mapping -> open animation is active and window has shadow & border.
+    let animating = state.sync_scene_graph();
+    assert!(animating, "window open animation should be in flight");
+    let nodes = state.scene.collect_front_to_back();
+    assert_eq!(nodes.len(), 2, "backdrop + 1 floating window");
+    assert!(
+        nodes[0].shadow.is_some(),
+        "floating window must have drop shadow"
+    );
+    assert!(
+        nodes[0].border.is_some(),
+        "floating window must have focus border"
+    );
+
+    // Switching to empty workspace 1 removes window node from SceneGraph and triggers slide animation.
+    state
+        .switch_workspace_next(SERIAL_COUNTER.next_serial())
+        .expect("switch to dynamic workspace 1");
+    let slide_active = state.sync_scene_graph();
+    assert!(
+        slide_active,
+        "workspace transition animation should be active"
+    );
+    assert_eq!(
+        state.scene.collect_front_to_back().len(),
+        1,
+        "only backdrop remains visible on empty workspace 1"
+    );
+
+    allow_exit.store(true, Ordering::SeqCst);
+    while !client_handle.is_finished() && Instant::now() < deadline {
+        pump_server(&mut display, &mut state);
+        thread::sleep(Duration::from_millis(5));
+    }
+    client_handle.join().unwrap();
+}

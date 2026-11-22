@@ -1,17 +1,14 @@
-//! Nested `winit` + OpenGL ES (`GlesRenderer`) backend for Milestone 1 development.
+//! Nested `winit` + OpenGL ES (`GlesRenderer`) backend driven by `NeonRenderer` and `SceneGraph`.
 
 use std::{cell::RefCell, rc::Rc, time::Duration};
 
 use anyhow::{Context, Result};
+use neon_renderer::NeonRenderer;
 use smithay::{
     backend::{
-        renderer::{
-            damage::OutputDamageTracker, element::solid::SolidColorRenderElement,
-            gles::GlesRenderer,
-        },
+        renderer::{ImportDma, gles::GlesRenderer},
         winit::{self, WinitEvent},
     },
-    desktop::space::render_output,
     output::{Mode, Output, PhysicalProperties, Subpixel},
     reexports::{
         calloop::{
@@ -29,9 +26,6 @@ use tracing::{error, info, warn};
 
 use crate::{input::process_input_event, state::NeonState};
 
-/// NEON DE signature obsidian backdrop clear color (`#0E1119`).
-const NEON_CANVAS_COLOR: [f32; 4] = [0.055, 0.067, 0.098, 1.0];
-
 /// Configuration for running the nested `winit` backend.
 #[derive(Debug, Clone)]
 pub struct WinitConfig {
@@ -40,6 +34,8 @@ pub struct WinitConfig {
     pub socket_name: Option<String>,
     pub startup_command: Option<String>,
     pub startup_args: Vec<String>,
+    pub reduced_motion: bool,
+    pub shadows_enabled: bool,
 }
 
 /// Runs the NEON DE Wayland compositor inside a nested `winit` window on the host desktop.
@@ -61,6 +57,8 @@ pub fn run_winit(config: WinitConfig) -> Result<()> {
         wayland_display = ?socket_name,
         width = config.width,
         height = config.height,
+        reduced_motion = config.reduced_motion,
+        shadows = config.shadows_enabled,
         "Starting NEON DE nested compositor"
     );
 
@@ -70,6 +68,8 @@ pub fn run_winit(config: WinitConfig) -> Result<()> {
         event_loop.get_signal(),
         socket_name.clone(),
     );
+    state.effects.config.reduced_motion = config.reduced_motion;
+    state.effects.config.shadows_enabled = config.shadows_enabled;
 
     // Initialize nested winit window + GLES renderer.
     let window_attrs = WinitWindow::default_attributes()
@@ -80,7 +80,7 @@ pub fn run_winit(config: WinitConfig) -> Result<()> {
         ))
         .with_visible(true);
 
-    let (backend, winit_events) = winit::init_from_attributes::<GlesRenderer>(window_attrs)
+    let (mut backend, winit_events) = winit::init_from_attributes::<GlesRenderer>(window_attrs)
         .map_err(|err| anyhow::anyhow!("Failed to initialize winit GLES backend: {err}"))?;
 
     let initial_size = backend.window_size();
@@ -107,9 +107,24 @@ pub fn run_winit(config: WinitConfig) -> Result<()> {
     output.set_preferred(mode);
     state.register_output(output.clone(), (0, 0).into());
 
-    let damage_tracker = OutputDamageTracker::from_output(&output);
-    let backend_cell = Rc::new(RefCell::new((backend, damage_tracker)));
+    // Initialize NEON DE's modular GPU renderer and compile custom GLES shaders.
+    let neon_renderer = NeonRenderer::new(backend.renderer(), &output);
+    let dmabuf_formats = backend.renderer().dmabuf_formats();
+
+    let backend_cell = Rc::new(RefCell::new((backend, neon_renderer, false)));
     let display_cell = Rc::new(RefCell::new(display));
+
+    // Advertise zwp_linux_dmabuf_v1 if the EGL context supports DMA-BUF textures.
+    {
+        let backend_for_dma = Rc::clone(&backend_cell);
+        state.enable_dmabuf(
+            dmabuf_formats,
+            Box::new(move |dmabuf| {
+                let mut guard = backend_for_dma.borrow_mut();
+                guard.0.renderer().import_dmabuf(dmabuf, None).is_ok()
+            }),
+        );
+    }
 
     // Register incoming Wayland client socket connections.
     event_loop
@@ -174,15 +189,21 @@ pub fn run_winit(config: WinitConfig) -> Result<()> {
                 }
                 WinitEvent::Redraw => {
                     let mut guard = backend_for_winit.borrow_mut();
-                    let (ref mut backend, ref mut damage_tracker) = *guard;
-                    render_frame(backend, damage_tracker, &output_for_winit, state);
+                    let (ref mut backend, ref mut neon_renderer, ref mut presented_once) = *guard;
+                    render_frame(
+                        backend,
+                        neon_renderer,
+                        presented_once,
+                        &output_for_winit,
+                        state,
+                    );
                 }
                 WinitEvent::Focus(_) => {}
             })
             .map_err(|err| anyhow::anyhow!("Failed to insert winit event source: {err}"))?;
     }
 
-    // Frame pacing timer (~60 Hz) to request redraws and flush client buffers cleanly.
+    // Frame pacing timer (~60 Hz) synchronized with damage tracking (skips swap on zero-damage idle).
     {
         let backend_for_timer = Rc::clone(&backend_cell);
         let output_for_timer = output.clone();
@@ -192,8 +213,14 @@ pub fn run_winit(config: WinitConfig) -> Result<()> {
                 Timer::from_duration(Duration::from_millis(16)),
                 move |_, _, state| {
                     let mut guard = backend_for_timer.borrow_mut();
-                    let (ref mut backend, ref mut damage_tracker) = *guard;
-                    render_frame(backend, damage_tracker, &output_for_timer, state);
+                    let (ref mut backend, ref mut neon_renderer, ref mut presented_once) = *guard;
+                    render_frame(
+                        backend,
+                        neon_renderer,
+                        presented_once,
+                        &output_for_timer,
+                        state,
+                    );
                     TimeoutAction::ToDuration(Duration::from_millis(16))
                 },
             )
@@ -231,33 +258,36 @@ pub fn run_winit(config: WinitConfig) -> Result<()> {
 
 fn render_frame(
     backend: &mut winit::WinitGraphicsBackend<GlesRenderer>,
-    damage_tracker: &mut OutputDamageTracker,
+    neon_renderer: &mut NeonRenderer,
+    presented_once: &mut bool,
     output: &Output,
     state: &mut NeonState,
 ) {
+    let _animating = state.sync_scene_graph();
+    let _dirty_regions = state.scene.take_dirty_regions();
+
     let size = backend.window_size();
     let full_damage = Rectangle::from_size(size);
 
-    let render_damage = {
+    let (should_submit, render_damage) = {
         let age = backend.buffer_age().unwrap_or(0);
         match backend.bind() {
             Ok((renderer, mut framebuffer)) => {
-                let custom: [SolidColorRenderElement; 0] = [];
-                match render_output(
+                match neon_renderer.render_scene(
                     output,
                     renderer,
                     &mut framebuffer,
-                    1.0,
                     age,
-                    [&state.space],
-                    &custom,
-                    damage_tracker,
-                    NEON_CANVAS_COLOR,
+                    &state.scene,
+                    |id| state.managed_windows.get(&id),
                 ) {
-                    Ok(res) => res.damage.cloned(),
+                    Ok(res) => match res.damage {
+                        Some(damage) => (true, Some(damage.clone())),
+                        None => (!*presented_once, None),
+                    },
                     Err(err) => {
-                        warn!(?err, "Output render error");
-                        Some(vec![full_damage])
+                        warn!(?err, "Scene render error");
+                        (true, Some(vec![full_damage]))
                     }
                 }
             }
@@ -268,8 +298,12 @@ fn render_frame(
         }
     };
 
-    if let Err(err) = backend.submit(render_damage.as_deref()) {
-        warn!(?err, "Failed to submit winit swapchain frame");
+    if should_submit {
+        if let Err(err) = backend.submit(render_damage.as_deref()) {
+            warn!(?err, "Failed to submit winit swapchain frame");
+        } else {
+            *presented_once = true;
+        }
     }
 
     let now = state.clock.now();

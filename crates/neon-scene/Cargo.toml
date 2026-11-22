@@ -1,0 +1,11 @@
+[package]
+name = "neon-scene"
+description = "Retained scene graph and layer tree for NEON DE"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+neon-window-manager.workspace = true
+tracing.workspace = true

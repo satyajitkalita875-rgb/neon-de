@@ -1,36 +1,43 @@
-# NEON DE — Rendering Engine Design
+# NEON DE — Rendering Engine & Effects Design
 
 ## 1. Design Goals
 
 - GPU-accelerated composition targeting steady 60 FPS at 1080p on Intel CometLake-H integrated graphics and NVIDIA GTX 1650 Mobile.
-- Strict separation between compositor event dispatch and rendering logic.
-- Damage-tracked partial redraws to minimize idle GPU/CPU usage.
-- Clean abstraction over Smithay's OpenGL ES (`GlesRenderer` / `GlowRenderer`) initially, keeping the door open for alternative renderers later without premature Vulkan complexity.
+- Strict separation between compositor event dispatch (`neon-compositor`), retained scene representation (`neon-scene`), frame-driven animations (`neon-effects`), and GPU rendering (`neon-renderer`).
+- True damage-tracked partial redraws and zero-swap idle frames when nothing on screen changes.
+- Clean OpenGL ES (`GlesRenderer`) path via Smithay with graceful fallback if custom shaders fail on an exotic driver, plus optional `--reduced-motion` and `--no-shadows` modes.
 
-## 2. Conceptual Rendering Pipeline
+## 2. Implemented Rendering Pipeline (Milestone 3)
 
 ```text
-Wayland Surfaces (wl_shm / DMA-BUF)
-  -> Buffer Import & Texture Upload
-  -> Surface Tree Traversal (main surface + subsurfaces + popups)
-  -> Retained Scene Graph (Milestone 3: Background -> Windows -> Panels -> Dock -> Overview -> Notifications -> Lockscreen -> Cursor)
-  -> Window Transforms & Effects (Milestone 3 & 5: rounded corners, shadows, blur, animations)
-  -> Damage Tracking (OutputDamageTracker)
-  -> GPU Composition (GlesRenderer / GlowRenderer)
-  -> Output Presentation (Winit nested swapchain [M1] / DRM-KMS atomic pageflip [M5])
+Wayland Surfaces (wl_shm + zwp_linux_dmabuf_v1)
+  -> Buffer Import & Texture Upload (GlesRenderer / ImportDma)
+  -> EffectsManager::tick(now) (crates/neon-effects)
+       - Window open fade + upward glide
+       - Interruptible focus highlight transition
+       - Horizontal workspace slide transition
+       - Reduced-motion accessibility mode
+  -> Retained SceneGraph sync (crates/neon-scene)
+       - Z-ordered SceneLayers: Background -> Windows -> Panels -> Dock -> Overview -> Notifications -> LockScreen -> Cursor
+       - Per-window ShadowStyle & BorderStyle (auto-stripped when Maximized/Fullscreen)
+       - Logical dirty-region tracking
+  -> NeonRenderer::render_scene (crates/neon-renderer)
+       - Cached PixelShaderElements (stable Element Ids across idle frames!)
+       - Analytical SDF rounded drop-shadow shader (SHADOW_FRAGMENT_SHADER)
+       - Anti-aliased SDF rounded focus ring shader (BORDER_FRAGMENT_SHADER)
+       - NEON DE ambient obsidian radial-gradient backdrop (BACKDROP_FRAGMENT_SHADER)
+       - WaylandSurfaceRenderElement trees (surfaces + subsurfaces + popups)
+  -> OutputDamageTracker::render_output (front-to-back damage culling)
+  -> Conditional Swapchain Submit (skips swap on zero-damage idle frames)
 ```
 
-## 3. Milestone 1 Rendering Implementation
+## 3. Shader & Blending Conventions
 
-In Milestone 1 (`crates/neon-compositor/src/backend/winit.rs`):
+- All custom pixel shaders target GLSL ES 1.00 (`#version 100` prepended by Smithay) and output **premultiplied RGBA** (`vec4(rgb * a, a)`) to match Smithay's `GL_ONE, GL_ONE_MINUS_SRC_ALPHA` blend pipeline.
+- Every cached shader element (`CachedShadow`, `CachedBorder`, `CachedBackdrop`) retains its `Element::id()` and increments its `CommitCounter` **only** when its geometry, style, or opacity actually changes — avoiding spurious full-screen redraws during idle periods.
 
-- Uses `smithay::backend::winit` with `GlesRenderer` (`GlowRenderer`) to create a nested EGL/GLES window inside the host Wayland/X11 session.
-- Uses `smithay::desktop::Space<Window>` + `smithay::backend::renderer::damage::OutputDamageTracker` to render visible client windows, subsurfaces, and popups with damage tracking.
-- Draws a NEON DE signature deep obsidian/midnight canvas clear color (`[0.055, 0.067, 0.098, 1.0]`) as the compositor backdrop before client surfaces are composited.
-- Dispatches Wayland `wl_surface.frame` callbacks immediately after rendering so clients pace their animations cleanly at the output refresh rate.
-- Supports software GL fallback (`LIBGL_ALWAYS_SOFTWARE=1`) for headless or recovery debugging.
+## 4. Planned Evolution (Milestone 5)
 
-## 4. Planned Evolution (Milestones 3 & 5)
-
-- **Milestone 3**: Extract `neon-scene` (retained scene graph with Z-layers, clipping, opacity, transforms) and `neon-renderer` (custom GLSL shaders for rounded corners, analytical shadows, and damage-aware partial redraws). Introduce `neon-effects` for frame-driven spring/cubic-Bézier animations.
-- **Milestone 5**: Add downsampled Kawase/dual-filter background blur with region caching and user toggles for reduced motion / low-power mode, plus zero-copy `zwp_linux_dmabuf_v1` + DRM/KMS direct scanout.
+- Multi-pass downsampled Kawase / dual-filter GPU background blur with region caching for translucent panels, dock, and overview surfaces.
+- Zero-copy DRM/KMS direct scanout for fullscreen clients on bare-metal outputs.
+- `wp_presentation` and `wp_fractional_scale_v1` integration.

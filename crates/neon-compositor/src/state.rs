@@ -1,9 +1,19 @@
-//! Central compositor state (`NeonState`) integrating Smithay, `neon-window-manager`, and `neon-workspaces`.
+//! Central compositor state (`NeonState`) integrating Smithay, `neon-window-manager`,
+//! `neon-workspaces`, `neon-scene`, and `neon-effects`.
 
-use std::{collections::HashMap, ffi::OsString, process::Command, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    ffi::OsString,
+    process::Command,
+    sync::Arc,
+    time::Duration,
+};
 
+use neon_effects::{EffectsConfig, EffectsManager};
+use neon_scene::{BorderStyle, SceneGraph, ShadowStyle};
 use neon_workspaces::{WorkspaceId, WorkspacePolicy};
 use smithay::{
+    backend::allocator::{Format, dmabuf::Dmabuf},
     desktop::{PopupManager, Space, Window, WindowSurfaceType},
     input::{
         Seat, SeatState,
@@ -23,6 +33,7 @@ use smithay::{
     utils::{Clock, IsAlive, Logical, Monotonic, Point, Rectangle, SERIAL_COUNTER, Serial, Size},
     wayland::{
         compositor::{CompositorClientState, CompositorState},
+        dmabuf::{DmabufGlobal, DmabufState},
         output::OutputManagerState,
         selection::data_device::DataDeviceState,
         shell::xdg::XdgShellState,
@@ -33,7 +44,7 @@ use tracing::{debug, info, warn};
 
 use crate::window::{
     SnapRegion, WindowId, WindowLayoutUpdate, WindowManager, WindowMode, WmRect, from_wm_point,
-    from_wm_size, to_wm_rect, window_id, window_matches_surface,
+    from_wm_size, to_wm_point, to_wm_rect, to_wm_size, window_id, window_matches_surface,
 };
 
 /// Per-client data attached to every connected Wayland client.
@@ -52,6 +63,9 @@ impl ClientData for NeonClientData {
     }
 }
 
+/// Callback invoked by `DmabufHandler::dmabuf_imported` to validate GPU buffer import.
+pub type DmabufImportHook = Box<dyn FnMut(&Dmabuf) -> bool>;
+
 /// Core NEON DE compositor state passed through `calloop` and `wayland-server` dispatch.
 pub struct NeonState {
     pub display_handle: DisplayHandle,
@@ -64,17 +78,24 @@ pub struct NeonState {
     pub compositor_state: CompositorState,
     pub xdg_shell_state: XdgShellState,
     pub shm_state: ShmState,
+    pub dmabuf_state: DmabufState,
+    pub dmabuf_global: Option<DmabufGlobal>,
+    pub dmabuf_import_hook: Option<DmabufImportHook>,
     pub output_manager_state: OutputManagerState,
     pub seat_state: SeatState<Self>,
     pub data_device_state: DataDeviceState,
     pub popups: PopupManager,
 
-    // Desktop & window management state
+    // Desktop, window management, scene graph, and effects
     pub space: Space<Window>,
     /// All live managed toplevel windows across all workspaces (including minimized windows).
     pub managed_windows: HashMap<WindowId, Window>,
     /// NEON DE window manager & dynamic workspace manager.
     pub wm: WindowManager,
+    /// Retained scene graph synchronized every frame before GPU composition.
+    pub scene: SceneGraph,
+    /// Frame-driven interruptible animation engine.
+    pub effects: EffectsManager,
     pub seat: Seat<Self>,
     pub pointer_location: Point<f64, Logical>,
     pub cursor_status: CursorImageStatus,
@@ -82,7 +103,7 @@ pub struct NeonState {
 }
 
 impl NeonState {
-    /// Initializes Wayland globals, seat capabilities, window manager, and desktop space.
+    /// Initializes Wayland globals, seat capabilities, window manager, scene graph, and effects.
     pub fn new(
         display: &Display<Self>,
         loop_handle: LoopHandle<'static, Self>,
@@ -94,6 +115,7 @@ impl NeonState {
         let compositor_state = CompositorState::new::<Self>(&display_handle);
         let xdg_shell_state = XdgShellState::new::<Self>(&display_handle);
         let shm_state = ShmState::new::<Self>(&display_handle, vec![]);
+        let dmabuf_state = DmabufState::new();
         let output_manager_state = OutputManagerState::new_with_xdg_output::<Self>(&display_handle);
         let data_device_state = DataDeviceState::new::<Self>(&display_handle);
 
@@ -114,6 +136,9 @@ impl NeonState {
             compositor_state,
             xdg_shell_state,
             shm_state,
+            dmabuf_state,
+            dmabuf_global: None,
+            dmabuf_import_hook: None,
             output_manager_state,
             seat_state,
             data_device_state,
@@ -121,11 +146,114 @@ impl NeonState {
             space: Space::default(),
             managed_windows: HashMap::new(),
             wm: WindowManager::new(WorkspacePolicy::default()),
+            scene: SceneGraph::new(),
+            effects: EffectsManager::new(EffectsConfig::default()),
             seat,
             pointer_location: (640.0, 400.0).into(),
             cursor_status: CursorImageStatus::default_named(),
             primary_output: None,
         }
+    }
+
+    /// Monotonic compositor timestamp as [`Duration`] for animation sampling.
+    pub fn now_duration(&self) -> Duration {
+        self.clock.now().into()
+    }
+
+    /// Advertises `zwp_linux_dmabuf_v1` once the graphics backend reports supported GPU formats.
+    pub fn enable_dmabuf<I>(&mut self, formats: I, import_hook: DmabufImportHook)
+    where
+        I: IntoIterator<Item = Format>,
+    {
+        let format_vec: Vec<Format> = formats.into_iter().collect();
+        if format_vec.is_empty() {
+            debug!(
+                "Renderer reported no DMA-BUF formats; keeping zwp_linux_dmabuf_v1 unadvertised"
+            );
+            return;
+        }
+        let count = format_vec.len();
+        let global = self
+            .dmabuf_state
+            .create_global::<Self>(&self.display_handle, format_vec);
+        self.dmabuf_global = Some(global);
+        self.dmabuf_import_hook = Some(import_hook);
+        info!(
+            format_count = count,
+            "Advertised zwp_linux_dmabuf_v1 global"
+        );
+    }
+
+    /// Synchronizes the retained [`SceneGraph`] from active workspace windows and animations.
+    ///
+    /// Returns `true` if any animations remain in flight.
+    pub fn sync_scene_graph(&mut self) -> bool {
+        let now = self.now_duration();
+        let animating = self.effects.tick(now);
+
+        let output_size = self.output_logical_size();
+        self.scene.set_backdrop(to_wm_size(output_size));
+
+        let fx_cfg = self.effects.config;
+        let focused_id = self.wm.focused_id();
+        let mut visible_ids: HashSet<WindowId> = HashSet::new();
+
+        for (z_idx, window) in self.space.elements().enumerate() {
+            let Some(id) = window_id(window) else {
+                continue;
+            };
+            let Some(loc) = self.space.element_location(window) else {
+                continue;
+            };
+            let win_size = window.geometry().size;
+            let bounds = WmRect::new(to_wm_point(loc), to_wm_size(win_size));
+
+            let is_focused = focused_id == Some(id);
+            let mode = self
+                .wm
+                .get(id)
+                .map(|w| w.mode.clone())
+                .unwrap_or(WindowMode::Floating);
+            let fullscreen = mode.is_fullscreen();
+            let maximized = mode.is_maximized();
+            let visual = self.effects.sample_window(id, is_focused, now);
+
+            let shadow = if fx_cfg.shadows_enabled && !fullscreen && !maximized {
+                Some(ShadowStyle::for_window(
+                    visual.focus_progress,
+                    fx_cfg.corner_radius,
+                ))
+            } else {
+                None
+            };
+
+            let border = if fx_cfg.borders_enabled && !fullscreen && !maximized {
+                Some(BorderStyle::for_window(
+                    visual.focus_progress,
+                    fx_cfg.corner_radius,
+                ))
+            } else {
+                None
+            };
+
+            self.scene.upsert_window(
+                id,
+                bounds,
+                z_idx as i32,
+                true,
+                visual.opacity,
+                (visual.offset_x, visual.offset_y),
+                is_focused,
+                visual.focus_progress,
+                fullscreen,
+                shadow,
+                border,
+            );
+            visible_ids.insert(id);
+        }
+
+        self.scene.retain_windows(|id| visible_ids.contains(&id));
+        animating
     }
 
     /// Registers an output into both the Wayland global registry and NEON DE's desktop space.
@@ -312,6 +440,7 @@ impl NeonState {
         serial: Serial,
         raise: bool,
     ) {
+        let prev_focused = self.wm.focused_id();
         let target_id = target.and_then(window_id);
         let target_surface = target.and_then(|w| w.toplevel().map(|t| t.wl_surface().clone()));
 
@@ -338,6 +467,16 @@ impl NeonState {
 
         if raise && let Some(window) = target {
             self.space.raise_element(window, true);
+        }
+
+        let now = self.now_duration();
+        if prev_focused != target_id {
+            if let Some(old_id) = prev_focused {
+                self.effects.animate_focus(old_id, false, now);
+            }
+            if let Some(new_id) = target_id {
+                self.effects.animate_focus(new_id, true, now);
+            }
         }
 
         self.wm.mark_focused(target_id);
@@ -377,7 +516,7 @@ impl NeonState {
         }
     }
 
-    // --- Milestone 2 Window Management & Dynamic Workspace Actions ---
+    // --- Window Management & Dynamic Workspace Actions ---
 
     pub fn toggle_maximize_focused(&mut self) {
         let Some(id) = self.wm.focused_id() else {
@@ -452,6 +591,8 @@ impl NeonState {
         if let Some(update) = self.wm.restore_last_minimized(work_area) {
             info!(id = ?update.id, mode = ?update.mode, "Restored minimized window");
             self.apply_layout_update(&update);
+            let now = self.now_duration();
+            self.effects.animate_window_open(update.id, now);
             if let Some(window) = self.find_window_by_id(update.id) {
                 self.focus_window(Some(&window), serial);
             }
@@ -459,7 +600,11 @@ impl NeonState {
     }
 
     pub fn switch_workspace_index(&mut self, index: usize, serial: Serial) -> Option<WorkspaceId> {
+        let old_idx = self.wm.workspaces().active_index();
         let new_ws = self.wm.switch_workspace_index(index)?;
+        let direction = if index >= old_idx { 1 } else { -1 };
+        let now = self.now_duration();
+        self.effects.animate_workspace_switch(direction, now);
         info!(
             workspace = ?new_ws,
             index = self.wm.workspaces().active_index(),
@@ -472,6 +617,8 @@ impl NeonState {
 
     pub fn switch_workspace_next(&mut self, serial: Serial) -> Option<WorkspaceId> {
         let new_ws = self.wm.switch_workspace_next()?;
+        let now = self.now_duration();
+        self.effects.animate_workspace_switch(1, now);
         info!(
             workspace = ?new_ws,
             index = self.wm.workspaces().active_index(),
@@ -484,6 +631,8 @@ impl NeonState {
 
     pub fn switch_workspace_prev(&mut self, serial: Serial) -> Option<WorkspaceId> {
         let new_ws = self.wm.switch_workspace_prev()?;
+        let now = self.now_duration();
+        self.effects.animate_workspace_switch(-1, now);
         info!(
             workspace = ?new_ws,
             index = self.wm.workspaces().active_index(),
@@ -501,6 +650,10 @@ impl NeonState {
     ) -> Option<WorkspaceId> {
         let id = self.wm.focused_id()?;
         let new_ws = self.wm.move_window_to_next_workspace(id, follow)?;
+        if follow {
+            let now = self.now_duration();
+            self.effects.animate_workspace_switch(1, now);
+        }
         info!(
             ?id,
             workspace = ?new_ws,
@@ -522,6 +675,10 @@ impl NeonState {
     ) -> Option<WorkspaceId> {
         let id = self.wm.focused_id()?;
         let new_ws = self.wm.move_window_to_prev_workspace(id, follow)?;
+        if follow {
+            let now = self.now_duration();
+            self.effects.animate_workspace_switch(-1, now);
+        }
         info!(
             ?id,
             workspace = ?new_ws,
@@ -609,7 +766,7 @@ impl NeonState {
         }
     }
 
-    /// Removes dead windows across all workspaces and refreshes Space and PopupManager state.
+    /// Removes dead windows across all workspaces and refreshes Space, SceneGraph, and Effects.
     pub fn cleanup_dead_windows(&mut self) {
         let dead_ids: Vec<WindowId> = self
             .managed_windows
@@ -627,6 +784,8 @@ impl NeonState {
                 lost_focus = true;
             }
             self.wm.remove_window(id);
+            self.effects.remove_window(id);
+            self.scene.remove_window(id);
             debug!(?id, "Cleaned up dead window");
         }
 
