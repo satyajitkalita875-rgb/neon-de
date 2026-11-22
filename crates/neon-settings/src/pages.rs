@@ -11,6 +11,14 @@ use neon_config::{
     save_atomic,
 };
 use neon_ipc::{IpcClient, IpcPayload, IpcRequest, IpcResult, OutputInfo};
+use neon_system::{
+    audio::{set_sink_mute, set_sink_volume},
+    bluetooth::set_bluetooth_powered,
+    network::set_wifi_enabled,
+    notifications::{NESTED_BUS_NAME, NotificationUrgency, send_dbus_notification},
+    power::set_power_profile,
+    query_system_snapshot,
+};
 use tracing::warn;
 
 use crate::{style::SettingsTheme, system_info::collect_hardware_summary};
@@ -938,16 +946,231 @@ pub fn build_system_page(ctrl: Rc<SettingsController>) -> ScrolledWindow {
     }
     page.append(&about_card);
 
-    let svc_card = card("LINUX SYSTEM SERVICES (MILESTONE 7 INTEGRATION TARGETS)");
-    for (svc_name, running) in info.services {
-        let badge = Label::new(Some(if running { "Running" } else { "Not detected" }));
-        badge.add_css_class("settings-row-title");
-        svc_card.append(&labeled_row(
-            svc_name,
-            "Live host process check (full D-Bus controls arrive in Milestone 7).",
-            &badge,
-        ));
+    let sys = query_system_snapshot();
+
+    // Live Audio (PipeWire / WirePlumber)
+    let audio_card = card("AUDIO (PIPEWIRE / WIREPLUMBER)");
+    let vol_scale = Scale::with_range(Orientation::Horizontal, 0.0, 150.0, 2.0);
+    vol_scale.set_width_request(180);
+    vol_scale.set_draw_value(true);
+    vol_scale.set_sensitive(sys.audio.available);
+    vol_scale.set_value(f64::from(sys.audio.volume_percent()));
+    {
+        let ctrl = Rc::clone(&ctrl);
+        vol_scale.connect_value_changed(move |s| {
+            let vol = (s.value() as f32) / 100.0;
+            match set_sink_volume(vol) {
+                Ok(()) => ctrl
+                    .status_label
+                    .set_text(&format!("Set PipeWire volume to {:.0}%", s.value())),
+                Err(err) => ctrl.status_label.set_text(&format!("Audio error: {err}")),
+            }
+        });
     }
+    let sink_desc = sys
+        .audio
+        .default_sink_name
+        .as_deref()
+        .unwrap_or("PipeWire default output sink");
+    audio_card.append(&labeled_row("Output Volume", sink_desc, &vol_scale));
+
+    let mute_sw = Switch::new();
+    mute_sw.set_valign(Align::Center);
+    mute_sw.set_sensitive(sys.audio.available);
+    mute_sw.set_active(sys.audio.muted);
+    {
+        let ctrl = Rc::clone(&ctrl);
+        mute_sw.connect_state_set(move |_, muted| {
+            match set_sink_mute(muted) {
+                Ok(()) => ctrl.status_label.set_text(if muted {
+                    "Muted PipeWire audio output"
+                } else {
+                    "Unmuted PipeWire audio output"
+                }),
+                Err(err) => ctrl.status_label.set_text(&format!("Mute error: {err}")),
+            }
+            gtk4::glib::Propagation::Proceed
+        });
+    }
+    audio_card.append(&Separator::new(Orientation::Horizontal));
+    audio_card.append(&labeled_row(
+        "Mute Audio Output",
+        "Controls @DEFAULT_AUDIO_SINK@ via WirePlumber.",
+        &mute_sw,
+    ));
+    page.append(&audio_card);
+
+    // Live Connectivity & Power (NetworkManager, BlueZ, UPower)
+    let dev_card = card("NETWORK, BLUETOOTH & POWER (D-BUS)");
+
+    let wifi_sw = Switch::new();
+    wifi_sw.set_valign(Align::Center);
+    wifi_sw.set_sensitive(sys.network.available);
+    wifi_sw.set_active(sys.network.wifi_enabled);
+    {
+        let ctrl = Rc::clone(&ctrl);
+        wifi_sw.connect_state_set(move |_, enabled| {
+            match set_wifi_enabled(enabled) {
+                Ok(()) => ctrl.status_label.set_text(if enabled {
+                    "Enabled Wi-Fi via NetworkManager"
+                } else {
+                    "Disabled Wi-Fi via NetworkManager"
+                }),
+                Err(err) => ctrl.status_label.set_text(&format!("Network error: {err}")),
+            }
+            gtk4::glib::Propagation::Proceed
+        });
+    }
+    dev_card.append(&labeled_row(
+        "Wi-Fi (NetworkManager)",
+        &format!("Status: {}", sys.network.panel_label()),
+        &wifi_sw,
+    ));
+
+    let bt_sw = Switch::new();
+    bt_sw.set_valign(Align::Center);
+    bt_sw.set_sensitive(sys.bluetooth.available);
+    bt_sw.set_active(sys.bluetooth.powered);
+    {
+        let ctrl = Rc::clone(&ctrl);
+        bt_sw.connect_state_set(move |_, powered| {
+            match set_bluetooth_powered(powered) {
+                Ok(()) => ctrl.status_label.set_text(if powered {
+                    "Powered on BlueZ Bluetooth adapter"
+                } else {
+                    "Powered off BlueZ Bluetooth adapter"
+                }),
+                Err(err) => ctrl
+                    .status_label
+                    .set_text(&format!("Bluetooth error: {err}")),
+            }
+            gtk4::glib::Propagation::Proceed
+        });
+    }
+    dev_card.append(&Separator::new(Orientation::Horizontal));
+    dev_card.append(&labeled_row(
+        "Bluetooth (BlueZ)",
+        &format!(
+            "{} paired · {} connected",
+            sys.bluetooth.devices.len(),
+            sys.bluetooth.connected_count()
+        ),
+        &bt_sw,
+    ));
+
+    let profile_model = StringList::new(&["power-saver", "balanced", "performance"]);
+    let profile_dd = DropDown::new(Some(profile_model), gtk4::Expression::NONE);
+    profile_dd.set_valign(Align::Center);
+    profile_dd.set_sensitive(sys.power.active_profile.is_some());
+    profile_dd.set_selected(match sys.power.active_profile.as_deref() {
+        Some("power-saver") => 0,
+        Some("performance") => 2,
+        _ => 1,
+    });
+    {
+        let ctrl = Rc::clone(&ctrl);
+        profile_dd.connect_selected_notify(move |dd| {
+            let prof = match dd.selected() {
+                0 => "power-saver",
+                2 => "performance",
+                _ => "balanced",
+            };
+            match set_power_profile(prof) {
+                Ok(()) => ctrl
+                    .status_label
+                    .set_text(&format!("Switched power profile to {prof}")),
+                Err(err) => ctrl
+                    .status_label
+                    .set_text(&format!("Power profile error: {err}")),
+            }
+        });
+    }
+    let power_desc = if sys.power.has_battery {
+        format!(
+            "Battery: {:.0}% ({})",
+            sys.power.battery_percentage,
+            sys.power.battery_state.label()
+        )
+    } else {
+        "AC Power (UPower)".to_string()
+    };
+    dev_card.append(&Separator::new(Orientation::Horizontal));
+    dev_card.append(&labeled_row(
+        "Power Profile (UPower)",
+        &power_desc,
+        &profile_dd,
+    ));
+    page.append(&dev_card);
+
+    // Desktop Services (Notifications, PolicyKit1, XDG Desktop Portals)
+    let svc_card = card("DESKTOP SERVICES (D-BUS, POLKIT & PORTALS)");
+    let notif_bus = sys
+        .notifications
+        .active_bus_name
+        .clone()
+        .unwrap_or_else(|| NESTED_BUS_NAME.to_string());
+    let test_notif_btn = Button::with_label("Test Toast");
+    test_notif_btn.add_css_class("settings-secondary-btn");
+    {
+        let ctrl = Rc::clone(&ctrl);
+        let bus = notif_bus.clone();
+        test_notif_btn.connect_clicked(move |_| {
+            match send_dbus_notification(
+                &bus,
+                "NEON DE Settings",
+                "Notifications Active",
+                "Freedesktop Notifications v1.2 D-Bus integration verified.",
+                NotificationUrgency::Normal,
+                4000,
+            ) {
+                Ok(id) => ctrl
+                    .status_label
+                    .set_text(&format!("Sent D-Bus notification #{id} via {bus}")),
+                Err(err) => ctrl
+                    .status_label
+                    .set_text(&format!("Notification error: {err}")),
+            }
+        });
+    }
+    svc_card.append(&labeled_row(
+        "Desktop Notifications (v1.2)",
+        &format!("Active bus: {notif_bus}"),
+        &test_notif_btn,
+    ));
+
+    let polkit_badge = Label::new(Some(if sys.polkit.daemon_available {
+        "Available"
+    } else {
+        "Unavailable"
+    }));
+    polkit_badge.add_css_class("settings-row-title");
+    svc_card.append(&Separator::new(Orientation::Horizontal));
+    svc_card.append(&labeled_row(
+        "PolicyKit1 Authority",
+        &format!("Agent path: {}", sys.polkit.agent_object_path),
+        &polkit_badge,
+    ));
+
+    let portal_badge = Label::new(Some(if sys.portals.desktop_portal_running {
+        "Active"
+    } else {
+        "Inactive"
+    }));
+    portal_badge.add_css_class("settings-row-title");
+    let backends = if sys.portals.installed_backends.is_empty() {
+        "none detected".to_string()
+    } else {
+        sys.portals.installed_backends.join(", ")
+    };
+    svc_card.append(&Separator::new(Orientation::Horizontal));
+    svc_card.append(&labeled_row(
+        "XDG Desktop Portals",
+        &format!(
+            "Desktop: {} · Backends: {backends}",
+            sys.portals.current_desktop
+        ),
+        &portal_badge,
+    ));
     page.append(&svc_card);
 
     let cfg_card = card("CONFIGURATION MANAGEMENT");

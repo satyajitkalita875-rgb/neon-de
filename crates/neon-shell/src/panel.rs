@@ -8,8 +8,9 @@ use gtk4::{
 };
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 use neon_ipc::{DesktopSnapshot, IpcRequest};
+use neon_system::{SystemAction, SystemActionSender, SystemSnapshot};
 
-use crate::ipc_bridge::IpcCommandSender;
+use crate::{ipc_bridge::IpcCommandSender, quick_settings::QuickSettingsPanel};
 
 /// Live handles to updatable widgets in the NEON DE Top Panel.
 pub struct TopPanel {
@@ -18,11 +19,20 @@ pub struct TopPanel {
     workspaces_box: GtkBox,
     clock_label: Label,
     focused_label: Label,
+    net_btn: Button,
+    audio_btn: Button,
+    power_btn: Button,
+    control_center_btn: Button,
     ipc: IpcCommandSender,
 }
 
 impl TopPanel {
-    pub fn build(app: &Application, ipc: IpcCommandSender) -> Self {
+    pub fn build(
+        app: &Application,
+        ipc: IpcCommandSender,
+        sys_tx: SystemActionSender,
+        quick_settings: QuickSettingsPanel,
+    ) -> Self {
         let window = ApplicationWindow::builder()
             .application(app)
             .title("NEON DE Top Panel")
@@ -72,18 +82,52 @@ impl TopPanel {
             });
         }
 
-        // Right: Active window title + NEON badge
-        let right_box = GtkBox::new(Orientation::Horizontal, 10);
+        // Right: Active window title + Live System Tray (Network / PipeWire Audio / UPower Battery) + Control Center + Settings + Lock
+        let right_box = GtkBox::new(Orientation::Horizontal, 6);
         let focused_label = Label::new(Some("Desktop"));
         focused_label.add_css_class("neon-focused-title");
-        focused_label.set_max_width_chars(32);
+        focused_label.set_max_width_chars(22);
         focused_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+
+        let net_btn = Button::with_label("Net: --");
+        net_btn.add_css_class("neon-status-pill");
+        net_btn.set_tooltip_text(Some("NetworkManager Status — Click for Control Center"));
+        {
+            let qs = quick_settings.clone();
+            net_btn.connect_clicked(move |_| qs.toggle());
+        }
+
+        let audio_btn = Button::with_label("Vol: --");
+        audio_btn.add_css_class("neon-status-pill");
+        audio_btn.set_tooltip_text(Some("PipeWire Volume — Click to Mute/Unmute"));
+        {
+            let sys_tx = sys_tx.clone();
+            audio_btn.connect_clicked(move |_| {
+                sys_tx.send(SystemAction::ToggleSinkMute);
+            });
+        }
+
+        let power_btn = Button::with_label("Pwr: --");
+        power_btn.add_css_class("neon-status-pill");
+        power_btn.set_tooltip_text(Some("UPower Battery & Profile — Click for Control Center"));
+        {
+            let qs = quick_settings.clone();
+            power_btn.connect_clicked(move |_| qs.toggle());
+        }
+
+        let control_center_btn = Button::with_label("System");
+        control_center_btn.add_css_class("neon-pill-button");
+        control_center_btn.set_tooltip_text(Some("Open Control Center & Notifications"));
+        {
+            let qs = quick_settings;
+            control_center_btn.connect_clicked(move |_| qs.toggle());
+        }
 
         let settings_btn = Button::with_label("Settings");
         settings_btn.add_css_class("neon-pill-button");
         settings_btn.set_tooltip_text(Some("Open NEON DE Settings"));
         settings_btn.connect_clicked(move |_| {
-            launch_sibling("neon-settings");
+            launch_sibling_binary("neon-settings");
         });
 
         let lock_btn = Button::with_label("Lock");
@@ -97,6 +141,10 @@ impl TopPanel {
         }
 
         right_box.append(&focused_label);
+        right_box.append(&net_btn);
+        right_box.append(&audio_btn);
+        right_box.append(&power_btn);
+        right_box.append(&control_center_btn);
         right_box.append(&settings_btn);
         right_box.append(&lock_btn);
 
@@ -113,6 +161,10 @@ impl TopPanel {
             workspaces_box,
             clock_label,
             focused_label,
+            net_btn,
+            audio_btn,
+            power_btn,
+            control_center_btn,
             ipc,
         }
     }
@@ -129,7 +181,6 @@ impl TopPanel {
             self.activities_btn.remove_css_class("active");
         }
 
-        // Rebuild dynamic workspace pills cleanly
         while let Some(child) = self.workspaces_box.first_child() {
             self.workspaces_box.remove(&child);
         }
@@ -161,6 +212,23 @@ impl TopPanel {
             .unwrap_or("Desktop");
         self.focused_label.set_text(title);
     }
+
+    pub fn update_system(&self, sys: &SystemSnapshot, unread_notifications: usize) {
+        self.net_btn.set_label(&sys.network.panel_label());
+        self.audio_btn.set_label(&sys.audio.panel_label());
+        if sys.audio.muted {
+            self.audio_btn.add_css_class("active");
+        } else {
+            self.audio_btn.remove_css_class("active");
+        }
+        self.power_btn.set_label(&sys.power.panel_label());
+        if unread_notifications > 0 {
+            self.control_center_btn
+                .set_label(&format!("System ({unread_notifications})"));
+        } else {
+            self.control_center_btn.set_label("System");
+        }
+    }
 }
 
 fn format_clock_now() -> String {
@@ -170,7 +238,7 @@ fn format_clock_now() -> String {
         .unwrap_or_else(|_| "NEON DE".to_string())
 }
 
-fn launch_sibling(name: &str) {
+pub fn launch_sibling_binary(name: &str) {
     if let Ok(exe) = std::env::current_exe()
         && let Some(dir) = exe.parent()
     {

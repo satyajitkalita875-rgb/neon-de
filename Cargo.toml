@@ -9,6 +9,7 @@ members = [
     "crates/neon-renderer",
     "crates/neon-config",
     "crates/neon-ipc",
+    "crates/neon-system",
     "crates/neon-compositor",
     "crates/neon-shell",
     "crates/neon-lockscreen",
@@ -31,6 +32,8 @@ neon-scene = { path = "crates/neon-scene" }
 neon-renderer = { path = "crates/neon-renderer" }
 neon-config = { path = "crates/neon-config" }
 neon-ipc = { path = "crates/neon-ipc" }
+neon-system = { path = "crates/neon-system" }
+zbus = "5"
 smithay = { version = "0.7.0", default-features = false, features = [
     "backend_winit",
     "desktop",

@@ -33,7 +33,7 @@ NEON SESSION (planned — Milestone 8)
 └── Linux System Services (PipeWire, NetworkManager, UPower, BlueZ, polkit, portals)
 ```
 
-## 3. Current Workspace Crate Structure (Milestone 6)
+## 3. Current Workspace Crate Structure (Milestone 7)
 
 ```text
 crates/
@@ -45,10 +45,11 @@ crates/
 ├── neon-renderer/            # Modular GLES/Glow pipeline, SDF shadow/border/backdrop/frosted-glass shaders, lock curtain
 ├── neon-config/              # Versioned TOML XDG configuration service (atomic saves, validation, migration, backup)
 ├── neon-ipc/                 # Versioned Unix domain socket IPC + SO_PEERCRED auth + typed snapshots/events
+├── neon-system/              # Linux D-Bus & PipeWire integration (NetworkManager, WirePlumber, BlueZ, UPower, Notifications v1.2, Polkit, Portals)
 ├── neon-compositor/          # Smithay 0.7.0 compositor (layer-shell, session-lock, fractional-scale, gestures, XWayland, DMA-BUF)
-├── neon-shell/               # Custom Rust + GTK4 + gtk4-layer-shell Desktop Shell (live Dark/Light theme, Panel, Dock, Overview)
+├── neon-shell/               # Custom Rust + GTK4 + gtk4-layer-shell Desktop Shell (Panel, System Tray, Control Center, Toasts, Dock, Overview)
 ├── neon-lockscreen/          # Standalone ext_session_lock_v1 Wayland lock screen client
-└── neon-settings/            # macOS-inspired GTK4 Settings application wired live to neon-config & neon-ipc
+└── neon-settings/            # macOS-inspired GTK4 Settings application wired live to neon-config, neon-ipc & neon-system
 ```
 
 ## 4. Key Architectural Decisions & Trade-offs

@@ -91,7 +91,9 @@ pub fn build_shell_css(appearance: &AppearanceInfo) -> String {
         r#"
 window.neon-panel-window,
 window.neon-dock-window,
-window.neon-overview-window {{
+window.neon-overview-window,
+window.neon-quicksettings-window,
+window.neon-toast-window {{
     background-color: transparent;
 }}
 
@@ -273,6 +275,69 @@ window.neon-overview-window {{
 .neon-close-button:hover {{
     background-color: rgba(239, 68, 68, 0.75);
     color: #FFFFFF;
+}}
+
+.neon-status-pill {{
+    background-color: {pill_bg};
+    color: {fg_primary};
+    border: 1px solid {border_subtle};
+    border-radius: 999px;
+    padding: 2px 10px;
+    min-height: 22px;
+    font-size: 12px;
+    font-weight: 600;
+}}
+
+.neon-status-pill:hover {{
+    border-color: {accent};
+}}
+
+.neon-status-pill.active {{
+    border-color: {accent};
+    background-color: alpha({accent}, 0.24);
+}}
+
+.neon-quicksettings-panel {{
+    background-color: {panel_bg};
+    border: 1px solid {border_subtle};
+    border-radius: 18px;
+    padding: 16px;
+    color: {fg_primary};
+    box-shadow: 0 16px 40px rgba(0, 0, 0, 0.42);
+    min-width: 340px;
+}}
+
+.neon-qs-card {{
+    background-color: {card_bg};
+    border: 1px solid {border_subtle};
+    border-radius: 12px;
+    padding: 10px 12px;
+    color: {fg_primary};
+}}
+
+.neon-qs-muted {{
+    color: {fg_muted};
+    font-size: 11px;
+}}
+
+.neon-qs-title {{
+    color: {fg_primary};
+    font-weight: 700;
+    font-size: 13px;
+}}
+
+.neon-toast-card {{
+    background-color: {panel_bg};
+    border: 1px solid {accent};
+    border-radius: 14px;
+    padding: 12px 14px;
+    color: {fg_primary};
+    box-shadow: 0 10px 28px rgba(0, 0, 0, 0.38);
+    min-width: 310px;
+}}
+
+.neon-toast-card.critical {{
+    border-color: #EF4444;
 }}
 "#
     )

@@ -10,8 +10,8 @@ NEON DE is built in eight verifiable milestones. Every milestone produces a comp
 | **M4 — Desktop Shell** | Typed Unix socket IPC (`neon-ipc`), `zwlr_layer_shell_v1`, GTK4 `neon-shell` (top panel, dock, activities overview, application grid, search, workspace previews) | **Completed (Verified)** |
 | **M5 — Advanced Compositor** | GPU frosted-glass blur & translucency, touchpad gestures (`zwp_pointer_gestures_v1`), multi-monitor (`neon-output`) & hotplugging, fractional scaling (`wp_fractional_scale_v1` + `wp_viewporter`), XWayland (`X11Wm`), `ext_session_lock_v1` + `neon-lockscreen` | **Completed (Verified)** |
 | **M6 — Settings Application** | Versioned XDG config service (`neon-config`), GTK4 macOS-inspired `neon-settings` app with live IPC updates across Appearance, Displays, Desktop/Windows, Dock/Panels, Effects, Input, Privacy/Accessibility, and System | **Completed (Verified)** |
-| **M7 — System Integration** | D-Bus integration (`neon-system`): NetworkManager, PipeWire/WirePlumber, BlueZ, UPower, notifications daemon, polkit, XDG Desktop Portals | **Next** |
-| **M8 — Production Readiness** | Crash recovery, profiling, accessibility, packaging, session `.desktop` files (`neon-session`), bare-metal QA | Planned |
+| **M7 — System Integration** | D-Bus integration (`neon-system`): NetworkManager, PipeWire/WirePlumber, BlueZ, UPower, notifications daemon, polkit, XDG Desktop Portals | **Completed (Verified)** |
+| **M8 — Production Readiness** | Crash recovery, profiling, accessibility, packaging, session `.desktop` files (`neon-session`), bare-metal QA | **Next** |
 
 ## Milestone 1 Acceptance Criteria
 
@@ -61,3 +61,10 @@ NEON DE is built in eight verifiable milestones. Every milestone produces a comp
 - [x] Built `crates/neon-settings` in Rust + GTK4 with macOS-inspired searchable sidebar, Neon Dark & Neon Light themes, grouped cards, and live IPC sync.
 - [x] Wired live `UpdateAppearance` (Neon Dark / Neon Light, accent color, panel/dock transparency, clock/workspace toggles) and `UpdateWindowBehavior` (focus policy, snap gap) across `neon-compositor`, `neon-shell`, and `neon-settings`, plus one-click Settings & Lock buttons in the Top Panel.
 - [x] Verified config unit tests, live IPC appearance/window-behavior tests, and live nested launch of `neon-settings` inside NEON DE.
+
+## Milestone 7 Acceptance Criteria
+
+- [x] Created `crates/neon-system` integrating NetworkManager (`org.freedesktop.NetworkManager`), PipeWire/WirePlumber (`wpctl`), BlueZ (`org.bluez`), UPower & PowerProfiles (`org.freedesktop.UPower`), Freedesktop Notifications v1.2 D-Bus server, PolicyKit1 `AuthenticationAgent` interface, and XDG Desktop Portals (`data/xdg-desktop-portal/neon-de-portals.conf`).
+- [x] Integrated live Top Panel status pills (Network, PipeWire Volume, UPower Battery), Control Center / Quick Settings overlay, and live Notification Toast overlay into `neon-shell` off the UI thread.
+- [x] Upgraded `neon-settings` *System* page with live PipeWire audio, NetworkManager Wi-Fi, BlueZ Bluetooth, UPower Power Profiles, Notification test, PolicyKit1, and XDG Portal status & controls.
+- [x] Verified unit tests, live D-Bus `org.freedesktop.Notifications` v1.2 roundtrip test, live Linux subsystem snapshot probe, and live nested NEON DE session with `neon-shell` + `neon-settings` + D-Bus notification toast delivery.

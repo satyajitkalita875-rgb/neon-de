@@ -2,7 +2,7 @@
 
 **NEON DE** is an independent, next-generation Linux desktop environment built in **Rust** with **Smithay** and **Wayland**.
 
-> **Project Status**: **Milestone 6 (Settings & Configuration)** — Custom Smithay `0.7.0` Wayland compositor + GTK4 Desktop Shell + macOS-inspired GTK4 Settings App + `ext_session_lock_v1` Lock Screen across 12 modular crates (`neon-compositor`, `neon-shell`, `neon-settings`, `neon-lockscreen`, `neon-config`, `neon-output`, `neon-ipc`, `neon-renderer`, `neon-scene`, `neon-effects`, `neon-window-manager`, `neon-workspaces`): live Neon Dark / Neon Light themes & accent colors, GPU frosted-glass blur + shadows + focus rings, GNOME-inspired dynamic workspaces, multi-monitor & fractional scaling, touchpad gestures, XWayland, secure screen locking, and atomic versioned XDG config. Full Linux D-Bus system services & bare-metal session packaging follow in Milestones 7–8.
+> **Project Status**: **Milestone 7 (Linux System Integration)** — Custom Smithay `0.7.0` Wayland compositor + GTK4 Desktop Shell (Top Panel, Live System Tray, Control Center, Notification Toasts, Dock, Overview) + macOS-inspired GTK4 Settings App + `ext_session_lock_v1` Lock Screen + `neon-system` Linux D-Bus/PipeWire integration across 13 modular crates (`neon-compositor`, `neon-shell`, `neon-settings`, `neon-lockscreen`, `neon-system`, `neon-config`, `neon-output`, `neon-ipc`, `neon-renderer`, `neon-scene`, `neon-effects`, `neon-window-manager`, `neon-workspaces`). Bare-metal session packaging & production hardening follow in Milestone 8.
 
 ## Vision
 
@@ -50,6 +50,7 @@ cargo run -p neon-compositor -- --command weston-terminal
 - [Window Manager Design](docs/WINDOW_MANAGER_DESIGN.md)
 - [IPC Specification](docs/IPC_SPECIFICATION.md)
 - [Configuration Specification](docs/CONFIGURATION_SPECIFICATION.md)
+- [Linux System Integration](docs/SYSTEM_INTEGRATION.md)
 - [Security Model](docs/SECURITY_MODEL.md)
 - [Build Instructions](docs/BUILD_INSTRUCTIONS.md)
 - [Testing Guide](docs/TESTING_GUIDE.md)

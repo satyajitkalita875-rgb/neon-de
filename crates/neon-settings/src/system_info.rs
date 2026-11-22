@@ -1,6 +1,6 @@
-//! Real Linux hardware, OS, and system service discovery for the System settings page.
+//! Real Linux hardware and OS discovery for the System settings page.
 
-use std::{fs, process::Command};
+use std::fs;
 
 #[derive(Debug, Clone)]
 pub struct HardwareSummary {
@@ -8,7 +8,6 @@ pub struct HardwareSummary {
     pub kernel: String,
     pub cpu_model: String,
     pub memory_gib: String,
-    pub services: Vec<(&'static str, bool)>,
 }
 
 pub fn collect_hardware_summary() -> HardwareSummary {
@@ -19,20 +18,11 @@ pub fn collect_hardware_summary() -> HardwareSummary {
     let cpu_model = read_cpu_model().unwrap_or_else(|| "x86_64 Processor".into());
     let memory_gib = read_memory_gib().unwrap_or_else(|| "Unknown".into());
 
-    let services = vec![
-        ("PipeWire Audio", service_or_proc_active("pipewire")),
-        ("WirePlumber", service_or_proc_active("wireplumber")),
-        ("NetworkManager", service_or_proc_active("NetworkManager")),
-        ("BlueZ Bluetooth", service_or_proc_active("bluetoothd")),
-        ("UPower Battery", service_or_proc_active("upowerd")),
-    ];
-
     HardwareSummary {
         os_name,
         kernel,
         cpu_model,
         memory_gib,
-        services,
     }
 }
 
@@ -67,12 +57,4 @@ fn read_memory_gib() -> Option<String> {
         }
     }
     None
-}
-
-fn service_or_proc_active(name: &str) -> bool {
-    Command::new("pgrep")
-        .args(["-x", name])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
 }
