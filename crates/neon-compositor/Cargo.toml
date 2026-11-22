@@ -1,0 +1,28 @@
+[package]
+name = "neon-compositor"
+description = "NEON DE Wayland compositor built on Smithay"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lib]
+name = "neon_compositor"
+path = "src/lib.rs"
+
+[[bin]]
+name = "neon-compositor"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+bitflags.workspace = true
+clap.workspace = true
+smithay.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client"] }

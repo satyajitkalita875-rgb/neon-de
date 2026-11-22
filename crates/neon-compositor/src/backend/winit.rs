@@ -1,0 +1,280 @@
+//! Nested `winit` + OpenGL ES (`GlesRenderer`) backend for Milestone 1 development.
+
+use std::{cell::RefCell, rc::Rc, time::Duration};
+
+use anyhow::{Context, Result};
+use smithay::{
+    backend::{
+        renderer::{
+            damage::OutputDamageTracker, element::solid::SolidColorRenderElement,
+            gles::GlesRenderer,
+        },
+        winit::{self, WinitEvent},
+    },
+    desktop::space::render_output,
+    output::{Mode, Output, PhysicalProperties, Subpixel},
+    reexports::{
+        calloop::{
+            EventLoop, Interest, Mode as TriggerMode, PostAction,
+            generic::Generic,
+            timer::{TimeoutAction, Timer},
+        },
+        wayland_server::Display,
+        winit::{dpi::LogicalSize, window::Window as WinitWindow},
+    },
+    utils::{Rectangle, Transform},
+    wayland::socket::ListeningSocketSource,
+};
+use tracing::{error, info, warn};
+
+use crate::{input::process_input_event, state::NeonState};
+
+/// NEON DE signature obsidian backdrop clear color (`#0E1119`).
+const NEON_CANVAS_COLOR: [f32; 4] = [0.055, 0.067, 0.098, 1.0];
+
+/// Configuration for running the nested `winit` backend.
+#[derive(Debug, Clone)]
+pub struct WinitConfig {
+    pub width: u32,
+    pub height: u32,
+    pub socket_name: Option<String>,
+    pub startup_command: Option<String>,
+    pub startup_args: Vec<String>,
+}
+
+/// Runs the NEON DE Wayland compositor inside a nested `winit` window on the host desktop.
+pub fn run_winit(config: WinitConfig) -> Result<()> {
+    let mut event_loop: EventLoop<NeonState> =
+        EventLoop::try_new().context("Failed to create calloop event loop")?;
+    let display: Display<NeonState> = Display::new().context("Failed to create Wayland display")?;
+
+    let listening_socket = match &config.socket_name {
+        Some(name) => ListeningSocketSource::with_name(name)
+            .with_context(|| format!("Failed to bind Wayland socket '{name}'"))?,
+        None => {
+            ListeningSocketSource::new_auto().context("Failed to bind automatic Wayland socket")?
+        }
+    };
+    let socket_name = listening_socket.socket_name().to_os_string();
+
+    info!(
+        wayland_display = ?socket_name,
+        width = config.width,
+        height = config.height,
+        "Starting NEON DE nested compositor"
+    );
+
+    let mut state = NeonState::new(
+        &display,
+        event_loop.handle(),
+        event_loop.get_signal(),
+        socket_name.clone(),
+    );
+
+    // Initialize nested winit window + GLES renderer.
+    let window_attrs = WinitWindow::default_attributes()
+        .with_inner_size(LogicalSize::new(config.width as f64, config.height as f64))
+        .with_title(format!(
+            "NEON DE — Nested ({})",
+            socket_name.to_string_lossy()
+        ))
+        .with_visible(true);
+
+    let (backend, winit_events) = winit::init_from_attributes::<GlesRenderer>(window_attrs)
+        .map_err(|err| anyhow::anyhow!("Failed to initialize winit GLES backend: {err}"))?;
+
+    let initial_size = backend.window_size();
+    let mode = Mode {
+        size: initial_size,
+        refresh: 60_000,
+    };
+
+    let output = Output::new(
+        "NEON-Winit-1".to_string(),
+        PhysicalProperties {
+            size: (0, 0).into(),
+            subpixel: Subpixel::Unknown,
+            make: "NEON DE".into(),
+            model: "Nested Winit Display".into(),
+        },
+    );
+    output.change_current_state(
+        Some(mode),
+        Some(Transform::Flipped180),
+        Some(smithay::output::Scale::Fractional(backend.scale_factor())),
+        Some((0, 0).into()),
+    );
+    output.set_preferred(mode);
+    state.register_output(output.clone(), (0, 0).into());
+
+    let damage_tracker = OutputDamageTracker::from_output(&output);
+    let backend_cell = Rc::new(RefCell::new((backend, damage_tracker)));
+    let display_cell = Rc::new(RefCell::new(display));
+
+    // Register incoming Wayland client socket connections.
+    event_loop
+        .handle()
+        .insert_source(listening_socket, |client_stream, _, state| {
+            state.insert_client(client_stream);
+        })
+        .map_err(|err| anyhow::anyhow!("Failed to insert listening socket source: {err}"))?;
+
+    // Register Wayland display fd dispatch.
+    {
+        let display_for_source = Rc::clone(&display_cell);
+        let fd = display_for_source
+            .borrow_mut()
+            .backend()
+            .poll_fd()
+            .try_clone_to_owned()
+            .context("Failed to clone Wayland display poll fd")?;
+
+        event_loop
+            .handle()
+            .insert_source(
+                Generic::new(fd, Interest::READ, TriggerMode::Level),
+                move |_, _, state| {
+                    let mut display = display_for_source.borrow_mut();
+                    if let Err(err) = display.dispatch_clients(state) {
+                        error!(?err, "Error dispatching Wayland clients");
+                    }
+                    Ok(PostAction::Continue)
+                },
+            )
+            .map_err(|err| anyhow::anyhow!("Failed to insert Wayland display source: {err}"))?;
+    }
+
+    // Register nested winit window + input events.
+    {
+        let backend_for_winit = Rc::clone(&backend_cell);
+        let output_for_winit = output.clone();
+        event_loop
+            .handle()
+            .insert_source(winit_events, move |event, _, state| match event {
+                WinitEvent::Resized { size, scale_factor } => {
+                    let mode = Mode {
+                        size,
+                        refresh: 60_000,
+                    };
+                    output_for_winit.change_current_state(
+                        Some(mode),
+                        None,
+                        Some(smithay::output::Scale::Fractional(scale_factor)),
+                        None,
+                    );
+                    output_for_winit.set_preferred(mode);
+                }
+                WinitEvent::Input(input_event) => {
+                    process_input_event(state, input_event);
+                }
+                WinitEvent::CloseRequested => {
+                    info!("Host nested window closed; stopping NEON DE compositor");
+                    state.loop_signal.stop();
+                }
+                WinitEvent::Redraw => {
+                    let mut guard = backend_for_winit.borrow_mut();
+                    let (ref mut backend, ref mut damage_tracker) = *guard;
+                    render_frame(backend, damage_tracker, &output_for_winit, state);
+                }
+                WinitEvent::Focus(_) => {}
+            })
+            .map_err(|err| anyhow::anyhow!("Failed to insert winit event source: {err}"))?;
+    }
+
+    // Frame pacing timer (~60 Hz) to request redraws and flush client buffers cleanly.
+    {
+        let backend_for_timer = Rc::clone(&backend_cell);
+        let output_for_timer = output.clone();
+        event_loop
+            .handle()
+            .insert_source(
+                Timer::from_duration(Duration::from_millis(16)),
+                move |_, _, state| {
+                    let mut guard = backend_for_timer.borrow_mut();
+                    let (ref mut backend, ref mut damage_tracker) = *guard;
+                    render_frame(backend, damage_tracker, &output_for_timer, state);
+                    TimeoutAction::ToDuration(Duration::from_millis(16))
+                },
+            )
+            .map_err(|err| anyhow::anyhow!("Failed to insert frame pacing timer: {err}"))?;
+    }
+
+    // Spawn optional startup command wired strictly to NEON DE's WAYLAND_DISPLAY.
+    if let Some(program) = &config.startup_command {
+        state.spawn_client(program, &config.startup_args);
+    }
+
+    info!(
+        wayland_display = ?state.socket_name,
+        "NEON DE compositor is ready (connect clients with WAYLAND_DISPLAY={})",
+        state.socket_name.to_string_lossy()
+    );
+
+    // Main deterministic calloop event loop.
+    event_loop
+        .run(None, &mut state, |state| {
+            state.cleanup_dead_windows();
+            let mut display = display_cell.borrow_mut();
+            if let Err(err) = display.dispatch_clients(state) {
+                warn!(?err, "Error dispatching Wayland clients during idle");
+            }
+            if let Err(err) = display.flush_clients() {
+                warn!(?err, "Error flushing Wayland clients");
+            }
+        })
+        .context("Error while running calloop event loop")?;
+
+    info!("NEON DE nested compositor shut down cleanly");
+    Ok(())
+}
+
+fn render_frame(
+    backend: &mut winit::WinitGraphicsBackend<GlesRenderer>,
+    damage_tracker: &mut OutputDamageTracker,
+    output: &Output,
+    state: &mut NeonState,
+) {
+    let size = backend.window_size();
+    let full_damage = Rectangle::from_size(size);
+
+    let render_damage = {
+        let age = backend.buffer_age().unwrap_or(0);
+        match backend.bind() {
+            Ok((renderer, mut framebuffer)) => {
+                let custom: [SolidColorRenderElement; 0] = [];
+                match render_output(
+                    output,
+                    renderer,
+                    &mut framebuffer,
+                    1.0,
+                    age,
+                    [&state.space],
+                    &custom,
+                    damage_tracker,
+                    NEON_CANVAS_COLOR,
+                ) {
+                    Ok(res) => res.damage.cloned(),
+                    Err(err) => {
+                        warn!(?err, "Output render error");
+                        Some(vec![full_damage])
+                    }
+                }
+            }
+            Err(err) => {
+                warn!(?err, "Failed to bind winit EGL surface");
+                return;
+            }
+        }
+    };
+
+    if let Err(err) = backend.submit(render_damage.as_deref()) {
+        warn!(?err, "Failed to submit winit swapchain frame");
+    }
+
+    let now = state.clock.now();
+    for window in state.space.elements() {
+        window.send_frame(output, now, Some(Duration::ZERO), |_, _| {
+            Some(output.clone())
+        });
+    }
+}
