@@ -1,28 +1,36 @@
-//! NEON DE Top Panel (`zwlr_layer_shell_v1` `Layer::Top` anchored Top+Left+Right).
+//! NEON DE macOS × GNOME 47 Top Menu Bar (`zwlr_layer_shell_v1` `Layer::Top` anchored Top+Left+Right).
 
 use std::time::Duration;
 
 use gtk4::{
-    Application, ApplicationWindow, Box as GtkBox, Button, CenterBox, Label, Orientation, glib,
-    prelude::*,
+    Align, Application, ApplicationWindow, Box as GtkBox, Button, CenterBox, Image, Label,
+    Orientation, glib, prelude::*,
 };
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 use neon_ipc::{DesktopSnapshot, IpcRequest};
-use neon_system::{SystemAction, SystemActionSender, SystemSnapshot};
+use neon_system::{
+    SystemAction, SystemActionSender, SystemSnapshot, network::ConnectionKind, power::BatteryState,
+};
 
 use crate::{ipc_bridge::IpcCommandSender, quick_settings::QuickSettingsPanel};
 
-/// Live handles to updatable widgets in the NEON DE Top Panel.
+/// Live handles to updatable widgets in the NEON DE Top Menu Bar.
 pub struct TopPanel {
     window: ApplicationWindow,
     activities_btn: Button,
     workspaces_box: GtkBox,
-    clock_label: Label,
     focused_label: Label,
+    clock_btn: Button,
+    clock_label: Label,
     net_btn: Button,
+    net_icon: Image,
+    bt_btn: Button,
     audio_btn: Button,
+    audio_icon: Image,
     power_btn: Button,
-    control_center_btn: Button,
+    power_icon: Image,
+    power_pct_label: Label,
+    notif_dot: GtkBox,
     ipc: IpcCommandSender,
 }
 
@@ -35,10 +43,10 @@ impl TopPanel {
     ) -> Self {
         let window = ApplicationWindow::builder()
             .application(app)
-            .title("NEON DE Top Panel")
+            .title("NEON DE Top Bar")
             .decorated(false)
             .resizable(false)
-            .default_height(36)
+            .default_height(30)
             .build();
         window.add_css_class("neon-panel-window");
 
@@ -56,10 +64,13 @@ impl TopPanel {
         let bar = CenterBox::new();
         bar.add_css_class("neon-top-panel");
 
-        // Left: Activities toggle + dynamic workspace indicator strip
+        // Left: NEON brand / Activities button + GNOME 47 workspace dots + focused app name
         let left_box = GtkBox::new(Orientation::Horizontal, 8);
-        let activities_btn = Button::with_label("Activities");
-        activities_btn.add_css_class("neon-pill-button");
+        left_box.set_valign(Align::Center);
+
+        let activities_btn = Button::with_label("NEON");
+        activities_btn.add_css_class("neon-brand-button");
+        activities_btn.set_tooltip_text(Some("Activities Overview (Super+Space)"));
         {
             let ipc = ipc.clone();
             activities_btn.connect_clicked(move |_| {
@@ -68,12 +79,27 @@ impl TopPanel {
         }
 
         let workspaces_box = GtkBox::new(Orientation::Horizontal, 4);
+        workspaces_box.set_valign(Align::Center);
+
+        let focused_label = Label::new(Some("Desktop"));
+        focused_label.add_css_class("neon-app-title");
+        focused_label.set_max_width_chars(24);
+        focused_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+
         left_box.append(&activities_btn);
         left_box.append(&workspaces_box);
+        left_box.append(&focused_label);
 
-        // Center: Live clock & date
+        // Center: Clean GNOME / macOS Date & Time (click toggles Control Center & Notifications)
         let clock_label = Label::new(Some(&format_clock_now()));
-        clock_label.add_css_class("neon-clock");
+        let clock_btn = Button::new();
+        clock_btn.add_css_class("neon-clock-btn");
+        clock_btn.set_child(Some(&clock_label));
+        clock_btn.set_tooltip_text(Some("Date, Time & Notifications"));
+        {
+            let qs = quick_settings.clone();
+            clock_btn.connect_clicked(move |_| qs.toggle());
+        }
         {
             let clock_clone = clock_label.clone();
             glib::timeout_add_local(Duration::from_secs(1), move || {
@@ -82,24 +108,39 @@ impl TopPanel {
             });
         }
 
-        // Right: Active window title + Live System Tray (Network / PipeWire Audio / UPower Battery) + Control Center + Settings + Lock
-        let right_box = GtkBox::new(Orientation::Horizontal, 6);
-        let focused_label = Label::new(Some("Desktop"));
-        focused_label.add_css_class("neon-focused-title");
-        focused_label.set_max_width_chars(22);
-        focused_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+        // Right: Crisp symbolic icons (Wi-Fi, Bluetooth, Volume, Battery + %, Control Center)
+        let right_box = GtkBox::new(Orientation::Horizontal, 2);
+        right_box.set_valign(Align::Center);
 
-        let net_btn = Button::with_label("Net: --");
-        net_btn.add_css_class("neon-status-pill");
-        net_btn.set_tooltip_text(Some("NetworkManager Status — Click for Control Center"));
+        let net_icon = Image::from_icon_name("network-wireless-signal-excellent-symbolic");
+        net_icon.set_pixel_size(15);
+        let net_btn = Button::new();
+        net_btn.add_css_class("neon-tray-btn");
+        net_btn.set_child(Some(&net_icon));
+        net_btn.set_tooltip_text(Some("Network"));
         {
             let qs = quick_settings.clone();
             net_btn.connect_clicked(move |_| qs.toggle());
         }
 
-        let audio_btn = Button::with_label("Vol: --");
-        audio_btn.add_css_class("neon-status-pill");
-        audio_btn.set_tooltip_text(Some("PipeWire Volume — Click to Mute/Unmute"));
+        let bt_icon = Image::from_icon_name("bluetooth-active-symbolic");
+        bt_icon.set_pixel_size(15);
+        let bt_btn = Button::new();
+        bt_btn.add_css_class("neon-tray-btn");
+        bt_btn.set_child(Some(&bt_icon));
+        bt_btn.set_tooltip_text(Some("Bluetooth"));
+        bt_btn.set_visible(false);
+        {
+            let qs = quick_settings.clone();
+            bt_btn.connect_clicked(move |_| qs.toggle());
+        }
+
+        let audio_icon = Image::from_icon_name("audio-volume-high-symbolic");
+        audio_icon.set_pixel_size(15);
+        let audio_btn = Button::new();
+        audio_btn.add_css_class("neon-tray-btn");
+        audio_btn.set_child(Some(&audio_icon));
+        audio_btn.set_tooltip_text(Some("Volume — Click to Mute/Unmute"));
         {
             let sys_tx = sys_tx.clone();
             audio_btn.connect_clicked(move |_| {
@@ -107,49 +148,48 @@ impl TopPanel {
             });
         }
 
-        let power_btn = Button::with_label("Pwr: --");
-        power_btn.add_css_class("neon-status-pill");
-        power_btn.set_tooltip_text(Some("UPower Battery & Profile — Click for Control Center"));
+        let power_inner = GtkBox::new(Orientation::Horizontal, 4);
+        let power_icon = Image::from_icon_name("battery-full-symbolic");
+        power_icon.set_pixel_size(15);
+        let power_pct_label = Label::new(Some("100%"));
+        power_inner.append(&power_icon);
+        power_inner.append(&power_pct_label);
+        let power_btn = Button::new();
+        power_btn.add_css_class("neon-tray-btn");
+        power_btn.set_child(Some(&power_inner));
+        power_btn.set_tooltip_text(Some("Battery & Power"));
         {
             let qs = quick_settings.clone();
             power_btn.connect_clicked(move |_| qs.toggle());
         }
 
-        let control_center_btn = Button::with_label("System");
-        control_center_btn.add_css_class("neon-pill-button");
-        control_center_btn.set_tooltip_text(Some("Open Control Center & Notifications"));
+        let cc_inner = GtkBox::new(Orientation::Horizontal, 3);
+        let cc_icon = Image::from_icon_name("view-more-symbolic");
+        cc_icon.set_pixel_size(15);
+        let notif_dot = GtkBox::new(Orientation::Horizontal, 0);
+        notif_dot.add_css_class("neon-notif-dot");
+        notif_dot.set_valign(Align::Center);
+        notif_dot.set_visible(false);
+        cc_inner.append(&cc_icon);
+        cc_inner.append(&notif_dot);
+
+        let cc_btn = Button::new();
+        cc_btn.add_css_class("neon-tray-btn");
+        cc_btn.set_child(Some(&cc_inner));
+        cc_btn.set_tooltip_text(Some("Control Center & Notifications"));
         {
             let qs = quick_settings;
-            control_center_btn.connect_clicked(move |_| qs.toggle());
+            cc_btn.connect_clicked(move |_| qs.toggle());
         }
 
-        let settings_btn = Button::with_label("Settings");
-        settings_btn.add_css_class("neon-pill-button");
-        settings_btn.set_tooltip_text(Some("Open NEON DE Settings"));
-        settings_btn.connect_clicked(move |_| {
-            launch_sibling_binary("neon-settings");
-        });
-
-        let lock_btn = Button::with_label("Lock");
-        lock_btn.add_css_class("neon-pill-button");
-        lock_btn.set_tooltip_text(Some("Lock Session (Super+L)"));
-        {
-            let ipc = ipc.clone();
-            lock_btn.connect_clicked(move |_| {
-                ipc.send(IpcRequest::LockSession);
-            });
-        }
-
-        right_box.append(&focused_label);
         right_box.append(&net_btn);
+        right_box.append(&bt_btn);
         right_box.append(&audio_btn);
         right_box.append(&power_btn);
-        right_box.append(&control_center_btn);
-        right_box.append(&settings_btn);
-        right_box.append(&lock_btn);
+        right_box.append(&cc_btn);
 
         bar.set_start_widget(Some(&left_box));
-        bar.set_center_widget(Some(&clock_label));
+        bar.set_center_widget(Some(&clock_btn));
         bar.set_end_widget(Some(&right_box));
 
         window.set_child(Some(&bar));
@@ -159,18 +199,25 @@ impl TopPanel {
             window,
             activities_btn,
             workspaces_box,
-            clock_label,
             focused_label,
+            clock_btn,
+            clock_label,
             net_btn,
+            net_icon,
+            bt_btn,
             audio_btn,
+            audio_icon,
             power_btn,
-            control_center_btn,
+            power_icon,
+            power_pct_label,
+            notif_dot,
             ipc,
         }
     }
 
     pub fn update(&self, snapshot: &DesktopSnapshot) {
         self.window.set_visible(snapshot.appearance.panel_visible);
+        self.clock_btn.set_visible(snapshot.appearance.show_clock);
         self.clock_label.set_visible(snapshot.appearance.show_clock);
         self.workspaces_box
             .set_visible(snapshot.appearance.show_workspaces);
@@ -186,22 +233,25 @@ impl TopPanel {
         }
 
         for ws in &snapshot.workspaces {
-            let label = if ws.window_ids.is_empty() {
-                format!("{}", ws.index + 1)
-            } else {
-                format!("{} · {}", ws.index + 1, ws.window_ids.len())
-            };
-            let pill = Button::with_label(&label);
-            pill.add_css_class("neon-ws-pill");
-            if ws.active {
-                pill.add_css_class("active");
+            let dot = Button::new();
+            dot.add_css_class("neon-ws-dot");
+            if !ws.window_ids.is_empty() {
+                dot.add_css_class("occupied");
             }
+            if ws.active {
+                dot.add_css_class("active");
+            }
+            dot.set_tooltip_text(Some(&format!(
+                "Workspace {} ({} windows)",
+                ws.index + 1,
+                ws.window_ids.len()
+            )));
             let idx = ws.index;
             let ipc = self.ipc.clone();
-            pill.connect_clicked(move |_| {
+            dot.connect_clicked(move |_| {
                 ipc.send(IpcRequest::SwitchWorkspace { index: idx });
             });
-            self.workspaces_box.append(&pill);
+            self.workspaces_box.append(&dot);
         }
 
         let title = snapshot
@@ -214,20 +264,88 @@ impl TopPanel {
     }
 
     pub fn update_system(&self, sys: &SystemSnapshot, unread_notifications: usize) {
-        self.net_btn.set_label(&sys.network.panel_label());
-        self.audio_btn.set_label(&sys.audio.panel_label());
+        // Network icon + tooltip
+        let net_icon_name = if !sys.network.available || !sys.network.connectivity.is_connected() {
+            "network-wireless-offline-symbolic"
+        } else {
+            match sys.network.primary_kind {
+                ConnectionKind::Ethernet => "network-wired-symbolic",
+                ConnectionKind::Vpn => "network-vpn-symbolic",
+                ConnectionKind::Wifi => match sys.network.wifi_strength.unwrap_or(80) {
+                    75..=100 => "network-wireless-signal-excellent-symbolic",
+                    50..=74 => "network-wireless-signal-good-symbolic",
+                    25..=49 => "network-wireless-signal-ok-symbolic",
+                    _ => "network-wireless-signal-weak-symbolic",
+                },
+                _ => "network-transmit-receive-symbolic",
+            }
+        };
+        self.net_icon.set_icon_name(Some(net_icon_name));
+        self.net_btn
+            .set_tooltip_text(Some(&sys.network.panel_label()));
+
+        // Bluetooth icon visibility
+        self.bt_btn
+            .set_visible(sys.bluetooth.available && sys.bluetooth.powered);
+        self.bt_btn.set_tooltip_text(Some(&format!(
+            "Bluetooth ({} connected)",
+            sys.bluetooth.connected_count()
+        )));
+
+        // Audio symbolic icon + tooltip
+        let vol_pct = sys.audio.volume_percent();
+        let vol_icon_name = if sys.audio.muted || vol_pct == 0 {
+            "audio-volume-muted-symbolic"
+        } else if vol_pct < 34 {
+            "audio-volume-low-symbolic"
+        } else if vol_pct < 67 {
+            "audio-volume-medium-symbolic"
+        } else {
+            "audio-volume-high-symbolic"
+        };
+        self.audio_icon.set_icon_name(Some(vol_icon_name));
+        self.audio_btn.set_tooltip_text(Some(&format!(
+            "{} — Click to toggle mute",
+            sys.audio.panel_label()
+        )));
         if sys.audio.muted {
             self.audio_btn.add_css_class("active");
         } else {
             self.audio_btn.remove_css_class("active");
         }
-        self.power_btn.set_label(&sys.power.panel_label());
-        if unread_notifications > 0 {
-            self.control_center_btn
-                .set_label(&format!("System ({unread_notifications})"));
+
+        // Power / Battery icon + compact percentage
+        if sys.power.has_battery {
+            let pct = sys.power.battery_percentage.round() as u32;
+            let charging = matches!(
+                sys.power.battery_state,
+                BatteryState::Charging | BatteryState::PendingCharge
+            );
+            let bat_icon = match (pct, charging) {
+                (90..=100, true) => "battery-full-charging-symbolic",
+                (90..=100, false) => "battery-full-symbolic",
+                (50..=89, true) => "battery-good-charging-symbolic",
+                (50..=89, false) => "battery-good-symbolic",
+                (20..=49, true) => "battery-low-charging-symbolic",
+                (20..=49, false) => "battery-low-symbolic",
+                (_, true) => "battery-caution-charging-symbolic",
+                (_, false) => "battery-caution-symbolic",
+            };
+            self.power_icon.set_icon_name(Some(bat_icon));
+            self.power_pct_label.set_text(&format!("{pct}%"));
+            self.power_pct_label.set_visible(true);
+            self.power_btn.set_tooltip_text(Some(&format!(
+                "Battery: {pct}% ({}) · Profile: {}",
+                sys.power.battery_state.label(),
+                sys.power.active_profile.as_deref().unwrap_or("default")
+            )));
         } else {
-            self.control_center_btn.set_label("System");
+            self.power_icon.set_icon_name(Some("ac-adapter-symbolic"));
+            self.power_pct_label.set_visible(false);
+            self.power_btn.set_tooltip_text(Some("AC Power"));
         }
+
+        self.notif_dot.set_visible(unread_notifications > 0);
     }
 }
 

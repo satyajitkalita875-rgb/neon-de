@@ -559,6 +559,7 @@ fn handle_ipc_request(
             show_clock,
             show_workspaces,
             high_contrast,
+            wallpaper,
         } => {
             if let Some(t) = theme {
                 state.config.appearance.theme = match t.as_str() {
@@ -587,6 +588,9 @@ fn handle_ipc_request(
             }
             if let Some(v) = high_contrast {
                 state.config.privacy_accessibility.high_contrast = v;
+            }
+            if let Some(w) = wallpaper {
+                state.config.appearance.wallpaper_path = if w.is_empty() { None } else { Some(w) };
             }
             state.config.validate_and_clamp();
             IpcResult::Ok {
@@ -743,6 +747,7 @@ fn build_appearance(state: &NeonState) -> AppearanceInfo {
         show_clock: state.config.panel.show_clock,
         show_workspaces: state.config.panel.show_workspaces,
         high_contrast: state.config.privacy_accessibility.high_contrast,
+        wallpaper: state.config.appearance.wallpaper_path.clone(),
     }
 }
 

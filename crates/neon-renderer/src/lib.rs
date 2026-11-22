@@ -4,6 +4,7 @@
 //! cached custom GLSL elements (analytical soft shadows, rounded accent focus rings, and
 //! NEON DE ambient backdrop) so idle frames generate zero spurious damage.
 
+pub mod cursor;
 pub mod shaders;
 
 use std::collections::{HashMap, HashSet};
@@ -16,21 +17,24 @@ use smithay::{
         damage::{Error as OutputDamageTrackerError, OutputDamageTracker, RenderOutputResult},
         element::{
             AsRenderElements, Kind,
+            memory::MemoryRenderBufferRenderElement,
             solid::{SolidColorBuffer, SolidColorRenderElement},
             surface::{WaylandSurfaceRenderElement, render_elements_from_surface_tree},
         },
         gles::{GlesError, GlesRenderer, GlesTarget, Uniform, element::PixelShaderElement},
     },
     desktop::{Window, layer_map_for_output},
+    input::pointer::{CursorIcon, CursorImageAttributes, CursorImageStatus},
     output::Output,
     render_elements,
     utils::{Logical, Physical, Point, Rectangle, Scale, Size},
-    wayland::session_lock::LockSurface,
-    wayland::shell::wlr_layer::Layer as WlrLayer,
+    wayland::{
+        compositor::with_states, session_lock::LockSurface, shell::wlr_layer::Layer as WlrLayer,
+    },
 };
 use tracing::{info, warn};
 
-use crate::shaders::NeonShaders;
+use crate::{cursor::CursorCache, shaders::NeonShaders};
 
 /// Fallback clear color (`#0C0F17`) used if shaders are unavailable.
 pub const FALLBACK_CLEAR_COLOR: Color32F = Color32F::new(0.047, 0.059, 0.090, 1.0);
@@ -60,6 +64,7 @@ render_elements! {
     /// Unified render element type composited by [`NeonRenderer`].
     pub NeonRenderElement<=GlesRenderer>;
     Wayland=WaylandSurfaceRenderElement<GlesRenderer>,
+    Memory=MemoryRenderBufferRenderElement<GlesRenderer>,
     Shader=PixelShaderElement,
     Solid=SolidColorRenderElement,
 }
@@ -109,8 +114,7 @@ pub struct NeonRenderer {
     border_cache: HashMap<WindowId, CachedBorder>,
     glass_cache: HashMap<WindowId, CachedGlass>,
     backdrop_cache: Option<CachedBackdrop>,
-    cursor_outer: SolidColorBuffer,
-    cursor_inner: SolidColorBuffer,
+    cursor_cache: CursorCache,
 }
 
 impl NeonRenderer {
@@ -142,14 +146,7 @@ impl NeonRenderer {
             border_cache: HashMap::new(),
             glass_cache: HashMap::new(),
             backdrop_cache: None,
-            cursor_outer: SolidColorBuffer::new(
-                Size::from((16, 16)),
-                Color32F::new(0.04, 0.06, 0.12, 0.96),
-            ),
-            cursor_inner: SolidColorBuffer::new(
-                Size::from((10, 10)),
-                Color32F::new(0.22, 0.74, 0.97, 1.0),
-            ),
+            cursor_cache: CursorCache::load_default(),
         }
     }
 
@@ -201,32 +198,83 @@ impl NeonRenderer {
             .render_output(renderer, framebuffer, age, &elements, LOCK_CURTAIN_COLOR)
     }
 
-    /// Builds a crisp software pointer cursor overlay for bare-metal DRM/KMS outputs using
-    /// persistent cached buffers so idle frames generate zero spurious damage.
+    /// Renders a real anti-aliased XCursor (or client-provided `wl_surface` cursor) for
+    /// bare-metal DRM/KMS outputs.
     pub fn cursor_elements(
-        &self,
+        &mut self,
+        renderer: &mut GlesRenderer,
         pointer_loc: Point<f64, Logical>,
         output_origin: Point<i32, Logical>,
         scale_f: f64,
+        cursor_status: &CursorImageStatus,
     ) -> Vec<NeonRenderElement> {
-        let px = pointer_loc.x.round() as i32 - output_origin.x;
-        let py = pointer_loc.y.round() as i32 - output_origin.y;
-        vec![
-            NeonRenderElement::from(SolidColorRenderElement::from_buffer(
-                &self.cursor_inner,
-                Point::<i32, Logical>::from((px + 3, py + 3)).to_physical_precise_round(scale_f),
-                scale_f,
-                1.0,
-                Kind::Cursor,
-            )),
-            NeonRenderElement::from(SolidColorRenderElement::from_buffer(
-                &self.cursor_outer,
-                Point::<i32, Logical>::from((px, py)).to_physical_precise_round(scale_f),
-                scale_f,
-                1.0,
-                Kind::Cursor,
-            )),
-        ]
+        let local_x = pointer_loc.x - output_origin.x as f64;
+        let local_y = pointer_loc.y - output_origin.y as f64;
+
+        match cursor_status {
+            CursorImageStatus::Hidden => Vec::new(),
+            CursorImageStatus::Surface(wl_surface) => {
+                let hotspot = with_states(wl_surface, |states| {
+                    states
+                        .data_map
+                        .get::<std::sync::Mutex<CursorImageAttributes>>()
+                        .and_then(|m| m.lock().ok())
+                        .map(|attrs| attrs.hotspot)
+                        .unwrap_or_else(|| (0, 0).into())
+                });
+                let render_loc: Point<i32, Logical> = (
+                    local_x.round() as i32 - hotspot.x,
+                    local_y.round() as i32 - hotspot.y,
+                )
+                    .into();
+                let phys_loc: Point<i32, Physical> = render_loc.to_physical_precise_round(scale_f);
+                let elems: Vec<WaylandSurfaceRenderElement<GlesRenderer>> =
+                    render_elements_from_surface_tree(
+                        renderer,
+                        wl_surface,
+                        phys_loc,
+                        Scale::from(scale_f),
+                        1.0,
+                        Kind::Cursor,
+                    );
+                if !elems.is_empty() {
+                    return elems.into_iter().map(NeonRenderElement::from).collect();
+                }
+                self.render_named_cursor(renderer, CursorIcon::Default, local_x, local_y, scale_f)
+            }
+            CursorImageStatus::Named(icon) => {
+                self.render_named_cursor(renderer, *icon, local_x, local_y, scale_f)
+            }
+        }
+    }
+
+    fn render_named_cursor(
+        &mut self,
+        renderer: &mut GlesRenderer,
+        icon: CursorIcon,
+        local_x: f64,
+        local_y: f64,
+        scale_f: f64,
+    ) -> Vec<NeonRenderElement> {
+        let loaded = self.cursor_cache.get_named(icon);
+        let phys_loc: Point<f64, Physical> = Point::<f64, Logical>::from((
+            local_x - loaded.hotspot.0 as f64,
+            local_y - loaded.hotspot.1 as f64,
+        ))
+        .to_physical(scale_f);
+
+        match MemoryRenderBufferRenderElement::from_buffer(
+            renderer,
+            phys_loc,
+            &loaded.buffer,
+            None,
+            None,
+            None,
+            Kind::Cursor,
+        ) {
+            Ok(elem) => vec![NeonRenderElement::from(elem)],
+            Err(_) => Vec::new(),
+        }
     }
 
     /// Collects all front-to-back [`NeonRenderElement`]s for the current [`SceneGraph`] on `output`.

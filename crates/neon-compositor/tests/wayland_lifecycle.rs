@@ -1117,6 +1117,7 @@ fn ipc_server_state_overview_workspace_and_effects_roundtrip() {
                 show_clock: Some(true),
                 show_workspaces: Some(true),
                 high_contrast: Some(true),
+                wallpaper: None,
             })
             .unwrap();
         let IpcResult::Ok {

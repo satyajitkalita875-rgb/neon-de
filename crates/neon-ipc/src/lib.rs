@@ -188,6 +188,8 @@ pub struct AppearanceInfo {
     pub show_workspaces: bool,
     #[serde(default)]
     pub high_contrast: bool,
+    #[serde(default)]
+    pub wallpaper: Option<String>,
 }
 
 /// Live compositor frame-timing, uptime, and runtime diagnostics.
@@ -295,6 +297,8 @@ pub enum IpcRequest {
         show_workspaces: Option<bool>,
         #[serde(default)]
         high_contrast: Option<bool>,
+        #[serde(default)]
+        wallpaper: Option<String>,
     },
     UpdateWindowBehavior {
         focus_follows_mouse: Option<bool>,
@@ -331,6 +335,7 @@ pub enum IpcResult {
 /// Typed response payload variants.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "payload_type", rename_all = "snake_case")]
+#[allow(clippy::large_enum_variant)]
 pub enum IpcPayload {
     Ack,
     State { snapshot: DesktopSnapshot },
@@ -347,6 +352,7 @@ pub enum IpcPayload {
 /// Asynchronous state-change events pushed to subscribed clients.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "event_type", rename_all = "snake_case")]
+#[allow(clippy::large_enum_variant)]
 pub enum IpcEvent {
     StateChanged { snapshot: DesktopSnapshot },
     OverviewToggled { open: bool },

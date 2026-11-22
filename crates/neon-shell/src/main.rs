@@ -8,6 +8,7 @@ mod overview;
 mod panel;
 mod quick_settings;
 mod style;
+mod wallpaper;
 
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
@@ -30,6 +31,7 @@ use crate::{
     overview::Overview,
     panel::TopPanel,
     quick_settings::QuickSettingsPanel,
+    wallpaper::WallpaperLayer,
 };
 
 #[derive(Debug, Parser)]
@@ -55,8 +57,6 @@ fn main() {
     let notif_store = Arc::new(NotificationStore::new());
     let notif_rx = notif_store.subscribe();
 
-    // Start NEON DE's Freedesktop Notifications v1.2 D-Bus service safely
-    // (never steals `org.freedesktop.Notifications` from a host desktop in nested mode).
     let notif_daemon = match start_notification_daemon(Arc::clone(&notif_store), None) {
         Ok(handle) => Some(handle),
         Err(err) => {
@@ -91,6 +91,8 @@ fn main() {
 
         let (ipc_sender, update_rx) = start_ipc_bridge(socket_path.clone());
 
+        // Background wallpaper layer renders behind all desktop windows & panels.
+        let wallpaper_layer = WallpaperLayer::build(app);
         let toast_overlay = NotificationOverlay::build(app, Arc::clone(&notif_store));
         let quick_settings = QuickSettingsPanel::build(
             app,
@@ -106,7 +108,7 @@ fn main() {
             sys_tx.clone(),
             quick_settings.clone(),
         );
-        let dock = Dock::build(app, &favorites, ipc_sender.clone());
+        let dock = Dock::build(app, &favorites, apps.clone(), ipc_sender.clone());
         let overview = Overview::build(app, apps, ipc_sender);
 
         let sys_rx_local = sys_rx.borrow_mut().take();
@@ -114,12 +116,13 @@ fn main() {
         let store_for_loop = Arc::clone(&notif_store);
         let mut last_sys = neon_system::SystemSnapshot::default();
 
-        // Drain compositor IPC, system D-Bus, and notification events cleanly on the GTK4 main loop.
         glib::timeout_add_local(Duration::from_millis(33), move || {
             while let Ok(update) = update_rx.try_recv() {
                 match update {
                     ShellIpcUpdate::Snapshot(snapshot) => {
                         theme_ctrl.apply_if_changed(&snapshot.appearance);
+                        wallpaper_layer.update(&snapshot.appearance);
+                        quick_settings.update_appearance(&snapshot.appearance);
                         top_panel.update(&snapshot);
                         dock.update(&snapshot);
                         overview.update(&snapshot);
@@ -158,7 +161,6 @@ fn main() {
         });
     });
 
-    // Keep D-Bus notification daemon alive for the entire lifetime of `neon-shell`.
     let _keep_daemon = notif_daemon;
     app.run_with_args::<&str>(&[]);
 }

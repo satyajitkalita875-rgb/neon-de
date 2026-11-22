@@ -15,6 +15,7 @@ use tracing::{debug, info, warn};
 
 /// Incoming updates delivered from `neon-compositor` to the GTK4 main loop.
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
 pub enum ShellIpcUpdate {
     Snapshot(DesktopSnapshot),
     OverviewToggled(bool),

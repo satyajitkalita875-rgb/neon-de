@@ -111,6 +111,7 @@ pub fn build_appearance_request(cfg: &NeonConfig) -> IpcRequest {
         show_clock: Some(cfg.panel.show_clock),
         show_workspaces: Some(cfg.panel.show_workspaces),
         high_contrast: Some(cfg.privacy_accessibility.high_contrast),
+        wallpaper: Some(cfg.appearance.wallpaper_path.clone().unwrap_or_default()),
     }
 }
 
@@ -284,7 +285,71 @@ pub fn build_appearance_page(ctrl: Rc<SettingsController>) -> ScrolledWindow {
     ));
     page.append(&typo_card);
 
+    // Live Desktop Wallpaper Picker
+    let wp_card = card("WALLPAPER");
+    let discovered = discover_wallpapers();
+    let mut wp_labels: Vec<String> = vec!["Automatic (Match Dark/Light Theme)".to_string()];
+    let mut wp_paths: Vec<Option<String>> = vec![None];
+    for p in discovered {
+        if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
+            wp_labels.push(stem.replace(['-', '_'], " "));
+            wp_paths.push(Some(p.to_string_lossy().into_owned()));
+        }
+    }
+    let wp_label_refs: Vec<&str> = wp_labels.iter().map(String::as_str).collect();
+    let wp_model = StringList::new(&wp_label_refs);
+    let wp_dd = DropDown::new(Some(wp_model), gtk4::Expression::NONE);
+    wp_dd.set_valign(Align::Center);
+    let current_wp = ctrl.config.borrow().appearance.wallpaper_path.clone();
+    if let Some(idx) = wp_paths.iter().position(|p| p == &current_wp) {
+        wp_dd.set_selected(idx as u32);
+    }
+    {
+        let ctrl = Rc::clone(&ctrl);
+        wp_dd.connect_selected_notify(move |dd| {
+            let idx = dd.selected() as usize;
+            let chosen = wp_paths.get(idx).cloned().flatten();
+            ctrl.config.borrow_mut().appearance.wallpaper_path = chosen;
+            let req = build_appearance_request(&ctrl.config.borrow());
+            ctrl.persist_and_sync(Some(req), "Updated desktop wallpaper");
+        });
+    }
+    wp_card.append(&labeled_row(
+        "Desktop Wallpaper",
+        "Applies live to NEON DE's background layer.",
+        &wp_dd,
+    ));
+    page.append(&wp_card);
+
     scroller
+}
+
+fn discover_wallpapers() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(home) = std::env::var_os("HOME") {
+        dirs.push(PathBuf::from(home).join("Pictures/Wallpapers"));
+    }
+    dirs.push(PathBuf::from("/usr/share/backgrounds"));
+
+    let mut found = Vec::new();
+    for dir in dirs {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if let Some(ext) = path.extension().and_then(|s| s.to_str())
+                && matches!(
+                    ext.to_ascii_lowercase().as_str(),
+                    "jpg" | "jpeg" | "png" | "webp"
+                )
+            {
+                found.push(path);
+            }
+        }
+    }
+    found.sort();
+    found
 }
 
 pub fn build_displays_page(ctrl: Rc<SettingsController>) -> ScrolledWindow {

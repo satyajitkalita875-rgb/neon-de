@@ -113,9 +113,9 @@ impl Overview {
 
         let apps_flow = FlowBox::new();
         apps_flow.set_selection_mode(SelectionMode::None);
-        apps_flow.set_column_spacing(12);
-        apps_flow.set_row_spacing(12);
-        apps_flow.set_max_children_per_line(7);
+        apps_flow.set_column_spacing(14);
+        apps_flow.set_row_spacing(14);
+        apps_flow.set_max_children_per_line(6);
         apps_flow.set_homogeneous(true);
 
         let scroller = ScrolledWindow::builder()
@@ -331,11 +331,10 @@ impl Overview {
             vbox.set_halign(Align::Center);
             vbox.set_valign(Align::Center);
 
-            if let Some(icon_name) = &app.icon {
-                let icon = Image::from_icon_name(icon_name);
-                icon.set_pixel_size(32);
-                vbox.append(&icon);
-            }
+            let icon_name = app.icon.as_deref().unwrap_or("application-x-executable");
+            let icon = Image::from_icon_name(icon_name);
+            icon.set_pixel_size(48);
+            vbox.append(&icon);
 
             let name_lbl = Label::new(Some(&app.name));
             name_lbl.set_max_width_chars(14);

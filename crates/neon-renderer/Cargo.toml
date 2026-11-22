@@ -11,3 +11,4 @@ neon-scene.workspace = true
 neon-window-manager.workspace = true
 smithay.workspace = true
 tracing.workspace = true
+xcursor = "0.3"

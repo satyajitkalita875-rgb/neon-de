@@ -604,10 +604,13 @@ fn render_all_drm_outputs(rt: &mut DrmRuntime, state: &mut NeonState) {
         let frame_start = std::time::Instant::now();
         let scale_f = active.output.current_scale().fractional_scale();
         let output_origin = active.output.current_location();
-        let mut elements =
-            active
-                .neon_renderer
-                .cursor_elements(pointer_loc, output_origin, scale_f);
+        let mut elements = active.neon_renderer.cursor_elements(
+            &mut rt.renderer,
+            pointer_loc,
+            output_origin,
+            scale_f,
+            &state.cursor_status,
+        );
         let clear_color = if is_locked {
             let lock_surface = state.lock_state.surface_for_output(&active.output.name());
             elements.extend(active.neon_renderer.collect_locked_elements(
