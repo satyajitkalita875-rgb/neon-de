@@ -171,6 +171,8 @@ pub struct NeonState {
     pub last_frame_time_us: u64,
     /// Optional VT switching hook (wired to `LibSeatSession::change_vt` on DRM/KMS).
     pub vt_switch_hook: Option<VtSwitchHook>,
+    /// Queued native screenshot destination captured on the next render frame.
+    pub pending_screenshot: Option<PathBuf>,
 }
 
 impl NeonState {
@@ -256,6 +258,7 @@ impl NeonState {
             idle_frames_skipped: 0,
             last_frame_time_us: 0,
             vt_switch_hook: None,
+            pending_screenshot: None,
         }
     }
 
@@ -1115,6 +1118,67 @@ impl NeonState {
             info!(vt, "Switching virtual terminal via libseat");
             hook(vt);
         }
+    }
+
+    /// Queues a native PNG screenshot to be captured on the next render pass.
+    pub fn request_screenshot(&mut self, custom_path: Option<PathBuf>) -> PathBuf {
+        let dest = custom_path.unwrap_or_else(|| {
+            let base = std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("/tmp"))
+                .join("Pictures/Screenshots");
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            base.join(format!("NEON-Screenshot-{ts}.png"))
+        });
+        info!(path = %dest.display(), "Queued native NEON DE screenshot");
+        self.pending_screenshot = Some(dest.clone());
+        dest
+    }
+
+    /// Post-processes a saved screenshot in the background: copies to clipboard and notifies user.
+    pub fn notify_screenshot_saved(&self, path: PathBuf) {
+        let wl_display = self.socket_name.clone();
+        std::thread::spawn(move || {
+            // Copy PNG to Wayland clipboard via wl-copy if available.
+            if let Ok(file) = std::fs::File::open(&path) {
+                let _ = Command::new("wl-copy")
+                    .args(["--type", "image/png"])
+                    .env("WAYLAND_DISPLAY", &wl_display)
+                    .stdin(std::process::Stdio::from(file))
+                    .status();
+            }
+            // Deliver desktop notification toast cleanly via gdbus.
+            let body = format!("Saved to {} (copied to clipboard)", path.display());
+            for dest in ["org.freedesktop.Notifications", "org.neonde.Notifications"] {
+                if Command::new("gdbus")
+                    .args([
+                        "call",
+                        "--session",
+                        "--dest",
+                        dest,
+                        "--object-path",
+                        "/org/freedesktop/Notifications",
+                        "--method",
+                        "org.freedesktop.Notifications.Notify",
+                        "NEON DE",
+                        "0",
+                        "camera-photo-symbolic",
+                        "Screenshot Saved",
+                        &body,
+                        "[]",
+                        "{}",
+                        "4000",
+                    ])
+                    .output()
+                    .is_ok_and(|o| o.status.success())
+                {
+                    break;
+                }
+            }
+        });
     }
 
     /// Spawns the first available Wayland-native terminal inside NEON DE.

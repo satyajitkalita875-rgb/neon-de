@@ -5,6 +5,7 @@
 //! NEON DE ambient backdrop) so idle frames generate zero spurious damage.
 
 pub mod cursor;
+pub mod screenshot;
 pub mod shaders;
 
 use std::collections::{HashMap, HashSet};

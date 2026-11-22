@@ -38,6 +38,7 @@ enum CompositorAction {
     SpawnTerminal,
     ToggleOverview,
     LockSession,
+    TakeScreenshot,
     CloseFocused,
     CycleFocus,
     ToggleMaximize,
@@ -135,6 +136,20 @@ fn handle_keyboard<B: InputBackend>(state: &mut NeonState, event: B::KeyboardKey
             // Emergency / nested exit
             if modifiers.ctrl && modifiers.alt && sym == Keysym::from(keysyms::KEY_Escape) {
                 return FilterResult::Intercept(CompositorAction::Quit);
+            }
+
+            // Native screenshot shortcuts: Print key, Super+Shift+S, or macOS Super+Shift+3
+            if sym == Keysym::from(keysyms::KEY_Print) {
+                return FilterResult::Intercept(CompositorAction::TakeScreenshot);
+            }
+            if modifiers.logo
+                && modifiers.shift
+                && (sym == Keysym::from(keysyms::KEY_s)
+                    || sym == Keysym::from(keysyms::KEY_S)
+                    || sym == Keysym::from(keysyms::KEY_3)
+                    || sym == Keysym::from(keysyms::KEY_numbersign))
+            {
+                return FilterResult::Intercept(CompositorAction::TakeScreenshot);
             }
 
             // Standard Linux terminal shortcut: Ctrl+Alt+T
@@ -264,6 +279,9 @@ fn handle_keyboard<B: InputBackend>(state: &mut NeonState, event: B::KeyboardKey
             }
             CompositorAction::LockSession => {
                 state.lock_session();
+            }
+            CompositorAction::TakeScreenshot => {
+                state.request_screenshot(None);
             }
             CompositorAction::CloseFocused => state.close_focused_window(),
             CompositorAction::CycleFocus => state.cycle_focus(serial),

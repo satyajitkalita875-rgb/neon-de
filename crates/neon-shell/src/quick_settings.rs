@@ -313,8 +313,28 @@ impl QuickSettingsPanel {
         notif_card.append(&notif_scroller);
         root.append(&notif_card);
 
-        // --- Footer Quick Actions (Settings + Lock + Close) ---
+        // --- Footer Quick Actions (Screenshot + Settings + Lock) ---
         let footer = GtkBox::new(Orientation::Horizontal, 8);
+        let shot_btn = Button::with_label("Screenshot");
+        shot_btn.add_css_class("neon-pill-button");
+        shot_btn.set_hexpand(true);
+        {
+            let win = window.clone();
+            let overlay = toast_overlay.clone();
+            let ipc = ipc.clone();
+            shot_btn.connect_clicked(move |_| {
+                win.set_visible(false);
+                overlay.set_suppressed(false);
+                let ipc_c = ipc.clone();
+                gtk4::glib::timeout_add_local_once(
+                    std::time::Duration::from_millis(120),
+                    move || {
+                        ipc_c.send(IpcRequest::TakeScreenshot { path: None });
+                    },
+                );
+            });
+        }
+
         let settings_btn = Button::with_label("Settings");
         settings_btn.add_css_class("neon-pill-button");
         settings_btn.set_hexpand(true);
@@ -342,20 +362,9 @@ impl QuickSettingsPanel {
             });
         }
 
-        let close_btn = Button::with_label("Done");
-        close_btn.add_css_class("neon-pill-button");
-        {
-            let win = window.clone();
-            let overlay = toast_overlay.clone();
-            close_btn.connect_clicked(move |_| {
-                win.set_visible(false);
-                overlay.set_suppressed(false);
-            });
-        }
-
+        footer.append(&shot_btn);
         footer.append(&settings_btn);
         footer.append(&lock_btn);
-        footer.append(&close_btn);
         root.append(&footer);
 
         window.set_child(Some(&root));

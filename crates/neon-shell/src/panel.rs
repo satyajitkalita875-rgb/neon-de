@@ -112,6 +112,19 @@ impl TopPanel {
         let right_box = GtkBox::new(Orientation::Horizontal, 2);
         right_box.set_valign(Align::Center);
 
+        let shot_icon = Image::from_icon_name("camera-photo-symbolic");
+        shot_icon.set_pixel_size(15);
+        let shot_btn = Button::new();
+        shot_btn.add_css_class("neon-tray-btn");
+        shot_btn.set_child(Some(&shot_icon));
+        shot_btn.set_tooltip_text(Some("Take Screenshot (Print / Super+Shift+3)"));
+        {
+            let ipc = ipc.clone();
+            shot_btn.connect_clicked(move |_| {
+                ipc.send(IpcRequest::TakeScreenshot { path: None });
+            });
+        }
+
         let net_icon = Image::from_icon_name("network-wireless-signal-excellent-symbolic");
         net_icon.set_pixel_size(15);
         let net_btn = Button::new();
@@ -182,6 +195,7 @@ impl TopPanel {
             cc_btn.connect_clicked(move |_| qs.toggle());
         }
 
+        right_box.append(&shot_btn);
         right_box.append(&net_btn);
         right_box.append(&bt_btn);
         right_box.append(&audio_btn);

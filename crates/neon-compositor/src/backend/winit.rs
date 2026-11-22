@@ -5,7 +5,7 @@ use std::{cell::RefCell, path::PathBuf, rc::Rc, time::Duration};
 
 use anyhow::{Context, Result};
 use neon_ipc::default_socket_path;
-use neon_renderer::{BlurSettings, NeonRenderer};
+use neon_renderer::{BlurSettings, NeonRenderer, screenshot::capture_output_to_png};
 use smithay::{
     backend::{
         renderer::{ImportDma, gles::GlesRenderer},
@@ -364,8 +364,24 @@ fn render_frame(
 
     let (should_submit, render_damage) = {
         let age = backend.buffer_age().unwrap_or(0);
+        let pending_shot = state.pending_screenshot.take();
         match backend.bind() {
             Ok((renderer, mut framebuffer)) => {
+                if let Some(shot_path) = pending_shot {
+                    match capture_output_to_png(
+                        renderer,
+                        neon_renderer,
+                        output,
+                        &state.scene,
+                        blur,
+                        is_locked,
+                        |id| state.managed_windows.get(&id),
+                        &shot_path,
+                    ) {
+                        Ok(()) => state.notify_screenshot_saved(shot_path),
+                        Err(err) => warn!(%err, "Failed to capture winit screenshot"),
+                    }
+                }
                 let result = if is_locked {
                     let lock_surface = state.lock_state.surface_for_output(&output.name());
                     neon_renderer.render_locked(

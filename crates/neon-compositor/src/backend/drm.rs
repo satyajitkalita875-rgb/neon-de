@@ -17,6 +17,7 @@ use anyhow::{Context, Result, bail};
 use neon_ipc::default_socket_path;
 use neon_renderer::{
     BlurSettings, FALLBACK_CLEAR_COLOR, LOCK_CURTAIN_COLOR, NeonRenderElement, NeonRenderer,
+    screenshot::capture_output_to_png,
 };
 use smithay::{
     backend::{
@@ -588,6 +589,26 @@ fn render_all_drm_outputs(rt: &mut DrmRuntime, state: &mut NeonState) {
     let now = state.clock.now();
 
     let crtcs: Vec<crtc::Handle> = rt.outputs.keys().copied().collect();
+    // Fulfill queued native screenshot capture cleanly via offscreen GLES readback.
+    if let Some(shot_path) = state.pending_screenshot.take()
+        && let Some(&primary_crtc) = crtcs.first()
+        && let Some(active) = rt.outputs.get_mut(&primary_crtc)
+    {
+        match capture_output_to_png(
+            &mut rt.renderer,
+            &mut active.neon_renderer,
+            &active.output,
+            &state.scene,
+            blur,
+            is_locked,
+            |id| state.managed_windows.get(&id),
+            &shot_path,
+        ) {
+            Ok(()) => state.notify_screenshot_saved(shot_path),
+            Err(err) => warn!(%err, "Failed to capture DRM screenshot"),
+        }
+    }
+
     for crtc_handle in crtcs {
         let Some(active) = rt.outputs.get_mut(&crtc_handle) else {
             continue;

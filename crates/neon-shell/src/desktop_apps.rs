@@ -49,6 +49,7 @@ impl DesktopApp {
     }
 
     /// Returns true if the application belongs to the requested category (or `"All"`).
+    #[allow(dead_code)]
     pub fn matches_category(&self, category: &str) -> bool {
         if category.eq_ignore_ascii_case("All") {
             return true;

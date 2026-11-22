@@ -454,34 +454,69 @@ window.neon-wallpaper-window {{
     background-color: alpha({accent}, 0.24);
 }}
 
-/* ===================== ACTIVITIES OVERVIEW (GNOME 47) ===================== */
+/* ===================== MACOS LAUNCHPAD & MISSION CONTROL ===================== */
 
-.neon-overview-scrim {{
+.neon-launchpad-scrim {{
     background-color: {scrim_bg};
-    padding: 32px 48px;
+    padding: 20px 44px 16px 44px;
     color: {fg_primary};
 }}
 
-.neon-search-entry {{
+.neon-launchpad-search {{
     background-color: {tile_bg};
     color: {fg_primary};
     border: 1px solid {border_glass};
-    border-radius: 999px;
-    padding: 8px 18px;
-    font-size: 15px;
-    min-width: 440px;
-    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.22);
+    border-radius: 10px;
+    padding: 5px 14px;
+    font-size: 14px;
+    min-width: 280px;
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.22);
 }}
 
-.neon-search-entry:focus-within {{
+.neon-launchpad-search:focus-within {{
     border-color: {accent};
 }}
 
-.neon-section-heading {{
-    color: {fg_muted};
-    font-size: 11px;
-    font-weight: 700;
-    letter-spacing: 1.0px;
+.neon-launchpad-tile {{
+    background-color: transparent;
+    border: none;
+    border-radius: 20px;
+    padding: 12px 10px;
+    min-width: 118px;
+    min-height: 112px;
+    color: {fg_primary};
+    transition: background-color 140ms ease;
+}}
+
+.neon-launchpad-tile:hover {{
+    background-color: {hover_bg};
+}}
+
+.neon-launchpad-label {{
+    color: {fg_primary};
+    font-size: 12px;
+    font-weight: 500;
+    text-shadow: 0 1px 4px rgba(0, 0, 0, 0.55);
+}}
+
+.neon-page-dot {{
+    background-color: {ws_dot_bg};
+    border: none;
+    border-radius: 999px;
+    min-width: 8px;
+    min-height: 8px;
+    padding: 0;
+    transition: background-color 140ms ease, min-width 140ms ease;
+}}
+
+.neon-page-dot:hover {{
+    background-color: {fg_muted};
+}}
+
+.neon-page-dot.active {{
+    background-color: {fg_primary};
+    min-width: 10px;
+    min-height: 10px;
 }}
 
 .neon-workspace-card {{

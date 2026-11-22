@@ -463,6 +463,14 @@ fn handle_ipc_request(
                 payload: IpcPayload::Ack,
             }
         }
+        IpcRequest::TakeScreenshot { path } => {
+            let dest = state.request_screenshot(path.map(std::path::PathBuf::from));
+            IpcResult::Ok {
+                payload: IpcPayload::Screenshot {
+                    path: dest.to_string_lossy().into_owned(),
+                },
+            }
+        }
         IpcRequest::ConfigureOutput {
             name,
             x,

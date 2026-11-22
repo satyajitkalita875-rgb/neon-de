@@ -12,3 +12,4 @@ neon-window-manager.workspace = true
 smithay.workspace = true
 tracing.workspace = true
 xcursor = "0.3"
+png = "0.18"

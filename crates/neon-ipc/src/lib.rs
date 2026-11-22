@@ -268,6 +268,9 @@ pub enum IpcRequest {
         open: bool,
     },
     LockSession,
+    TakeScreenshot {
+        path: Option<String>,
+    },
     ConfigureOutput {
         name: String,
         x: Option<i32>,
@@ -347,6 +350,7 @@ pub enum IpcPayload {
     Effects { effects: EffectsInfo },
     Appearance { appearance: AppearanceInfo },
     WindowBehavior { behavior: WindowBehaviorInfo },
+    Screenshot { path: String },
 }
 
 /// Asynchronous state-change events pushed to subscribed clients.
