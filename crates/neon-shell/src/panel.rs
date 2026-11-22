@@ -45,7 +45,6 @@ impl TopPanel {
             .application(app)
             .title("NEON DE Top Bar")
             .decorated(false)
-            .resizable(false)
             .default_height(30)
             .build();
         window.add_css_class("neon-panel-window");
@@ -62,6 +61,7 @@ impl TopPanel {
         }
 
         let bar = CenterBox::new();
+        bar.set_hexpand(true);
         bar.add_css_class("neon-top-panel");
 
         // Left: NEON brand / Activities button + GNOME 47 workspace dots + focused app name
@@ -201,9 +201,9 @@ impl TopPanel {
         right_box.append(&audio_btn);
         right_box.append(&power_btn);
         right_box.append(&cc_btn);
+        right_box.append(&clock_btn);
 
         bar.set_start_widget(Some(&left_box));
-        bar.set_center_widget(Some(&clock_btn));
         bar.set_end_widget(Some(&right_box));
 
         window.set_child(Some(&bar));

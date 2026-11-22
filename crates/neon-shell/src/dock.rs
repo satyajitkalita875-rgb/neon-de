@@ -3,13 +3,17 @@
 use std::rc::Rc;
 
 use gtk4::{
-    Align, Application, ApplicationWindow, Box as GtkBox, Button, Image, Orientation, Separator,
+    Align, Application, ApplicationWindow, Box as GtkBox, Button, Orientation, Separator,
     prelude::*,
 };
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 use neon_ipc::{DesktopSnapshot, IpcRequest};
 
-use crate::{desktop_apps::DesktopApp, ipc_bridge::IpcCommandSender, panel::launch_sibling_binary};
+use crate::{
+    desktop_apps::{DesktopApp, load_app_icon},
+    ipc_bridge::IpcCommandSender,
+    panel::launch_sibling_binary,
+};
 
 /// Floating glass dock displaying icon-only pinned apps, running window icons with glowing
 /// macOS/GNOME indicator dots, Settings, and the Applications Grid trigger.
@@ -153,8 +157,7 @@ fn make_icon_dock_button(icon_name: &str, tooltip: &str, running: bool, focused:
     vbox.set_halign(Align::Center);
     vbox.set_valign(Align::Center);
 
-    let icon = Image::from_icon_name(icon_name);
-    icon.set_pixel_size(38);
+    let icon = load_app_icon(Some(icon_name), tooltip, 42);
     vbox.append(&icon);
 
     let dot = GtkBox::new(Orientation::Horizontal, 0);

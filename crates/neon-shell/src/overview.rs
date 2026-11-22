@@ -9,13 +9,16 @@ use std::{cell::RefCell, rc::Rc};
 
 use gtk4::{
     Align, Application, ApplicationWindow, Box as GtkBox, Button, EventControllerKey, FlowBox,
-    GestureClick, Grid, Image, Label, Orientation, SearchEntry, SelectionMode, Stack,
-    StackTransitionType, gdk, glib, prelude::*,
+    GestureClick, Grid, Label, Orientation, SearchEntry, SelectionMode, Stack, StackTransitionType,
+    gdk, glib, prelude::*,
 };
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 use neon_ipc::{DesktopSnapshot, IpcRequest};
 
-use crate::{desktop_apps::DesktopApp, ipc_bridge::IpcCommandSender};
+use crate::{
+    desktop_apps::{DesktopApp, load_app_icon},
+    ipc_bridge::IpcCommandSender,
+};
 
 const LAUNCHPAD_COLS: usize = 7;
 const LAUNCHPAD_ROWS: usize = 5;
@@ -342,9 +345,7 @@ impl Overview {
             vbox.set_halign(Align::Center);
             vbox.set_valign(Align::Center);
 
-            let icon_name = app.icon.as_deref().unwrap_or("application-x-executable");
-            let icon = Image::from_icon_name(icon_name);
-            icon.set_pixel_size(64);
+            let icon = load_app_icon(app.icon.as_deref(), &app.name, 68);
             vbox.append(&icon);
 
             let name_lbl = Label::new(Some(&app.name));
@@ -537,8 +538,7 @@ fn rebuild_launchpad_page(
         vbox.set_halign(Align::Center);
         vbox.set_valign(Align::Center);
 
-        let icon = Image::from_icon_name(app.icon.as_deref().unwrap_or("application-x-executable"));
-        icon.set_pixel_size(64);
+        let icon = load_app_icon(app.icon.as_deref(), &app.name, 68);
         vbox.append(&icon);
 
         let lbl = Label::new(Some(&app.name));

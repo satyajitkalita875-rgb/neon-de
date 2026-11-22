@@ -139,7 +139,7 @@ pub fn build_shell_css(appearance: &AppearanceInfo) -> String {
                 "rgba(255, 255, 255, 0.09)"
             },
             "rgba(255, 255, 255, 0.11)",
-            "rgba(10, 12, 20, 0.82)",
+            "rgba(12, 15, 24, 0.88)",
             if high_contrast { "#FFFFFF" } else { "#F1F5F9" },
             if high_contrast { "#E2E8F0" } else { "#94A3B8" },
             if high_contrast {
@@ -187,10 +187,12 @@ window.neon-wallpaper-window {{
     font-size: 13px;
 }}
 
-.neon-brand-button {{
+button.neon-brand-button {{
+    background-image: none;
     background-color: transparent;
     color: {fg_primary};
     border: none;
+    box-shadow: none;
     border-radius: 7px;
     padding: 2px 9px;
     min-height: 22px;
@@ -199,8 +201,8 @@ window.neon-wallpaper-window {{
     transition: background-color 140ms ease;
 }}
 
-.neon-brand-button:hover,
-.neon-brand-button.active {{
+button.neon-brand-button:hover,
+button.neon-brand-button.active {{
     background-color: {hover_bg};
 }}
 
@@ -212,9 +214,11 @@ window.neon-wallpaper-window {{
 }}
 
 /* GNOME 47 style dynamic workspace dots / active pill */
-.neon-ws-dot {{
+button.neon-ws-dot {{
+    background-image: none;
     background-color: {ws_dot_bg};
     border: none;
+    box-shadow: none;
     border-radius: 999px;
     min-width: 7px;
     min-height: 7px;
@@ -223,23 +227,25 @@ window.neon-wallpaper-window {{
     transition: all 160ms ease;
 }}
 
-.neon-ws-dot:hover {{
+button.neon-ws-dot:hover {{
     background-color: {fg_primary};
     min-width: 12px;
 }}
 
-.neon-ws-dot.occupied {{
+button.neon-ws-dot.occupied {{
     background-color: {fg_muted};
 }}
 
-.neon-ws-dot.active {{
+button.neon-ws-dot.active {{
     background-color: {fg_primary};
     min-width: 22px;
 }}
 
-.neon-clock-btn {{
+button.neon-clock-btn {{
+    background-image: none;
     background-color: transparent;
     border: none;
+    box-shadow: none;
     border-radius: 7px;
     padding: 2px 10px;
     min-height: 22px;
@@ -250,13 +256,15 @@ window.neon-wallpaper-window {{
     transition: background-color 140ms ease;
 }}
 
-.neon-clock-btn:hover {{
+button.neon-clock-btn:hover {{
     background-color: {hover_bg};
 }}
 
-.neon-tray-btn {{
+button.neon-tray-btn {{
+    background-image: none;
     background-color: transparent;
     border: none;
+    box-shadow: none;
     border-radius: 7px;
     padding: 2px 7px;
     min-height: 22px;
@@ -266,11 +274,11 @@ window.neon-wallpaper-window {{
     transition: background-color 140ms ease;
 }}
 
-.neon-tray-btn:hover {{
+button.neon-tray-btn:hover {{
     background-color: {hover_bg};
 }}
 
-.neon-tray-btn.active {{
+button.neon-tray-btn.active {{
     background-color: alpha({accent}, 0.26);
     color: {accent};
 }}
@@ -293,23 +301,25 @@ window.neon-wallpaper-window {{
     box-shadow: 0 18px 44px rgba(0, 0, 0, 0.46), inset 0 1px 0 rgba(255, 255, 255, 0.14);
 }}
 
-.neon-dock-item {{
+button.neon-dock-item {{
+    background-image: none;
     background-color: transparent;
     border: none;
+    box-shadow: none;
     border-radius: 14px;
     padding: 4px 6px 2px 6px;
     min-width: 48px;
-    min-height: 50px;
+    min-height: 52px;
     color: {fg_primary};
     transition: background-color 150ms ease, margin 150ms ease;
 }}
 
-.neon-dock-item:hover {{
+button.neon-dock-item:hover {{
     background-color: {hover_bg};
 }}
 
-.neon-dock-item.focused {{
-    background-color: alpha({accent}, 0.18);
+button.neon-dock-item.focused {{
+    background-color: transparent;
 }}
 
 .neon-dock-dot {{
@@ -493,31 +503,36 @@ window.neon-wallpaper-window {{
     border-color: {accent};
 }}
 
-.neon-launchpad-tile {{
+button.neon-launchpad-tile {{
+    background-image: none;
     background-color: transparent;
     border: none;
+    box-shadow: none;
+    outline: none;
     border-radius: 20px;
-    padding: 12px 10px;
+    padding: 10px 10px;
     min-width: 118px;
-    min-height: 112px;
+    min-height: 108px;
     color: {fg_primary};
     transition: background-color 140ms ease;
 }}
 
-.neon-launchpad-tile:hover {{
-    background-color: {hover_bg};
+button.neon-launchpad-tile:hover {{
+    background-color: rgba(255, 255, 255, 0.10);
 }}
 
 .neon-launchpad-label {{
     color: {fg_primary};
     font-size: 12px;
     font-weight: 500;
-    text-shadow: 0 1px 4px rgba(0, 0, 0, 0.55);
+    text-shadow: 0 1px 4px rgba(0, 0, 0, 0.65);
 }}
 
-.neon-page-dot {{
+button.neon-page-dot {{
+    background-image: none;
     background-color: {ws_dot_bg};
     border: none;
+    box-shadow: none;
     border-radius: 999px;
     min-width: 8px;
     min-height: 8px;
@@ -525,11 +540,11 @@ window.neon-wallpaper-window {{
     transition: background-color 140ms ease, min-width 140ms ease;
 }}
 
-.neon-page-dot:hover {{
+button.neon-page-dot:hover {{
     background-color: {fg_muted};
 }}
 
-.neon-page-dot.active {{
+button.neon-page-dot.active {{
     background-color: {fg_primary};
     min-width: 10px;
     min-height: 10px;

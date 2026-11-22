@@ -7,6 +7,7 @@ use std::{
     process::Command,
 };
 
+use gtk4::{IconTheme, Image, gdk::Display};
 use tracing::{info, warn};
 
 /// Normalized metadata for an installed desktop application parsed from an XDG `.desktop` file.
@@ -92,6 +93,107 @@ impl DesktopApp {
 pub fn discover_applications() -> Vec<DesktopApp> {
     let dirs = xdg_application_dirs();
     discover_in_dirs(&dirs)
+}
+
+/// Loads an application icon cleanly for Dock or Launchpad with zero missing-icon symbols:
+/// 1. Supports direct filesystem paths (`/snap/...`, `/opt/...`, `/usr/share/pixmaps/...`)
+/// 2. Checks the active GTK4 IconTheme (`WhiteSur-dark` / `WhiteSur-light`) with smart Snap/Flatpak/name normalization
+/// 3. Falls back cleanly to a valid WhiteSur generic app icon (`application-x-executable`).
+pub fn load_app_icon(icon_spec: Option<&str>, app_name: &str, pixel_size: i32) -> Image {
+    let icon_theme = Display::default().map(|d| IconTheme::for_display(&d));
+
+    if let Some(raw) = icon_spec.map(str::trim).filter(|s| !s.is_empty()) {
+        // 1. Absolute filesystem path (e.g. Snap / DaVinci Resolve / AppImage / pixmaps)
+        let as_path = Path::new(raw);
+        if as_path.is_absolute() && as_path.exists() {
+            let img = Image::from_file(as_path);
+            img.set_pixel_size(pixel_size);
+            return img;
+        }
+
+        // 2. Direct lookup in active icon theme
+        if let Some(ref theme) = icon_theme {
+            if theme.has_icon(raw) {
+                let img = Image::from_icon_name(raw);
+                img.set_pixel_size(pixel_size);
+                return img;
+            }
+
+            // Try stripped stem (e.g. `foo.png` -> `foo`, `firefox_firefox` -> `firefox`, `org.foo.Bar` -> `bar`)
+            let stem = Path::new(raw)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or(raw);
+            let mut candidates: Vec<String> = vec![stem.to_string(), stem.to_lowercase()];
+            if let Some((prefix, _)) = stem.split_once('_') {
+                candidates.push(prefix.to_lowercase());
+            }
+            if let Some((_, suffix)) = stem.rsplit_once('.') {
+                candidates.push(suffix.to_lowercase());
+            }
+            for cand in candidates {
+                if !cand.is_empty() && theme.has_icon(&cand) {
+                    let img = Image::from_icon_name(&cand);
+                    img.set_pixel_size(pixel_size);
+                    return img;
+                }
+            }
+        }
+
+        // 3. Check /usr/share/pixmaps fallback
+        for ext in ["", ".png", ".svg", ".xpm"] {
+            let pix = PathBuf::from(format!("/usr/share/pixmaps/{raw}{ext}"));
+            if pix.exists() {
+                let img = Image::from_file(pix);
+                img.set_pixel_size(pixel_size);
+                return img;
+            }
+        }
+    }
+
+    // 4. Smart lookup by normalized application name against WhiteSur icon theme
+    if let Some(ref theme) = icon_theme {
+        let lower = app_name.to_lowercase();
+        let slug = lower
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .collect::<String>()
+            .trim_matches('-')
+            .to_string();
+        let first_word = lower.split_whitespace().next().unwrap_or("").to_string();
+
+        let mut name_candidates = vec![slug.clone(), first_word];
+        if lower.contains("firefox") {
+            name_candidates.push("firefox".into());
+        } else if lower.contains("davinci") || lower.contains("resolve") {
+            name_candidates.push("davinci-resolve".into());
+            name_candidates.push("applications-multimedia".into());
+        } else if lower.contains("app center") || lower.contains("software") {
+            name_candidates.push("system-software-install".into());
+        } else if lower.contains("firmware") {
+            name_candidates.push("system-software-update".into());
+        } else if lower.contains("instagram") {
+            name_candidates.push("instagram".into());
+            name_candidates.push("web-browser".into());
+        } else if lower.contains("settings") {
+            name_candidates.push("preferences-system".into());
+        } else if lower.contains("terminal") {
+            name_candidates.push("utilities-terminal".into());
+        }
+
+        for cand in name_candidates {
+            if !cand.is_empty() && theme.has_icon(&cand) {
+                let img = Image::from_icon_name(&cand);
+                img.set_pixel_size(pixel_size);
+                return img;
+            }
+        }
+    }
+
+    // 5. Guaranteed valid WhiteSur fallback icon (never shows red missing-icon glyph)
+    let fallback = Image::from_icon_name("application-x-executable");
+    fallback.set_pixel_size(pixel_size);
+    fallback
 }
 
 /// Scans the given directories in precedence order (earlier directories override later ones).
