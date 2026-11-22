@@ -21,10 +21,11 @@ use smithay::{
         },
         gles::{GlesError, GlesRenderer, GlesTarget, Uniform, element::PixelShaderElement},
     },
-    desktop::Window,
+    desktop::{Window, layer_map_for_output},
     output::Output,
     render_elements,
     utils::{Logical, Physical, Point, Rectangle, Scale, Size},
+    wayland::shell::wlr_layer::Layer as WlrLayer,
 };
 use tracing::{info, warn};
 
@@ -126,10 +127,56 @@ impl NeonRenderer {
         let scale = Scale::from(scale_f);
         let nodes = scene.collect_front_to_back();
 
-        let mut elements: Vec<NeonRenderElement> = Vec::with_capacity(nodes.len() * 3);
+        let mut elements: Vec<NeonRenderElement> = Vec::with_capacity(nodes.len() * 3 + 8);
         let mut seen_windows: HashSet<WindowId> = HashSet::new();
 
+        // Collect zwlr_layer_shell_v1 surfaces on this output split into upper (Overlay/Top)
+        // and lower (Bottom/Background) strata so they composite in exact protocol Z-order.
+        let (upper_layers, lower_layers) = {
+            let layer_map = layer_map_for_output(output);
+            let mut upper = Vec::new();
+            let mut lower = Vec::new();
+            for wlr_layer in [WlrLayer::Overlay, WlrLayer::Top] {
+                for layer in layer_map.layers_on(wlr_layer).rev() {
+                    if let Some(geo) = layer_map.layer_geometry(layer) {
+                        upper.push((layer.clone(), geo.loc));
+                    }
+                }
+            }
+            for wlr_layer in [WlrLayer::Bottom, WlrLayer::Background] {
+                for layer in layer_map.layers_on(wlr_layer).rev() {
+                    if let Some(geo) = layer_map.layer_geometry(layer) {
+                        lower.push((layer.clone(), geo.loc));
+                    }
+                }
+            }
+            (upper, lower)
+        };
+
+        // Front-most: Overlay and Top layer surfaces (Overview, Top Panel, Dock).
+        for (layer, loc) in &upper_layers {
+            let phys_loc: Point<i32, Physical> = loc.to_physical_precise_round(scale_f);
+            let layer_elements = AsRenderElements::<GlesRenderer>::render_elements::<
+                WaylandSurfaceRenderElement<GlesRenderer>,
+            >(layer, renderer, phys_loc, scale, 1.0);
+            elements.extend(layer_elements.into_iter().map(NeonRenderElement::from));
+        }
+
+        let mut inserted_lower_layers = false;
         for node in nodes {
+            if !inserted_lower_layers && matches!(node.content, NodeContent::Backdrop { .. }) {
+                // Insert Bottom and Background layer surfaces just above the compositor backdrop.
+                for (layer, loc) in &lower_layers {
+                    let phys_loc: Point<i32, Physical> = loc.to_physical_precise_round(scale_f);
+                    let layer_elements =
+                        AsRenderElements::<GlesRenderer>::render_elements::<
+                            WaylandSurfaceRenderElement<GlesRenderer>,
+                        >(layer, renderer, phys_loc, scale, 1.0);
+                    elements.extend(layer_elements.into_iter().map(NeonRenderElement::from));
+                }
+                inserted_lower_layers = true;
+            }
+
             let eff = node.effective_bounds();
             let eff_rect: Rectangle<i32, Logical> = Rectangle::new(
                 (eff.loc.x, eff.loc.y).into(),

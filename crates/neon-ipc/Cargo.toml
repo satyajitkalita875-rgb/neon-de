@@ -1,0 +1,16 @@
+[package]
+name = "neon-ipc"
+description = "Versioned Unix domain socket IPC protocol and client/server helpers for NEON DE"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+libc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

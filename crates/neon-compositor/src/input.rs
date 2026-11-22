@@ -13,6 +13,7 @@ use smithay::{
     },
     reexports::wayland_protocols::xdg::shell::server::xdg_toplevel,
     utils::{Rectangle, SERIAL_COUNTER},
+    wayland::shell::wlr_layer::{KeyboardInteractivity, Layer as WlrLayer},
 };
 use tracing::info;
 
@@ -28,6 +29,7 @@ const BTN_RIGHT: u32 = 0x111;
 enum CompositorAction {
     Quit,
     SpawnTerminal,
+    ToggleOverview,
     CloseFocused,
     CycleFocus,
     ToggleMaximize,
@@ -121,6 +123,12 @@ fn handle_keyboard<B: InputBackend>(state: &mut NeonState, event: B::KeyboardKey
                     if sym == Keysym::from(keysyms::KEY_Return) {
                         return FilterResult::Intercept(CompositorAction::SpawnTerminal);
                     }
+                    if sym == Keysym::from(keysyms::KEY_space)
+                        || sym == Keysym::from(keysyms::KEY_a)
+                        || sym == Keysym::from(keysyms::KEY_A)
+                    {
+                        return FilterResult::Intercept(CompositorAction::ToggleOverview);
+                    }
                     if sym == Keysym::from(keysyms::KEY_q) || sym == Keysym::from(keysyms::KEY_Q) {
                         return FilterResult::Intercept(CompositorAction::CloseFocused);
                     }
@@ -184,6 +192,9 @@ fn handle_keyboard<B: InputBackend>(state: &mut NeonState, event: B::KeyboardKey
                 state.loop_signal.stop();
             }
             CompositorAction::SpawnTerminal => state.spawn_terminal(),
+            CompositorAction::ToggleOverview => {
+                state.toggle_overview(serial);
+            }
             CompositorAction::CloseFocused => state.close_focused_window(),
             CompositorAction::CycleFocus => state.cycle_focus(serial),
             CompositorAction::ToggleMaximize => state.toggle_maximize_focused(),
@@ -271,7 +282,19 @@ fn handle_pointer_button<B: InputBackend>(state: &mut NeonState, event: B::Point
             .map(|kbd| kbd.modifier_state().alt)
             .unwrap_or(false);
 
-        if let Some((window, mut window_loc)) = state.window_under(pos) {
+        // If clicking an upper layer-shell surface (Panel, Dock, Overview), deliver the click
+        // to the layer surface instead of windows underneath.
+        if let Some((layer_surface, _, interactivity)) =
+            state.layer_surface_under(pos, &[WlrLayer::Overlay, WlrLayer::Top])
+        {
+            if matches!(
+                interactivity,
+                KeyboardInteractivity::OnDemand | KeyboardInteractivity::Exclusive
+            ) && let Some(keyboard) = state.seat.get_keyboard()
+            {
+                keyboard.set_focus(state, Some(layer_surface), serial);
+            }
+        } else if let Some((window, mut window_loc)) = state.window_under(pos) {
             // Click-to-focus & raise
             state.focus_window(Some(&window), serial);
 

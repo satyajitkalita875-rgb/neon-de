@@ -1,5 +1,7 @@
 //! Entrypoint for `neon-compositor` — the NEON DE Wayland compositor.
 
+use std::path::PathBuf;
+
 use anyhow::Result;
 use clap::Parser;
 use neon_compositor::backend::winit::{WinitConfig, run_winit};
@@ -20,6 +22,14 @@ struct Cli {
     /// Optional explicit Wayland socket name (defaults to next free wayland-N socket).
     #[arg(long)]
     socket: Option<String>,
+
+    /// Optional explicit NEON DE IPC socket path.
+    #[arg(long)]
+    ipc_socket: Option<PathBuf>,
+
+    /// Automatically launch `neon-shell` alongside the compositor.
+    #[arg(long, default_value_t = false)]
+    shell: bool,
 
     /// Disable compositor animations (accessibility reduced-motion mode).
     #[arg(long, default_value_t = false)]
@@ -53,6 +63,8 @@ fn main() -> Result<()> {
         width: cli.width,
         height: cli.height,
         socket_name: cli.socket,
+        ipc_socket: cli.ipc_socket,
+        spawn_shell: cli.shell,
         startup_command: cli.command,
         startup_args: cli.command_args,
         reduced_motion: cli.reduced_motion,

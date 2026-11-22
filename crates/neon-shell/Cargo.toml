@@ -1,0 +1,23 @@
+[package]
+name = "neon-shell"
+description = "NEON DE custom GTK4 Wayland desktop shell (top panel, dock, overview, application launcher)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "neon-shell"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+gtk4.workspace = true
+gtk4-layer-shell.workspace = true
+neon-ipc.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

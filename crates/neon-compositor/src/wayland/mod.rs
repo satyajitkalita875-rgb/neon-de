@@ -1,18 +1,20 @@
 //! Smithay Wayland protocol handler implementations for **NEON DE**.
 
 mod compositor;
+mod layer_shell;
 mod seat;
 mod xdg_shell;
 
 use smithay::{
-    delegate_compositor, delegate_data_device, delegate_dmabuf, delegate_output, delegate_seat,
-    delegate_shm, delegate_xdg_shell,
+    delegate_compositor, delegate_data_device, delegate_dmabuf, delegate_layer_shell,
+    delegate_output, delegate_seat, delegate_shm, delegate_xdg_shell,
 };
 
 use crate::state::NeonState;
 
 delegate_compositor!(NeonState);
 delegate_xdg_shell!(NeonState);
+delegate_layer_shell!(NeonState);
 delegate_shm!(NeonState);
 delegate_dmabuf!(NeonState);
 delegate_seat!(NeonState);

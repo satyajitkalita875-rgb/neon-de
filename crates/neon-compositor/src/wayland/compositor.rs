@@ -2,6 +2,7 @@
 
 use smithay::{
     backend::{allocator::dmabuf::Dmabuf, renderer::utils::on_commit_buffer_handler},
+    desktop::{WindowSurfaceType, layer_map_for_output},
     reexports::wayland_server::{
         Client,
         protocol::{wl_buffer::WlBuffer, wl_surface::WlSurface},
@@ -14,7 +15,10 @@ use smithay::{
             with_states,
         },
         dmabuf::{DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier},
-        shell::xdg::{XdgPopupSurfaceData, XdgToplevelSurfaceData},
+        shell::{
+            wlr_layer::{KeyboardInteractivity, LayerSurfaceCachedState, LayerSurfaceData},
+            xdg::{XdgPopupSurfaceData, XdgToplevelSurfaceData},
+        },
         shm::{ShmHandler, ShmState},
     },
 };
@@ -137,6 +141,50 @@ impl CompositorHandler for NeonState {
                     let serial = SERIAL_COUNTER.next_serial();
                     self.focus_window(Some(&window), serial);
                 }
+            }
+        }
+
+        // Handle zwlr_layer_shell_v1 surface commits, initial configure, and exclusive keyboard focus.
+        if let Some(output) = self.primary_output.clone() {
+            let (arranged_changed, exclusive_surface) = {
+                let mut map = layer_map_for_output(&output);
+                if let Some(layer) = map
+                    .layer_for_surface(surface, WindowSurfaceType::TOPLEVEL)
+                    .cloned()
+                {
+                    let initial_configure_sent = with_states(surface, |states| {
+                        states
+                            .data_map
+                            .get::<LayerSurfaceData>()
+                            .map(|d| d.lock().unwrap().initial_configure_sent)
+                            .unwrap_or(true)
+                    });
+                    if !initial_configure_sent {
+                        layer.layer_surface().send_configure();
+                    }
+                    let changed = map.arrange();
+                    let interactivity = with_states(surface, |states| {
+                        states
+                            .cached_state
+                            .get::<LayerSurfaceCachedState>()
+                            .current()
+                            .keyboard_interactivity
+                    });
+                    let exclusive = (interactivity == KeyboardInteractivity::Exclusive)
+                        .then(|| layer.wl_surface().clone());
+                    (changed, exclusive)
+                } else {
+                    (false, None)
+                }
+            };
+
+            if arranged_changed {
+                self.relayout_non_floating_windows();
+            }
+            if let Some(layer_wl) = exclusive_surface
+                && let Some(keyboard) = self.seat.get_keyboard()
+            {
+                keyboard.set_focus(self, Some(layer_wl), SERIAL_COUNTER.next_serial());
             }
         }
 

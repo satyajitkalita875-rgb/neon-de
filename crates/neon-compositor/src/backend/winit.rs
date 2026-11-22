@@ -1,14 +1,17 @@
-//! Nested `winit` + OpenGL ES (`GlesRenderer`) backend driven by `NeonRenderer` and `SceneGraph`.
+//! Nested `winit` + OpenGL ES (`GlesRenderer`) backend driven by `NeonRenderer`, `SceneGraph`,
+//! `zwlr_layer_shell_v1`, and the authenticated NEON DE IPC server.
 
-use std::{cell::RefCell, rc::Rc, time::Duration};
+use std::{cell::RefCell, path::PathBuf, rc::Rc, time::Duration};
 
 use anyhow::{Context, Result};
+use neon_ipc::default_socket_path;
 use neon_renderer::NeonRenderer;
 use smithay::{
     backend::{
         renderer::{ImportDma, gles::GlesRenderer},
         winit::{self, WinitEvent},
     },
+    desktop::layer_map_for_output,
     output::{Mode, Output, PhysicalProperties, Subpixel},
     reexports::{
         calloop::{
@@ -24,7 +27,7 @@ use smithay::{
 };
 use tracing::{error, info, warn};
 
-use crate::{input::process_input_event, state::NeonState};
+use crate::{input::process_input_event, ipc::IpcServer, state::NeonState};
 
 /// Configuration for running the nested `winit` backend.
 #[derive(Debug, Clone)]
@@ -32,6 +35,8 @@ pub struct WinitConfig {
     pub width: u32,
     pub height: u32,
     pub socket_name: Option<String>,
+    pub ipc_socket: Option<PathBuf>,
+    pub spawn_shell: bool,
     pub startup_command: Option<String>,
     pub startup_args: Vec<String>,
     pub reduced_motion: bool,
@@ -52,9 +57,14 @@ pub fn run_winit(config: WinitConfig) -> Result<()> {
         }
     };
     let socket_name = listening_socket.socket_name().to_os_string();
+    let ipc_path = config
+        .ipc_socket
+        .clone()
+        .unwrap_or_else(|| default_socket_path(&socket_name.to_string_lossy()));
 
     info!(
         wayland_display = ?socket_name,
+        ipc_socket = %ipc_path.display(),
         width = config.width,
         height = config.height,
         reduced_motion = config.reduced_motion,
@@ -70,6 +80,11 @@ pub fn run_winit(config: WinitConfig) -> Result<()> {
     );
     state.effects.config.reduced_motion = config.reduced_motion;
     state.effects.config.shadows_enabled = config.shadows_enabled;
+    state.ipc_socket_path = Some(ipc_path.clone());
+
+    let ipc_server = Rc::new(RefCell::new(
+        IpcServer::bind(ipc_path).context("Failed to bind NEON DE IPC socket")?,
+    ));
 
     // Initialize nested winit window + GLES renderer.
     let window_attrs = WinitWindow::default_attributes()
@@ -126,6 +141,26 @@ pub fn run_winit(config: WinitConfig) -> Result<()> {
         );
     }
 
+    // Register incoming IPC socket accepts into calloop.
+    {
+        let ipc_for_accept = Rc::clone(&ipc_server);
+        let fd = ipc_for_accept
+            .borrow()
+            .listener()
+            .try_clone()
+            .context("Failed to clone IPC listener socket")?;
+        event_loop
+            .handle()
+            .insert_source(
+                Generic::new(fd, Interest::READ, TriggerMode::Level),
+                move |_, _, state| {
+                    ipc_for_accept.borrow_mut().poll_requests(state);
+                    Ok(PostAction::Continue)
+                },
+            )
+            .map_err(|err| anyhow::anyhow!("Failed to insert IPC listener source: {err}"))?;
+    }
+
     // Register incoming Wayland client socket connections.
     event_loop
         .handle()
@@ -178,6 +213,7 @@ pub fn run_winit(config: WinitConfig) -> Result<()> {
                         None,
                     );
                     output_for_winit.set_preferred(mode);
+                    layer_map_for_output(&output_for_winit).arrange();
                     state.relayout_non_floating_windows();
                 }
                 WinitEvent::Input(input_event) => {
@@ -203,15 +239,17 @@ pub fn run_winit(config: WinitConfig) -> Result<()> {
             .map_err(|err| anyhow::anyhow!("Failed to insert winit event source: {err}"))?;
     }
 
-    // Frame pacing timer (~60 Hz) synchronized with damage tracking (skips swap on zero-damage idle).
+    // Frame pacing & IPC polling timer (~60 Hz).
     {
         let backend_for_timer = Rc::clone(&backend_cell);
+        let ipc_for_timer = Rc::clone(&ipc_server);
         let output_for_timer = output.clone();
         event_loop
             .handle()
             .insert_source(
                 Timer::from_duration(Duration::from_millis(16)),
                 move |_, _, state| {
+                    ipc_for_timer.borrow_mut().poll_requests(state);
                     let mut guard = backend_for_timer.borrow_mut();
                     let (ref mut backend, ref mut neon_renderer, ref mut presented_once) = *guard;
                     render_frame(
@@ -225,6 +263,11 @@ pub fn run_winit(config: WinitConfig) -> Result<()> {
                 },
             )
             .map_err(|err| anyhow::anyhow!("Failed to insert frame pacing timer: {err}"))?;
+    }
+
+    // Optionally spawn `neon-shell` alongside the compositor.
+    if config.spawn_shell {
+        spawn_sibling_binary(&state, "neon-shell");
     }
 
     // Spawn optional startup command wired strictly to NEON DE's WAYLAND_DISPLAY.
@@ -242,6 +285,7 @@ pub fn run_winit(config: WinitConfig) -> Result<()> {
     event_loop
         .run(None, &mut state, |state| {
             state.cleanup_dead_windows();
+            ipc_server.borrow_mut().poll_requests(state);
             let mut display = display_cell.borrow_mut();
             if let Err(err) = display.dispatch_clients(state) {
                 warn!(?err, "Error dispatching Wayland clients during idle");
@@ -254,6 +298,19 @@ pub fn run_winit(config: WinitConfig) -> Result<()> {
 
     info!("NEON DE nested compositor shut down cleanly");
     Ok(())
+}
+
+fn spawn_sibling_binary(state: &NeonState, binary_name: &str) {
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        let sibling = dir.join(binary_name);
+        if sibling.exists() {
+            state.spawn_client(&sibling.to_string_lossy(), &[]);
+            return;
+        }
+    }
+    state.spawn_client(binary_name, &[]);
 }
 
 fn render_frame(
@@ -309,6 +366,11 @@ fn render_frame(
     let now = state.clock.now();
     for window in state.space.elements() {
         window.send_frame(output, now, Some(Duration::ZERO), |_, _| {
+            Some(output.clone())
+        });
+    }
+    for layer in layer_map_for_output(output).layers() {
+        layer.send_frame(output, now, Some(Duration::ZERO), |_, _| {
             Some(output.clone())
         });
     }

@@ -1026,3 +1026,73 @@ fn scene_graph_and_animations_sync_with_window_and_workspace_events() {
     }
     client_handle.join().unwrap();
 }
+
+#[test]
+fn ipc_server_state_overview_workspace_and_effects_roundtrip() {
+    use neon_compositor::ipc::IpcServer;
+    use neon_ipc::{IpcClient, IpcPayload, IpcRequest, IpcResult};
+
+    let (_event_loop, _display, mut state) = create_headless_server();
+    let dir = tempfile::tempdir().unwrap();
+    let ipc_path = dir.path().join("neon-ipc-test.sock");
+    let mut ipc_server = IpcServer::bind(ipc_path.clone()).unwrap();
+
+    let client_done = Arc::new(AtomicBool::new(false));
+    let client_done_clone = Arc::clone(&client_done);
+
+    let client_thread = thread::spawn(move || {
+        let mut client = IpcClient::connect(&ipc_path).unwrap();
+
+        let state_res = client.request(IpcRequest::GetState).unwrap();
+        let IpcResult::Ok {
+            payload: IpcPayload::State { snapshot },
+        } = state_res
+        else {
+            panic!("Expected State payload");
+        };
+        assert!(!snapshot.overview_open);
+        assert_eq!(snapshot.workspaces.len(), 1);
+        assert_eq!(snapshot.outputs.len(), 1);
+
+        let ov_res = client.request(IpcRequest::ToggleOverview).unwrap();
+        assert_eq!(
+            ov_res,
+            IpcResult::Ok {
+                payload: IpcPayload::Overview { open: true }
+            }
+        );
+
+        let fx_res = client
+            .request(IpcRequest::UpdateEffects {
+                enabled: None,
+                reduced_motion: Some(true),
+                shadows_enabled: Some(false),
+                borders_enabled: None,
+                corner_radius: Some(16.0),
+                speed_scale: None,
+            })
+            .unwrap();
+        let IpcResult::Ok {
+            payload: IpcPayload::Effects { effects },
+        } = fx_res
+        else {
+            panic!("Expected Effects payload");
+        };
+        assert!(effects.reduced_motion);
+        assert!(!effects.shadows_enabled);
+        assert!((effects.corner_radius - 16.0).abs() < 1e-4);
+
+        client_done_clone.store(true, Ordering::SeqCst);
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !client_done.load(Ordering::SeqCst) && Instant::now() < deadline {
+        ipc_server.poll_requests(&mut state);
+        thread::sleep(Duration::from_millis(5));
+    }
+    client_thread.join().unwrap();
+
+    assert!(state.overview_open);
+    assert!(state.effects.config.reduced_motion);
+    assert!(!state.effects.config.shadows_enabled);
+}

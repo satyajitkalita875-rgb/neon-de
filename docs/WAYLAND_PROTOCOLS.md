@@ -13,16 +13,16 @@
 | `wl_output` + `zxdg_output_manager_v1` | Smithay `OutputManagerState` | Implemented | Logical output mode, geometry, scale |
 | `wl_data_device_manager` | Smithay `DataDeviceState` | Implemented | Clipboard selection & drag-and-drop scaffolding |
 | `xdg_wm_base` (`xdg_surface`, `xdg_toplevel`, `xdg_popup`) | Smithay `XdgShellState` | Implemented | Floating toplevel windows, popups, interactive move/resize, maximize/fullscreen/minimize/tiled state negotiation |
+| `zwlr_layer_shell_v1` | Smithay `WlrLayerShellState` | Implemented | Desktop panels, dock, Activities Overview overlay, exclusive-zone work-area reservation, keyboard interactivity (`None` / `OnDemand` / `Exclusive`) |
 | `zwp_linux_dmabuf_v1` | Smithay `DmabufState` | Implemented | Zero-copy GPU buffer import (advertised dynamically when EGL renderer exposes DMA-BUF formats) |
 
-## Planned Protocols (Milestones 4–7)
+## Planned Protocols (Milestones 5–7)
 
 | Protocol | Target Milestone | Purpose |
 |---|---|---|
 | `wp_presentation` | M5 | Frame presentation feedback & timing |
 | `wp_viewporter` | M5 | Surface cropping and scaling |
 | `wp_fractional_scale_v1` | M5 | Fractional HiDPI scaling |
-| `zwlr_layer_shell_v1` | M4 | Desktop panels, dock, overlays, wallpapers |
 | `zxdg_decoration_manager_v1` | M2 / M3 | Server-side / client-side decoration negotiation |
 | `ext_session_lock_v1` | M5 | Secure lock screen integration |
 | `zwp_pointer_gestures_v1` | M5 | Touchpad swipe & pinch gestures |

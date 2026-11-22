@@ -22,7 +22,10 @@ sudo apt-get install -y \
   libdrm-dev \
   libegl-dev \
   libgles-dev \
-  libpixman-1-dev
+  libpixman-1-dev \
+  libgtk-4-dev \
+  libgtk4-layer-shell-dev \
+  libadwaita-1-dev
 ```
 
 ## 2. Building NEON DE

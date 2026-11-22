@@ -2,7 +2,7 @@
 
 **NEON DE** is an independent, next-generation Linux desktop environment built in **Rust** with **Smithay** and **Wayland**.
 
-> **Project Status**: **Milestone 3 (Rendering Engine & Effects)** — Custom Smithay `0.7.0` Wayland compositor with 6 modular workspace crates (`neon-compositor`, `neon-window-manager`, `neon-workspaces`, `neon-scene`, `neon-effects`, `neon-renderer`): floating-first window management, GNOME-inspired dynamic workspaces, retained Z-layered scene graph, frame-driven interruptible animation engine, custom GLES shaders (analytical soft drop shadows, rounded NEON focus rings, obsidian ambient backdrop), damage tracking, and `zwp_linux_dmabuf_v1` zero-copy GPU buffers. Desktop shell, IPC, settings app, and DRM/KMS bare-metal session follow in Milestones 4–8.
+> **Project Status**: **Milestone 4 (Desktop Shell & IPC)** — Custom Smithay `0.7.0` Wayland compositor + independent GTK4 Desktop Shell across 8 modular crates (`neon-compositor`, `neon-shell`, `neon-ipc`, `neon-renderer`, `neon-scene`, `neon-effects`, `neon-window-manager`, `neon-workspaces`): floating-first window management, GNOME-inspired dynamic workspaces, retained scene graph, custom GLES shaders, `zwlr_layer_shell_v1`, `zwp_linux_dmabuf_v1`, authenticated Unix socket IPC (`SO_PEERCRED`), Top Panel, Floating Dock, Activities Overview, Workspace Previews, and XDG Application Grid. Settings app, advanced effects, DRM/KMS multi-monitor, and system integration follow in Milestones 5–8.
 
 ## Vision
 

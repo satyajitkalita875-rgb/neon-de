@@ -10,10 +10,10 @@ NEON DE enforces:
 2. **Protocol Validation & Robustness**: Malformed client requests or unexpected disconnects must terminate only the offending client connection (via Wayland protocol errors) and never panic or crash `neon-compositor`.
 3. **Minimal Surface Exposure**: Never advertise a Wayland protocol global unless its handler is implemented and verified.
 4. **Development Isolation**: Nested development runs inside an isolated `WAYLAND_DISPLAY` socket created in `$XDG_RUNTIME_DIR` and never modifies the host desktop session or login manager.
+5. **Authenticated IPC (Implemented & Tested — Milestone 4)**: The NEON DE IPC socket resides in a `0700` runtime directory with `0600` socket permissions, enforces same-UID peer credentials via Linux `SO_PEERCRED`, bounds frame sizes to 256 KiB, and exposes strictly typed desktop actions with zero arbitrary shell execution.
 
-## 2. Planned Security Controls (Milestones 4–7)
+## 2. Planned Security Controls (Milestones 5–7)
 
-- **IPC Authentication (M4)**: `SO_PEERCRED` UID verification and `0600` Unix socket permissions; strictly typed commands with zero arbitrary shell execution.
 - **Session Lock (M5)**: `ext_session_lock_v1` preventing input or frame leakage to regular clients while locked.
 - **Privilege Escalation (M7)**: Delegated strictly to `polkit`.
 - **Screen Capture & Sharing (M7)**: Mediated exclusively via XDG Desktop Portal user consent dialogs.

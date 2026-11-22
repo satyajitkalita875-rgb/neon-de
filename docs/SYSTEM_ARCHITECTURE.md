@@ -33,7 +33,7 @@ NEON SESSION (planned — Milestone 8)
 └── Linux System Services (PipeWire, NetworkManager, UPower, BlueZ, polkit, portals)
 ```
 
-## 3. Current Workspace Crate Structure (Milestone 3)
+## 3. Current Workspace Crate Structure (Milestone 4)
 
 ```text
 crates/
@@ -41,23 +41,10 @@ crates/
 ├── neon-window-manager/      # WindowMode state machine, placement, snapping, focus policy, window rules
 ├── neon-effects/             # Time-based interruptible animations (Bézier, spring, focus/open/workspace slide)
 ├── neon-scene/               # Retained Z-layered scene graph (Background..Cursor, shadows, borders, dirty regions)
-├── neon-renderer/            # Modular GLES/Glow pipeline, compiled SDF shadow/border/backdrop shaders, cached elements
-└── neon-compositor/          # Custom Smithay 0.7.0 Wayland compositor binary & library (+ zwp_linux_dmabuf_v1)
-    └── src/
-        ├── lib.rs            # Public library surface for binaries and integration tests
-        ├── main.rs           # CLI parsing (--reduced-motion, --no-shadows, etc.), tracing setup
-        ├── state.rs          # NeonState: Wayland globals, Space, WindowManager, SceneGraph, EffectsManager
-        ├── window.rs         # Bridge helpers between neon-window-manager & Smithay Window/Logical types
-        ├── wayland/
-        │   ├── mod.rs        # Smithay handler trait implementations & delegate_* macros
-        │   ├── compositor.rs # wl_compositor, wl_subcompositor, BufferHandler, ShmHandler, DmabufHandler
-        │   ├── xdg_shell.rs  # xdg_wm_base, xdg_surface, xdg_toplevel, xdg_popup, rules, state transitions
-        │   └── seat.rs       # wl_seat, wl_data_device, SelectionHandler, OutputHandler
-        ├── input.rs          # Keyboard/pointer dispatch, workspace & snap shortcuts, focus policies
-        ├── grabs.rs          # Interactive window move and resize pointer grabs
-        └── backend/
-            ├── mod.rs        # Backend selection
-            └── winit.rs      # Nested winit + NeonRenderer backend, DMA-BUF import hook, zero-damage idle skip
+├── neon-renderer/            # Modular GLES/Glow pipeline, SDF shadow/border/backdrop shaders, layer-shell Z-strata
+├── neon-ipc/                 # Versioned Unix domain socket IPC + SO_PEERCRED auth + typed snapshots/events
+├── neon-compositor/          # Custom Smithay 0.7.0 Wayland compositor (+ zwlr_layer_shell_v1, zwp_linux_dmabuf_v1, IPC server)
+└── neon-shell/               # Custom Rust + GTK4 + gtk4-layer-shell Desktop Shell (Top Panel, Dock, Overview, XDG App Grid)
 ```
 
 ## 4. Key Architectural Decisions & Trade-offs

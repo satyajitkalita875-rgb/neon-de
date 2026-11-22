@@ -4,6 +4,7 @@
 use std::{
     collections::{HashMap, HashSet},
     ffi::OsString,
+    path::PathBuf,
     process::Command,
     sync::Arc,
     time::Duration,
@@ -14,7 +15,7 @@ use neon_scene::{BorderStyle, SceneGraph, ShadowStyle};
 use neon_workspaces::{WorkspaceId, WorkspacePolicy};
 use smithay::{
     backend::allocator::{Format, dmabuf::Dmabuf},
-    desktop::{PopupManager, Space, Window, WindowSurfaceType},
+    desktop::{PopupManager, Space, Window, WindowSurfaceType, layer_map_for_output},
     input::{
         Seat, SeatState,
         keyboard::XkbConfig,
@@ -32,11 +33,17 @@ use smithay::{
     },
     utils::{Clock, IsAlive, Logical, Monotonic, Point, Rectangle, SERIAL_COUNTER, Serial, Size},
     wayland::{
-        compositor::{CompositorClientState, CompositorState},
+        compositor::{CompositorClientState, CompositorState, with_states},
         dmabuf::{DmabufGlobal, DmabufState},
         output::OutputManagerState,
         selection::data_device::DataDeviceState,
-        shell::xdg::XdgShellState,
+        shell::{
+            wlr_layer::{
+                KeyboardInteractivity, Layer as WlrLayer, LayerSurfaceCachedState,
+                WlrLayerShellState,
+            },
+            xdg::XdgShellState,
+        },
         shm::ShmState,
     },
 };
@@ -77,6 +84,7 @@ pub struct NeonState {
     // Wayland protocol states
     pub compositor_state: CompositorState,
     pub xdg_shell_state: XdgShellState,
+    pub layer_shell_state: WlrLayerShellState,
     pub shm_state: ShmState,
     pub dmabuf_state: DmabufState,
     pub dmabuf_global: Option<DmabufGlobal>,
@@ -86,7 +94,7 @@ pub struct NeonState {
     pub data_device_state: DataDeviceState,
     pub popups: PopupManager,
 
-    // Desktop, window management, scene graph, and effects
+    // Desktop, window management, scene graph, effects, and shell coordination
     pub space: Space<Window>,
     /// All live managed toplevel windows across all workspaces (including minimized windows).
     pub managed_windows: HashMap<WindowId, Window>,
@@ -96,6 +104,10 @@ pub struct NeonState {
     pub scene: SceneGraph,
     /// Frame-driven interruptible animation engine.
     pub effects: EffectsManager,
+    /// Whether the Activities Overview is currently open (synced with `neon-shell` over IPC).
+    pub overview_open: bool,
+    /// Bound IPC socket path passed to spawned shell/settings clients via `NEON_IPC_SOCKET`.
+    pub ipc_socket_path: Option<PathBuf>,
     pub seat: Seat<Self>,
     pub pointer_location: Point<f64, Logical>,
     pub cursor_status: CursorImageStatus,
@@ -114,6 +126,7 @@ impl NeonState {
 
         let compositor_state = CompositorState::new::<Self>(&display_handle);
         let xdg_shell_state = XdgShellState::new::<Self>(&display_handle);
+        let layer_shell_state = WlrLayerShellState::new::<Self>(&display_handle);
         let shm_state = ShmState::new::<Self>(&display_handle, vec![]);
         let dmabuf_state = DmabufState::new();
         let output_manager_state = OutputManagerState::new_with_xdg_output::<Self>(&display_handle);
@@ -135,6 +148,7 @@ impl NeonState {
             socket_name,
             compositor_state,
             xdg_shell_state,
+            layer_shell_state,
             shm_state,
             dmabuf_state,
             dmabuf_global: None,
@@ -148,6 +162,8 @@ impl NeonState {
             wm: WindowManager::new(WorkspacePolicy::default()),
             scene: SceneGraph::new(),
             effects: EffectsManager::new(EffectsConfig::default()),
+            overview_open: false,
+            ipc_socket_path: None,
             seat,
             pointer_location: (640.0, 400.0).into(),
             cursor_status: CursorImageStatus::default_named(),
@@ -274,23 +290,91 @@ impl NeonState {
             .unwrap_or_else(|| (1280, 800).into())
     }
 
-    /// Returns the active output work area as a `neon-window-manager` rectangle.
+    /// Returns the active output work area excluding `zwlr_layer_shell_v1` exclusive zones
+    /// (such as the top panel and dock).
     pub fn work_area(&self) -> WmRect {
+        if let Some(output) = self.primary_output.as_ref() {
+            let map = layer_map_for_output(output);
+            let zone = map.non_exclusive_zone();
+            if zone.size.w > 0 && zone.size.h > 0 {
+                return to_wm_rect(zone);
+            }
+        }
         to_wm_rect(Rectangle::from_size(self.output_logical_size()))
     }
 
-    /// Resolves the Wayland surface and its logical origin under the given compositor coordinates.
+    /// Checks whether a `zwlr_layer_shell_v1` surface sits under `pos` on one of `layers`.
+    pub fn layer_surface_under(
+        &self,
+        pos: Point<f64, Logical>,
+        layers: &[WlrLayer],
+    ) -> Option<(WlSurface, Point<f64, Logical>, KeyboardInteractivity)> {
+        let output = self.primary_output.as_ref()?;
+        let map = layer_map_for_output(output);
+        for &wlr_layer in layers {
+            if let Some(layer) = map.layer_under(wlr_layer, pos)
+                && let Some(geo) = map.layer_geometry(layer)
+                && let Some((surface, surf_loc)) =
+                    layer.surface_under(pos - geo.loc.to_f64(), WindowSurfaceType::ALL)
+            {
+                let interactivity = with_states(layer.wl_surface(), |states| {
+                    states
+                        .cached_state
+                        .get::<LayerSurfaceCachedState>()
+                        .current()
+                        .keyboard_interactivity
+                });
+                return Some((surface, (geo.loc + surf_loc).to_f64(), interactivity));
+            }
+        }
+        None
+    }
+
+    /// Resolves the Wayland surface and its logical origin under the given compositor coordinates,
+    /// respecting `zwlr_layer_shell_v1` Z-order (`Overlay`/`Top` above windows, `Bottom`/`Background` below).
     pub fn surface_under(
         &self,
         pos: Point<f64, Logical>,
     ) -> Option<(WlSurface, Point<f64, Logical>)> {
-        self.space
+        if let Some((surf, loc, _)) =
+            self.layer_surface_under(pos, &[WlrLayer::Overlay, WlrLayer::Top])
+        {
+            return Some((surf, loc));
+        }
+
+        if let Some(win_hit) = self
+            .space
             .element_under(pos)
             .and_then(|(window, location)| {
                 window
                     .surface_under(pos - location.to_f64(), WindowSurfaceType::ALL)
                     .map(|(surface, surface_loc)| (surface, (location + surface_loc).to_f64()))
             })
+        {
+            return Some(win_hit);
+        }
+
+        self.layer_surface_under(pos, &[WlrLayer::Bottom, WlrLayer::Background])
+            .map(|(surf, loc, _)| (surf, loc))
+    }
+
+    /// Toggles Activities Overview state (synced with `neon-shell` over IPC).
+    pub fn toggle_overview(&mut self, serial: Serial) -> bool {
+        let next = !self.overview_open;
+        self.set_overview_open(next, serial);
+        next
+    }
+
+    /// Explicitly opens or closes Activities Overview.
+    pub fn set_overview_open(&mut self, open: bool, serial: Serial) {
+        if self.overview_open == open {
+            return;
+        }
+        self.overview_open = open;
+        info!(open, "Updated Activities Overview state");
+        if !open {
+            self.focus_topmost_window(serial);
+        }
     }
 
     /// Finds the mapped [`Window`] whose surface tree sits at `pos` on the active workspace.
@@ -713,7 +797,7 @@ impl NeonState {
         }
     }
 
-    /// Spawns a Wayland client process wired strictly to NEON DE's Wayland socket.
+    /// Spawns a Wayland client process wired strictly to NEON DE's Wayland & IPC sockets.
     pub fn spawn_client(&self, program: &str, args: &[String]) {
         let mut cmd = Command::new(program);
         cmd.args(args)
@@ -721,6 +805,10 @@ impl NeonState {
             .env_remove("DISPLAY")
             .env("XDG_SESSION_TYPE", "wayland")
             .env("XDG_CURRENT_DESKTOP", "NEON-DE");
+
+        if let Some(ipc_path) = &self.ipc_socket_path {
+            cmd.env("NEON_IPC_SOCKET", ipc_path);
+        }
 
         match cmd.spawn() {
             Ok(child) => {
