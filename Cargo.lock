@@ -1303,6 +1303,7 @@ dependencies = [
  "anyhow",
  "bitflags 2.13.2",
  "clap",
+ "neon-config",
  "neon-effects",
  "neon-ipc",
  "neon-output",
@@ -1317,6 +1318,16 @@ dependencies = [
  "tracing-subscriber",
  "wayland-client",
  "wayland-protocols",
+]
+
+[[package]]
+name = "neon-config"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "tempfile",
+ "toml",
+ "tracing",
 ]
 
 [[package]]
@@ -1376,6 +1387,19 @@ version = "0.1.0"
 dependencies = [
  "neon-window-manager",
  "tracing",
+]
+
+[[package]]
+name = "neon-settings"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "gtk4",
+ "neon-config",
+ "neon-ipc",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

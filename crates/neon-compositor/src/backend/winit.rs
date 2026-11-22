@@ -82,9 +82,18 @@ pub fn run_winit(config: WinitConfig) -> Result<()> {
         event_loop.get_signal(),
         socket_name.clone(),
     );
-    state.effects.config.reduced_motion = config.reduced_motion;
-    state.effects.config.shadows_enabled = config.shadows_enabled;
-    state.effects.config.blur_enabled = config.blur_enabled;
+    // Load persisted user configuration from XDG config path, then apply CLI overrides.
+    let loaded_cfg = neon_config::load_or_default(&neon_config::default_config_path());
+    state.apply_config(loaded_cfg);
+    if config.reduced_motion {
+        state.effects.config.reduced_motion = true;
+    }
+    if !config.shadows_enabled {
+        state.effects.config.shadows_enabled = false;
+    }
+    if !config.blur_enabled {
+        state.effects.config.blur_enabled = false;
+    }
     state.ipc_socket_path = Some(ipc_path.clone());
 
     let ipc_server = Rc::new(RefCell::new(

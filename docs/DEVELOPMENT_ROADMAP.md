@@ -9,8 +9,8 @@ NEON DE is built in eight verifiable milestones. Every milestone produces a comp
 | **M3 — Rendering Engine** | Retained scene graph (`neon-scene`), modular renderer (`neon-renderer`), damage tracking, rounded corners, shadows, frame-driven animation engine (`neon-effects`), `zwp_linux_dmabuf_v1` | **Completed (Verified)** |
 | **M4 — Desktop Shell** | Typed Unix socket IPC (`neon-ipc`), `zwlr_layer_shell_v1`, GTK4 `neon-shell` (top panel, dock, activities overview, application grid, search, workspace previews) | **Completed (Verified)** |
 | **M5 — Advanced Compositor** | GPU frosted-glass blur & translucency, touchpad gestures (`zwp_pointer_gestures_v1`), multi-monitor (`neon-output`) & hotplugging, fractional scaling (`wp_fractional_scale_v1` + `wp_viewporter`), XWayland (`X11Wm`), `ext_session_lock_v1` + `neon-lockscreen` | **Completed (Verified)** |
-| **M6 — Settings Application** | Versioned XDG config service (`neon-config`), GTK4 macOS-inspired `neon-settings` app with live IPC updates across all categories | **Next** |
-| **M7 — System Integration** | D-Bus integration (`neon-system`): NetworkManager, PipeWire/WirePlumber, BlueZ, UPower, notifications daemon, polkit, XDG Desktop Portals | Planned |
+| **M6 — Settings Application** | Versioned XDG config service (`neon-config`), GTK4 macOS-inspired `neon-settings` app with live IPC updates across Appearance, Displays, Desktop/Windows, Dock/Panels, Effects, Input, Privacy/Accessibility, and System | **Completed (Verified)** |
+| **M7 — System Integration** | D-Bus integration (`neon-system`): NetworkManager, PipeWire/WirePlumber, BlueZ, UPower, notifications daemon, polkit, XDG Desktop Portals | **Next** |
 | **M8 — Production Readiness** | Crash recovery, profiling, accessibility, packaging, session `.desktop` files (`neon-session`), bare-metal QA | Planned |
 
 ## Milestone 1 Acceptance Criteria
@@ -54,3 +54,10 @@ NEON DE is built in eight verifiable milestones. Every milestone produces a comp
 - [x] Implemented `ext_session_lock_v1` with strict focus & render isolation + standalone `crates/neon-lockscreen` binary (`Super + L` / IPC `LockSession`).
 - [x] Implemented XWayland (`XWaylandShellState` + `X11Wm`) for legacy X11 client compatibility.
 - [x] Verified all automated unit, protocol, multi-monitor, IPC, and lock-screen tests plus live nested execution of frosted-glass shaders, XWayland, and `neon-lockscreen`.
+
+## Milestone 6 Acceptance Criteria
+
+- [x] Extracted `crates/neon-config` (versioned TOML schema v1, bounds clamping, corrupt-file backup & safe fallback, schema migration, atomic write-and-rename, export/import).
+- [x] Built `crates/neon-settings` in Rust + GTK4 with macOS-inspired searchable sidebar, Neon Dark & Neon Light themes, grouped cards, and live IPC sync.
+- [x] Wired live `UpdateAppearance` (Neon Dark / Neon Light, accent color, panel/dock transparency, clock/workspace toggles) and `UpdateWindowBehavior` (focus policy, snap gap) across `neon-compositor`, `neon-shell`, and `neon-settings`, plus one-click Settings & Lock buttons in the Top Panel.
+- [x] Verified config unit tests, live IPC appearance/window-behavior tests, and live nested launch of `neon-settings` inside NEON DE.

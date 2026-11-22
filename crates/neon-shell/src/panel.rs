@@ -13,9 +13,10 @@ use crate::ipc_bridge::IpcCommandSender;
 
 /// Live handles to updatable widgets in the NEON DE Top Panel.
 pub struct TopPanel {
-    _window: ApplicationWindow,
+    window: ApplicationWindow,
     activities_btn: Button,
     workspaces_box: GtkBox,
+    clock_label: Label,
     focused_label: Label,
     ipc: IpcCommandSender,
 }
@@ -78,17 +79,26 @@ impl TopPanel {
         focused_label.set_max_width_chars(32);
         focused_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
 
-        let brand_btn = Button::with_label("NEON DE");
-        brand_btn.add_css_class("neon-pill-button");
+        let settings_btn = Button::with_label("Settings");
+        settings_btn.add_css_class("neon-pill-button");
+        settings_btn.set_tooltip_text(Some("Open NEON DE Settings"));
+        settings_btn.connect_clicked(move |_| {
+            launch_sibling("neon-settings");
+        });
+
+        let lock_btn = Button::with_label("Lock");
+        lock_btn.add_css_class("neon-pill-button");
+        lock_btn.set_tooltip_text(Some("Lock Session (Super+L)"));
         {
             let ipc = ipc.clone();
-            brand_btn.connect_clicked(move |_| {
-                ipc.send(IpcRequest::ToggleOverview);
+            lock_btn.connect_clicked(move |_| {
+                ipc.send(IpcRequest::LockSession);
             });
         }
 
         right_box.append(&focused_label);
-        right_box.append(&brand_btn);
+        right_box.append(&settings_btn);
+        right_box.append(&lock_btn);
 
         bar.set_start_widget(Some(&left_box));
         bar.set_center_widget(Some(&clock_label));
@@ -98,15 +108,21 @@ impl TopPanel {
         window.present();
 
         Self {
-            _window: window,
+            window,
             activities_btn,
             workspaces_box,
+            clock_label,
             focused_label,
             ipc,
         }
     }
 
     pub fn update(&self, snapshot: &DesktopSnapshot) {
+        self.window.set_visible(snapshot.appearance.panel_visible);
+        self.clock_label.set_visible(snapshot.appearance.show_clock);
+        self.workspaces_box
+            .set_visible(snapshot.appearance.show_workspaces);
+
         if snapshot.overview_open {
             self.activities_btn.add_css_class("active");
         } else {
@@ -152,4 +168,17 @@ fn format_clock_now() -> String {
         .and_then(|dt| dt.format("%a %b %e  %H:%M"))
         .map(|s| s.to_string())
         .unwrap_or_else(|_| "NEON DE".to_string())
+}
+
+fn launch_sibling(name: &str) {
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        let sibling = dir.join(name);
+        if sibling.exists() {
+            let _ = std::process::Command::new(sibling).spawn();
+            return;
+        }
+    }
+    let _ = std::process::Command::new(name).spawn();
 }

@@ -19,8 +19,8 @@ fi
 
 cd "$REPO_ROOT"
 
-echo "[NEON DE] Building neon-compositor and neon-shell..."
-cargo build -p neon-compositor -p neon-shell
+echo "[NEON DE] Building neon-compositor, neon-shell, neon-lockscreen, and neon-settings..."
+cargo build -p neon-compositor -p neon-shell -p neon-lockscreen -p neon-settings
 
 if [[ -n "$TERMINAL" ]]; then
   echo "[NEON DE] Launching nested NEON DE session (shell + $TERMINAL)"

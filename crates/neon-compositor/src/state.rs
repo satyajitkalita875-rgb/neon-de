@@ -10,6 +10,7 @@ use std::{
     time::Duration,
 };
 
+use neon_config::{FocusMode, NeonConfig};
 use neon_effects::{EffectsConfig, EffectsManager};
 use neon_output::{DisplayMode, OutputConfigPatch, OutputId, OutputManager, OutputTransform};
 use neon_scene::{BorderStyle, SceneGraph, ShadowStyle};
@@ -143,6 +144,8 @@ pub struct NeonState {
     pub scene: SceneGraph,
     /// Frame-driven interruptible animation engine.
     pub effects: EffectsManager,
+    /// Live centralized NEON DE configuration synchronized with `neon-settings`.
+    pub config: NeonConfig,
     /// Active `ext_session_lock_v1` lock state.
     pub lock_state: SessionLockState,
     /// 3-finger touchpad swipe gesture accumulator.
@@ -224,6 +227,7 @@ impl NeonState {
             wm: WindowManager::new(WorkspacePolicy::default()),
             scene: SceneGraph::new(),
             effects: EffectsManager::new(EffectsConfig::default()),
+            config: NeonConfig::default(),
             lock_state: SessionLockState::Unlocked,
             swipe_gesture: SwipeGestureState::default(),
             overview_open: false,
@@ -233,6 +237,29 @@ impl NeonState {
             cursor_status: CursorImageStatus::default_named(),
             primary_output: None,
         }
+    }
+
+    /// Applies a validated [`NeonConfig`] live to compositor effects and window manager state.
+    pub fn apply_config(&mut self, mut cfg: NeonConfig) {
+        cfg.validate_and_clamp();
+        self.effects.config.enabled = cfg.effects.enabled;
+        self.effects.config.reduced_motion = cfg.effects.reduced_motion;
+        self.effects.config.shadows_enabled = cfg.effects.shadows_enabled;
+        self.effects.config.borders_enabled = cfg.effects.borders_enabled;
+        self.effects.config.blur_enabled = cfg.effects.blur_enabled;
+        self.effects.config.blur_strength = cfg.effects.blur_strength;
+        self.effects.config.inactive_opacity = cfg.effects.inactive_opacity;
+        self.effects.config.corner_radius = cfg.effects.corner_radius;
+        self.effects.config.speed_scale = cfg.effects.speed_scale;
+
+        let policy = match cfg.windows.focus_mode {
+            FocusMode::ClickToFocus => crate::window::FocusPolicy::ClickToFocus,
+            FocusMode::FocusFollowsMouse => crate::window::FocusPolicy::FocusFollowsMouse,
+        };
+        self.wm.set_focus_policy(policy);
+        self.wm.set_snap_gap(cfg.windows.snap_gap);
+        self.config = cfg;
+        self.relayout_non_floating_windows();
     }
 
     /// Monotonic compositor timestamp as [`Duration`] for animation sampling.
@@ -313,10 +340,18 @@ impl NeonState {
             };
 
             let border = if fx_cfg.borders_enabled && !fullscreen && !maximized {
-                Some(BorderStyle::for_window(
-                    visual.focus_progress,
-                    fx_cfg.corner_radius,
-                ))
+                let mut style =
+                    BorderStyle::for_window(visual.focus_progress, fx_cfg.corner_radius);
+                if let Some([ar, ag, ab]) = parse_hex_rgb(&self.config.appearance.accent_color) {
+                    let f = visual.focus_progress.clamp(0.0, 1.0);
+                    style.color = [
+                        0.28 * (1.0 - f) + ar * f,
+                        0.32 * (1.0 - f) + ag * f,
+                        0.40 * (1.0 - f) + ab * f,
+                        0.35 * (1.0 - f) + 0.88 * f,
+                    ];
+                }
+                Some(style)
             } else {
                 None
             };
@@ -1101,4 +1136,15 @@ fn to_smithay_transform(t: OutputTransform) -> Transform {
         OutputTransform::Flipped180 => Transform::Flipped180,
         OutputTransform::Flipped270 => Transform::Flipped270,
     }
+}
+
+fn parse_hex_rgb(hex: &str) -> Option<[f32; 3]> {
+    let stripped = hex.strip_prefix('#')?;
+    if stripped.len() != 6 {
+        return None;
+    }
+    let r = u8::from_str_radix(&stripped[0..2], 16).ok()?;
+    let g = u8::from_str_radix(&stripped[2..4], 16).ok()?;
+    let b = u8::from_str_radix(&stripped[4..6], 16).ok()?;
+    Some([r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0])
 }

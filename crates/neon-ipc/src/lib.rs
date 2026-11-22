@@ -176,6 +176,25 @@ pub struct EffectsInfo {
     pub speed_scale: f64,
 }
 
+/// Snapshot of live appearance, dock, and panel shell settings.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AppearanceInfo {
+    pub theme: String,
+    pub accent_color: String,
+    pub dock_transparency: f32,
+    pub panel_transparency: f32,
+    pub panel_visible: bool,
+    pub show_clock: bool,
+    pub show_workspaces: bool,
+}
+
+/// Snapshot of live window manager behavior settings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WindowBehaviorInfo {
+    pub focus_follows_mouse: bool,
+    pub snap_gap: i32,
+}
+
 /// Complete desktop state snapshot consumed by `neon-shell` and `neon-settings`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DesktopSnapshot {
@@ -186,6 +205,8 @@ pub struct DesktopSnapshot {
     pub workspaces: Vec<WorkspaceInfo>,
     pub outputs: Vec<OutputInfo>,
     pub effects: EffectsInfo,
+    pub appearance: AppearanceInfo,
+    pub window_behavior: WindowBehaviorInfo,
 }
 
 /// Typed request envelope sent by IPC clients.
@@ -247,6 +268,19 @@ pub enum IpcRequest {
         corner_radius: Option<f32>,
         speed_scale: Option<f64>,
     },
+    UpdateAppearance {
+        theme: Option<String>,
+        accent_color: Option<String>,
+        dock_transparency: Option<f32>,
+        panel_transparency: Option<f32>,
+        panel_visible: Option<bool>,
+        show_clock: Option<bool>,
+        show_workspaces: Option<bool>,
+    },
+    UpdateWindowBehavior {
+        focus_follows_mouse: Option<bool>,
+        snap_gap: Option<i32>,
+    },
     Subscribe {
         topics: Vec<EventTopic>,
     },
@@ -286,6 +320,8 @@ pub enum IpcPayload {
     Outputs { outputs: Vec<OutputInfo> },
     Overview { open: bool },
     Effects { effects: EffectsInfo },
+    Appearance { appearance: AppearanceInfo },
+    WindowBehavior { behavior: WindowBehaviorInfo },
 }
 
 /// Asynchronous state-change events pushed to subscribed clients.

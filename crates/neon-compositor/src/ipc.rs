@@ -7,10 +7,12 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use neon_config::{FocusMode, ThemeMode};
 use neon_ipc::{
-    DesktopSnapshot, EffectsInfo, EventTopic, IpcEvent, IpcPayload, IpcRequest, IpcRequestEnvelope,
-    IpcResult, IpcServerMessage, MAX_FRAME_BYTES, OutputInfo, PROTOCOL_VERSION, WindowInfo,
-    WorkspaceInfo, bind_ipc_listener, encode_frame, verify_peer_credentials,
+    AppearanceInfo, DesktopSnapshot, EffectsInfo, EventTopic, IpcEvent, IpcPayload, IpcRequest,
+    IpcRequestEnvelope, IpcResult, IpcServerMessage, MAX_FRAME_BYTES, OutputInfo, PROTOCOL_VERSION,
+    WindowBehaviorInfo, WindowInfo, WorkspaceInfo, bind_ipc_listener, encode_frame,
+    verify_peer_credentials,
 };
 use neon_output::{OutputConfigPatch, OutputTransform};
 use neon_window_manager::{WindowId, geometry::Point as WmPoint};
@@ -533,6 +535,75 @@ fn handle_ipc_request(
                 },
             }
         }
+        IpcRequest::UpdateAppearance {
+            theme,
+            accent_color,
+            dock_transparency,
+            panel_transparency,
+            panel_visible,
+            show_clock,
+            show_workspaces,
+        } => {
+            if let Some(t) = theme {
+                state.config.appearance.theme = match t.as_str() {
+                    "neon_light" | "light" => ThemeMode::NeonLight,
+                    "auto" => ThemeMode::Auto,
+                    _ => ThemeMode::NeonDark,
+                };
+            }
+            if let Some(hex) = accent_color {
+                state.config.appearance.accent_color = hex;
+            }
+            if let Some(v) = dock_transparency {
+                state.config.dock.transparency = v;
+            }
+            if let Some(v) = panel_transparency {
+                state.config.panel.transparency = v;
+            }
+            if let Some(v) = panel_visible {
+                state.config.panel.visible = v;
+            }
+            if let Some(v) = show_clock {
+                state.config.panel.show_clock = v;
+            }
+            if let Some(v) = show_workspaces {
+                state.config.panel.show_workspaces = v;
+            }
+            state.config.validate_and_clamp();
+            IpcResult::Ok {
+                payload: IpcPayload::Appearance {
+                    appearance: build_appearance(state),
+                },
+            }
+        }
+        IpcRequest::UpdateWindowBehavior {
+            focus_follows_mouse,
+            snap_gap,
+        } => {
+            if let Some(ffm) = focus_follows_mouse {
+                state.config.windows.focus_mode = if ffm {
+                    FocusMode::FocusFollowsMouse
+                } else {
+                    FocusMode::ClickToFocus
+                };
+                state.wm.set_focus_policy(if ffm {
+                    crate::window::FocusPolicy::FocusFollowsMouse
+                } else {
+                    crate::window::FocusPolicy::ClickToFocus
+                });
+            }
+            if let Some(gap) = snap_gap {
+                let clamped = gap.clamp(0, 48);
+                state.config.windows.snap_gap = clamped;
+                state.wm.set_snap_gap(clamped);
+                state.relayout_non_floating_windows();
+            }
+            IpcResult::Ok {
+                payload: IpcPayload::WindowBehavior {
+                    behavior: build_window_behavior(state),
+                },
+            }
+        }
         IpcRequest::Subscribe { topics } => {
             for topic in topics {
                 subscriptions.insert(topic);
@@ -555,6 +626,8 @@ pub fn build_snapshot(state: &NeonState) -> DesktopSnapshot {
         workspaces: build_workspaces(state),
         outputs: build_outputs(state),
         effects: build_effects(state),
+        appearance: build_appearance(state),
+        window_behavior: build_window_behavior(state),
     }
 }
 
@@ -633,5 +706,29 @@ fn build_effects(state: &NeonState) -> EffectsInfo {
         inactive_opacity: cfg.inactive_opacity,
         corner_radius: cfg.corner_radius,
         speed_scale: cfg.speed_scale,
+    }
+}
+
+fn build_appearance(state: &NeonState) -> AppearanceInfo {
+    let theme = match state.config.appearance.theme {
+        ThemeMode::NeonDark => "neon_dark",
+        ThemeMode::NeonLight => "neon_light",
+        ThemeMode::Auto => "auto",
+    };
+    AppearanceInfo {
+        theme: theme.into(),
+        accent_color: state.config.appearance.accent_color.clone(),
+        dock_transparency: state.config.dock.transparency,
+        panel_transparency: state.config.panel.transparency,
+        panel_visible: state.config.panel.visible,
+        show_clock: state.config.panel.show_clock,
+        show_workspaces: state.config.panel.show_workspaces,
+    }
+}
+
+fn build_window_behavior(state: &NeonState) -> WindowBehaviorInfo {
+    WindowBehaviorInfo {
+        focus_follows_mouse: state.config.windows.focus_mode == FocusMode::FocusFollowsMouse,
+        snap_gap: state.config.windows.snap_gap,
     }
 }

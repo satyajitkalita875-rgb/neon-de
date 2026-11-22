@@ -1,0 +1,20 @@
+[package]
+name = "neon-settings"
+description = "NEON DE macOS-inspired GTK4 Settings application with live compositor IPC and XDG config persistence"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "neon-settings"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+gtk4.workspace = true
+neon-config.workspace = true
+neon-ipc.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

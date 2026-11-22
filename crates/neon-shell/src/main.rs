@@ -48,7 +48,7 @@ fn main() {
         .build();
 
     app.connect_activate(move |app| {
-        style::load_css();
+        let mut theme_ctrl = style::ShellThemeController::init();
 
         let apps = discover_applications();
         info!(
@@ -68,6 +68,7 @@ fn main() {
             while let Ok(update) = update_rx.try_recv() {
                 match update {
                     ShellIpcUpdate::Snapshot(snapshot) => {
+                        theme_ctrl.apply_if_changed(&snapshot.appearance);
                         top_panel.update(&snapshot);
                         dock.update(&snapshot);
                         overview.update(&snapshot);

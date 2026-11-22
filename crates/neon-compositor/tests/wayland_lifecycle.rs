@@ -1106,6 +1106,42 @@ fn ipc_server_state_overview_workspace_and_effects_roundtrip() {
         assert_eq!(outputs.len(), 1);
         assert!((outputs[0].scale - 1.5).abs() < 1e-4);
 
+        // Live appearance & window behavior updates (used by neon-settings)
+        let app_res = client
+            .request(IpcRequest::UpdateAppearance {
+                theme: Some("neon_light".into()),
+                accent_color: Some("#A855F7".into()),
+                dock_transparency: Some(0.9),
+                panel_transparency: Some(0.92),
+                panel_visible: Some(true),
+                show_clock: Some(true),
+                show_workspaces: Some(true),
+            })
+            .unwrap();
+        let IpcResult::Ok {
+            payload: IpcPayload::Appearance { appearance },
+        } = app_res
+        else {
+            panic!("Expected Appearance payload");
+        };
+        assert_eq!(appearance.theme, "neon_light");
+        assert_eq!(appearance.accent_color, "#A855F7");
+
+        let wb_res = client
+            .request(IpcRequest::UpdateWindowBehavior {
+                focus_follows_mouse: Some(true),
+                snap_gap: Some(12),
+            })
+            .unwrap();
+        let IpcResult::Ok {
+            payload: IpcPayload::WindowBehavior { behavior },
+        } = wb_res
+        else {
+            panic!("Expected WindowBehavior payload");
+        };
+        assert!(behavior.focus_follows_mouse);
+        assert_eq!(behavior.snap_gap, 12);
+
         client_done_clone.store(true, Ordering::SeqCst);
     });
 
@@ -1325,6 +1361,7 @@ fn ext_session_lock_isolates_focus_and_restores_on_unlock() {
         lock_surf.destroy();
         surf.destroy();
         lock.unlock_and_destroy();
+        let _ = queue.roundtrip(&mut cstate);
         conn.flush().unwrap();
     });
 

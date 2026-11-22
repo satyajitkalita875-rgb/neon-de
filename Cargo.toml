@@ -7,10 +7,12 @@ members = [
     "crates/neon-effects",
     "crates/neon-scene",
     "crates/neon-renderer",
+    "crates/neon-config",
     "crates/neon-ipc",
     "crates/neon-compositor",
     "crates/neon-shell",
     "crates/neon-lockscreen",
+    "crates/neon-settings",
 ]
 
 [workspace.package]
@@ -27,6 +29,7 @@ neon-output = { path = "crates/neon-output" }
 neon-effects = { path = "crates/neon-effects" }
 neon-scene = { path = "crates/neon-scene" }
 neon-renderer = { path = "crates/neon-renderer" }
+neon-config = { path = "crates/neon-config" }
 neon-ipc = { path = "crates/neon-ipc" }
 smithay = { version = "0.7.0", default-features = false, features = [
     "backend_winit",
@@ -40,6 +43,7 @@ gtk4 = { version = "0.11", features = ["v4_12"] }
 gtk4-layer-shell = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+toml = "1"
 libc = "0.2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

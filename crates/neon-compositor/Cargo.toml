@@ -18,6 +18,7 @@ path = "src/main.rs"
 anyhow.workspace = true
 bitflags.workspace = true
 clap.workspace = true
+neon-config.workspace = true
 neon-effects.workspace = true
 neon-ipc.workspace = true
 neon-output.workspace = true
