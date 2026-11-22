@@ -8,4 +8,5 @@ authors.workspace = true
 
 [dependencies]
 neon-workspaces.workspace = true
+serde.workspace = true
 tracing.workspace = true

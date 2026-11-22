@@ -11,6 +11,7 @@ use std::{
 };
 
 use neon_effects::{EffectsConfig, EffectsManager};
+use neon_output::{DisplayMode, OutputConfigPatch, OutputId, OutputManager, OutputTransform};
 use neon_scene::{BorderStyle, SceneGraph, ShadowStyle};
 use neon_workspaces::{WorkspaceId, WorkspacePolicy};
 use smithay::{
@@ -21,7 +22,7 @@ use smithay::{
         keyboard::XkbConfig,
         pointer::{CursorImageStatus, MotionEvent},
     },
-    output::Output,
+    output::{Mode as OutputMode, Output, Scale as OutputScale},
     reexports::{
         calloop::{LoopHandle, LoopSignal},
         wayland_protocols::xdg::shell::server::xdg_toplevel,
@@ -31,12 +32,20 @@ use smithay::{
             protocol::wl_surface::WlSurface,
         },
     },
-    utils::{Clock, IsAlive, Logical, Monotonic, Point, Rectangle, SERIAL_COUNTER, Serial, Size},
+    utils::{
+        Clock, IsAlive, Logical, Monotonic, Point, Rectangle, SERIAL_COUNTER, Serial, Size,
+        Transform,
+    },
     wayland::{
         compositor::{CompositorClientState, CompositorState, with_states},
         dmabuf::{DmabufGlobal, DmabufState},
+        fractional_scale::{FractionalScaleManagerState, with_fractional_scale},
         output::OutputManagerState,
+        pointer_gestures::PointerGesturesState,
+        presentation::PresentationState,
+        seat::WaylandFocus,
         selection::data_device::DataDeviceState,
+        session_lock::SessionLockManagerState,
         shell::{
             wlr_layer::{
                 KeyboardInteractivity, Layer as WlrLayer, LayerSurfaceCachedState,
@@ -45,14 +54,30 @@ use smithay::{
             xdg::XdgShellState,
         },
         shm::ShmState,
+        viewporter::ViewporterState,
+        xwayland_shell::XWaylandShellState,
     },
+    xwayland::X11Wm,
 };
 use tracing::{debug, info, warn};
 
-use crate::window::{
-    SnapRegion, WindowId, WindowLayoutUpdate, WindowManager, WindowMode, WmRect, from_wm_point,
-    from_wm_size, to_wm_point, to_wm_rect, to_wm_size, window_id, window_matches_surface,
+use crate::{
+    wayland::session_lock::SessionLockState,
+    window::{
+        SnapRegion, WindowId, WindowLayoutUpdate, WindowManager, WindowMode, WmRect, from_wm_point,
+        from_wm_size, to_wm_point, to_wm_rect, to_wm_size, window_id, window_matches_surface,
+    },
 };
+
+/// Accumulator for compositor-intercepted 3-finger touchpad swipe gestures.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SwipeGestureState {
+    pub active: bool,
+    pub fingers: u32,
+    pub dx: f64,
+    pub dy: f64,
+    pub triggered: bool,
+}
 
 /// Per-client data attached to every connected Wayland client.
 #[derive(Default, Debug)]
@@ -85,6 +110,12 @@ pub struct NeonState {
     pub compositor_state: CompositorState,
     pub xdg_shell_state: XdgShellState,
     pub layer_shell_state: WlrLayerShellState,
+    pub session_lock_manager_state: SessionLockManagerState,
+    pub fractional_scale_manager_state: FractionalScaleManagerState,
+    pub viewporter_state: ViewporterState,
+    pub pointer_gestures_state: PointerGesturesState,
+    pub presentation_state: PresentationState,
+    pub xwayland_shell_state: XWaylandShellState,
     pub shm_state: ShmState,
     pub dmabuf_state: DmabufState,
     pub dmabuf_global: Option<DmabufGlobal>,
@@ -94,7 +125,15 @@ pub struct NeonState {
     pub data_device_state: DataDeviceState,
     pub popups: PopupManager,
 
-    // Desktop, window management, scene graph, effects, and shell coordination
+    // XWayland state
+    pub xwm: Option<X11Wm>,
+    pub xwayland_display: Option<u32>,
+
+    // Multi-monitor output management
+    pub output_manager: OutputManager,
+    pub output_handles: HashMap<OutputId, Output>,
+
+    // Desktop, window management, scene graph, effects, lock, and shell coordination
     pub space: Space<Window>,
     /// All live managed toplevel windows across all workspaces (including minimized windows).
     pub managed_windows: HashMap<WindowId, Window>,
@@ -104,6 +143,10 @@ pub struct NeonState {
     pub scene: SceneGraph,
     /// Frame-driven interruptible animation engine.
     pub effects: EffectsManager,
+    /// Active `ext_session_lock_v1` lock state.
+    pub lock_state: SessionLockState,
+    /// 3-finger touchpad swipe gesture accumulator.
+    pub swipe_gesture: SwipeGestureState,
     /// Whether the Activities Overview is currently open (synced with `neon-shell` over IPC).
     pub overview_open: bool,
     /// Bound IPC socket path passed to spawned shell/settings clients via `NEON_IPC_SOCKET`.
@@ -127,6 +170,15 @@ impl NeonState {
         let compositor_state = CompositorState::new::<Self>(&display_handle);
         let xdg_shell_state = XdgShellState::new::<Self>(&display_handle);
         let layer_shell_state = WlrLayerShellState::new::<Self>(&display_handle);
+        let session_lock_manager_state =
+            SessionLockManagerState::new::<Self, _>(&display_handle, |_| true);
+        let fractional_scale_manager_state =
+            FractionalScaleManagerState::new::<Self>(&display_handle);
+        let viewporter_state = ViewporterState::new::<Self>(&display_handle);
+        let pointer_gestures_state = PointerGesturesState::new::<Self>(&display_handle);
+        let clock = Clock::<Monotonic>::new();
+        let presentation_state = PresentationState::new::<Self>(&display_handle, clock.id() as u32);
+        let xwayland_shell_state = XWaylandShellState::new::<Self>(&display_handle);
         let shm_state = ShmState::new::<Self>(&display_handle, vec![]);
         let dmabuf_state = DmabufState::new();
         let output_manager_state = OutputManagerState::new_with_xdg_output::<Self>(&display_handle);
@@ -144,11 +196,17 @@ impl NeonState {
             display_handle,
             loop_handle,
             loop_signal,
-            clock: Clock::new(),
+            clock,
             socket_name,
             compositor_state,
             xdg_shell_state,
             layer_shell_state,
+            session_lock_manager_state,
+            fractional_scale_manager_state,
+            viewporter_state,
+            pointer_gestures_state,
+            presentation_state,
+            xwayland_shell_state,
             shm_state,
             dmabuf_state,
             dmabuf_global: None,
@@ -157,11 +215,17 @@ impl NeonState {
             seat_state,
             data_device_state,
             popups: PopupManager::default(),
+            xwm: None,
+            xwayland_display: None,
+            output_manager: OutputManager::new(),
+            output_handles: HashMap::new(),
             space: Space::default(),
             managed_windows: HashMap::new(),
             wm: WindowManager::new(WorkspacePolicy::default()),
             scene: SceneGraph::new(),
             effects: EffectsManager::new(EffectsConfig::default()),
+            lock_state: SessionLockState::Unlocked,
+            swipe_gesture: SwipeGestureState::default(),
             overview_open: false,
             ipc_socket_path: None,
             seat,
@@ -233,6 +297,11 @@ impl NeonState {
             let fullscreen = mode.is_fullscreen();
             let maximized = mode.is_maximized();
             let visual = self.effects.sample_window(id, is_focused, now);
+            let opacity = if is_focused || fullscreen {
+                visual.opacity
+            } else {
+                visual.opacity * fx_cfg.inactive_opacity.clamp(0.4, 1.0)
+            };
 
             let shadow = if fx_cfg.shadows_enabled && !fullscreen && !maximized {
                 Some(ShadowStyle::for_window(
@@ -257,7 +326,7 @@ impl NeonState {
                 bounds,
                 z_idx as i32,
                 true,
-                visual.opacity,
+                opacity,
                 (visual.offset_x, visual.offset_y),
                 is_focused,
                 visual.focus_progress,
@@ -272,12 +341,138 @@ impl NeonState {
         animating
     }
 
-    /// Registers an output into both the Wayland global registry and NEON DE's desktop space.
-    pub fn register_output(&mut self, output: Output, location: Point<i32, Logical>) {
+    /// Returns `true` when the desktop session is locked via `ext_session_lock_v1`.
+    pub fn is_locked(&self) -> bool {
+        self.lock_state.is_locked()
+    }
+
+    /// Launches `neon-lockscreen` to lock the session via `ext_session_lock_v1`.
+    pub fn lock_session(&self) {
+        if self.is_locked() {
+            return;
+        }
+        if let Ok(exe) = std::env::current_exe()
+            && let Some(dir) = exe.parent()
+        {
+            let sibling = dir.join("neon-lockscreen");
+            if sibling.exists() {
+                self.spawn_client(&sibling.to_string_lossy(), &[]);
+                return;
+            }
+        }
+        self.spawn_client("neon-lockscreen", &[]);
+    }
+
+    /// Registers an output into `OutputManager`, the Wayland global registry, and `Space`.
+    pub fn register_output(&mut self, output: Output, location: Point<i32, Logical>) -> OutputId {
+        let mode = output.current_mode().unwrap_or(OutputMode {
+            size: (1280, 800).into(),
+            refresh: 60_000,
+        });
+        let display_mode = DisplayMode {
+            width: mode.size.w,
+            height: mode.size.h,
+            refresh_mhz: mode.refresh,
+        };
+        let scale = output.current_scale().fractional_scale();
+        let props = output.physical_properties();
+        let record = self.output_manager.register_output(
+            output.name(),
+            props.make,
+            props.model,
+            vec![display_mode],
+            display_mode,
+            scale,
+        );
+
+        let effective_loc: Point<i32, Logical> = if location != (0, 0).into() {
+            location
+        } else {
+            from_wm_point(record.position)
+        };
+
         output.create_global::<Self>(&self.display_handle);
-        self.space.map_output(&output, location);
-        if self.primary_output.is_none() {
+        self.space.map_output(&output, effective_loc);
+        self.output_handles.insert(record.id, output.clone());
+        if record.primary || self.primary_output.is_none() {
             self.primary_output = Some(output);
+        }
+        record.id
+    }
+
+    /// Safely handles monitor hotplug disconnection, migrating windows onto a surviving output.
+    pub fn disconnect_output(&mut self, id: OutputId) -> bool {
+        let Some(outcome) = self.output_manager.disconnect_output(id) else {
+            return false;
+        };
+        if let Some(removed_output) = self.output_handles.remove(&id) {
+            self.space.unmap_output(&removed_output);
+        }
+        self.primary_output = outcome
+            .fallback_output
+            .and_then(|fallback_id| self.output_handles.get(&fallback_id).cloned());
+
+        // Clamp/migrate all active windows safely into the surviving work area so none are stranded.
+        let work_area = self.work_area();
+        for wid in self.wm.all_window_ids() {
+            if let Some(rec) = self.wm.get(wid).cloned() {
+                let clamped =
+                    work_area.clamp_origin(rec.current_geometry.loc, rec.current_geometry.size);
+                self.wm.set_floating_location(wid, clamped);
+                if let Some(window) = self.find_window_by_id(wid)
+                    && rec.is_visible_on(self.wm.active_workspace_id())
+                {
+                    self.space
+                        .map_element(window, from_wm_point(clamped), false);
+                }
+            }
+        }
+        self.relayout_non_floating_windows();
+        true
+    }
+
+    /// Applies live display configuration updates (scale, fractional scale, position, rotation, primary).
+    pub fn configure_output_by_name(
+        &mut self,
+        name: &str,
+        patch: &OutputConfigPatch,
+    ) -> Option<neon_output::OutputRecord> {
+        let updated = self.output_manager.configure_by_name(name, patch)?;
+        if let Some(output) = self.output_handles.get(&updated.id).cloned() {
+            let transform = to_smithay_transform(updated.transform);
+            let mode = OutputMode {
+                size: (updated.current_mode.width, updated.current_mode.height).into(),
+                refresh: updated.current_mode.refresh_mhz,
+            };
+            let loc = from_wm_point(updated.position);
+            output.change_current_state(
+                Some(mode),
+                Some(transform),
+                Some(OutputScale::Fractional(updated.scale)),
+                Some(loc),
+            );
+            self.space.map_output(&output, loc);
+            layer_map_for_output(&output).arrange();
+
+            if updated.primary {
+                self.primary_output = Some(output);
+            }
+            self.broadcast_fractional_scale(updated.scale);
+            self.relayout_non_floating_windows();
+        }
+        Some(updated)
+    }
+
+    /// Notifies all live client surfaces of an updated preferred fractional scale factor.
+    pub fn broadcast_fractional_scale(&self, scale: f64) {
+        for window in self.managed_windows.values() {
+            if let Some(surface) = window.wl_surface() {
+                with_states(&surface, |states| {
+                    with_fractional_scale(states, |fs| {
+                        fs.set_preferred_scale(scale);
+                    });
+                });
+            }
         }
     }
 
@@ -524,14 +719,18 @@ impl NeonState {
         serial: Serial,
         raise: bool,
     ) {
+        if self.is_locked() {
+            // Security invariant: never shift focus onto a regular desktop window while locked.
+            return;
+        }
         let prev_focused = self.wm.focused_id();
         let target_id = target.and_then(window_id);
-        let target_surface = target.and_then(|w| w.toplevel().map(|t| t.wl_surface().clone()));
+        let target_surface = target.and_then(|w| w.wl_surface().map(|s| s.into_owned()));
 
         for window in self.managed_windows.values() {
             let is_target = target
-                .and_then(|t| t.toplevel().map(|tl| tl.wl_surface().id()))
-                .zip(window.toplevel().map(|tl| tl.wl_surface().id()))
+                .and_then(|t| t.wl_surface().map(|s| s.id()))
+                .zip(window.wl_surface().map(|s| s.id()))
                 .map(|(a, b)| a == b)
                 .unwrap_or(false);
 
@@ -546,6 +745,8 @@ impl NeonState {
                 if changed && toplevel.is_initial_configure_sent() {
                     toplevel.send_pending_configure();
                 }
+            } else if let Some(x11) = window.x11_surface() {
+                let _ = x11.set_activated(is_target);
             }
         }
 
@@ -809,6 +1010,9 @@ impl NeonState {
         if let Some(ipc_path) = &self.ipc_socket_path {
             cmd.env("NEON_IPC_SOCKET", ipc_path);
         }
+        if let Some(x_display) = self.xwayland_display {
+            cmd.env("DISPLAY", format!(":{x_display}"));
+        }
 
         match cmd.spawn() {
             Ok(child) => {
@@ -883,5 +1087,18 @@ impl NeonState {
         if lost_focus {
             self.focus_topmost_window(SERIAL_COUNTER.next_serial());
         }
+    }
+}
+
+fn to_smithay_transform(t: OutputTransform) -> Transform {
+    match t {
+        OutputTransform::Normal => Transform::Normal,
+        OutputTransform::Rotate90 => Transform::_90,
+        OutputTransform::Rotate180 => Transform::_180,
+        OutputTransform::Rotate270 => Transform::_270,
+        OutputTransform::Flipped => Transform::Flipped,
+        OutputTransform::Flipped90 => Transform::Flipped90,
+        OutputTransform::Flipped180 => Transform::Flipped180,
+        OutputTransform::Flipped270 => Transform::Flipped270,
     }
 }

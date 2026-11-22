@@ -33,18 +33,20 @@ NEON SESSION (planned — Milestone 8)
 └── Linux System Services (PipeWire, NetworkManager, UPower, BlueZ, polkit, portals)
 ```
 
-## 3. Current Workspace Crate Structure (Milestone 4)
+## 3. Current Workspace Crate Structure (Milestone 5)
 
 ```text
 crates/
 ├── neon-workspaces/          # GNOME-inspired dynamic workspace manager (WorkspaceManager, WorkspaceId)
 ├── neon-window-manager/      # WindowMode state machine, placement, snapping, focus policy, window rules
-├── neon-effects/             # Time-based interruptible animations (Bézier, spring, focus/open/workspace slide)
+├── neon-output/              # Multi-monitor discovery, arrangement, fractional scale, rotation, mirroring, hotplug
+├── neon-effects/             # Time-based interruptible animations (Bézier, spring, focus/open/workspace slide, blur config)
 ├── neon-scene/               # Retained Z-layered scene graph (Background..Cursor, shadows, borders, dirty regions)
-├── neon-renderer/            # Modular GLES/Glow pipeline, SDF shadow/border/backdrop shaders, layer-shell Z-strata
+├── neon-renderer/            # Modular GLES/Glow pipeline, SDF shadow/border/backdrop/frosted-glass shaders, lock curtain
 ├── neon-ipc/                 # Versioned Unix domain socket IPC + SO_PEERCRED auth + typed snapshots/events
-├── neon-compositor/          # Custom Smithay 0.7.0 Wayland compositor (+ zwlr_layer_shell_v1, zwp_linux_dmabuf_v1, IPC server)
-└── neon-shell/               # Custom Rust + GTK4 + gtk4-layer-shell Desktop Shell (Top Panel, Dock, Overview, XDG App Grid)
+├── neon-compositor/          # Smithay 0.7.0 compositor (layer-shell, session-lock, fractional-scale, gestures, XWayland, DMA-BUF)
+├── neon-shell/               # Custom Rust + GTK4 + gtk4-layer-shell Desktop Shell (Top Panel, Dock, Overview, XDG App Grid)
+└── neon-lockscreen/          # Standalone ext_session_lock_v1 Wayland lock screen client
 ```
 
 ## 4. Key Architectural Decisions & Trade-offs

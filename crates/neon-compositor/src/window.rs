@@ -10,6 +10,7 @@ use smithay::{
     desktop::Window,
     reexports::wayland_server::{Resource, protocol::wl_surface::WlSurface},
     utils::{Logical, Point, Rectangle, Size},
+    wayland::seat::WaylandFocus,
 };
 
 /// Associates a stable [`WindowId`] with a Smithay [`Window`]'s `UserDataMap`.
@@ -22,11 +23,11 @@ pub fn window_id(window: &Window) -> Option<WindowId> {
     window.user_data().get::<WindowId>().copied()
 }
 
-/// Returns true if a Smithay [`Window`] matches the given `WlSurface` object ID.
+/// Returns true if a Smithay [`Window`] (Wayland or XWayland) matches the given `WlSurface` object ID.
 pub fn window_matches_surface(window: &Window, surface: &WlSurface) -> bool {
     window
-        .toplevel()
-        .map(|toplevel| toplevel.wl_surface().id() == surface.id())
+        .wl_surface()
+        .map(|s| s.id() == surface.id())
         .unwrap_or(false)
 }
 

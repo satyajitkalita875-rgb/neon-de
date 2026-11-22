@@ -1,0 +1,20 @@
+[package]
+name = "neon-lockscreen"
+description = "NEON DE Wayland ext-session-lock-v1 screen locker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "neon-lockscreen"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+tempfile = "3"
+tracing.workspace = true
+tracing-subscriber.workspace = true
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }

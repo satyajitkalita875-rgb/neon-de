@@ -106,12 +106,73 @@ void main() {
 }
 "#;
 
+/// Subtle frosted-glass translucent backdrop shader rendered behind floating windows
+/// when GPU blur/translucency is enabled (analytical 9-tap ambient diffusion + glass highlight).
+pub const FROSTED_GLASS_FRAGMENT_SHADER: &str = r#"
+precision mediump float;
+
+varying vec2 v_coords;
+uniform vec2 size;
+uniform float alpha;
+
+uniform vec2 u_output_size;
+uniform vec2 u_window_origin;
+uniform float u_corner_radius;
+uniform float u_blur_strength;
+uniform float u_opacity;
+uniform vec4 u_primary;
+uniform vec4 u_accent;
+
+float rounded_box_sdf(vec2 p, vec2 half_size, float radius) {
+    vec2 q = abs(p) - half_size + vec2(radius);
+    return min(max(q.x, q.y), 0.0) + length(max(q, 0.0)) - radius;
+}
+
+vec3 sample_ambient(vec2 uv, float aspect) {
+    vec2 d1 = (uv - vec2(0.32, 0.28)) * vec2(aspect, 1.0);
+    float g1 = exp(-dot(d1, d1) * 1.45);
+    vec2 d2 = (uv - vec2(0.78, 0.76)) * vec2(aspect, 1.0);
+    float g2 = exp(-dot(d2, d2) * 1.8) * 0.45;
+    return mix(u_primary.rgb, u_accent.rgb, clamp(g1 * 0.65 + g2, 0.0, 1.0));
+}
+
+void main() {
+    vec2 pos = v_coords * size;
+    vec2 half_size = size * 0.5;
+    float r = min(u_corner_radius, min(half_size.x, half_size.y));
+    float dist = rounded_box_sdf(pos - half_size, half_size, r);
+    float mask = 1.0 - smoothstep(-0.75, 0.75, dist);
+
+    vec2 out_sz = max(u_output_size, vec2(1.0));
+    float aspect = out_sz.x / out_sz.y;
+    vec2 global_uv = (u_window_origin + pos) / out_sz;
+    vec2 step_uv = (vec2(14.0) * clamp(u_blur_strength, 0.2, 2.0)) / out_sz;
+
+    // 9-tap radial Gaussian diffusion over the ambient desktop field
+    vec3 blurred = sample_ambient(global_uv, aspect) * 0.28;
+    blurred += sample_ambient(global_uv + vec2( step_uv.x, 0.0), aspect) * 0.11;
+    blurred += sample_ambient(global_uv + vec2(-step_uv.x, 0.0), aspect) * 0.11;
+    blurred += sample_ambient(global_uv + vec2(0.0,  step_uv.y), aspect) * 0.11;
+    blurred += sample_ambient(global_uv + vec2(0.0, -step_uv.y), aspect) * 0.11;
+    blurred += sample_ambient(global_uv + vec2( step_uv.x,  step_uv.y) * 0.7, aspect) * 0.07;
+    blurred += sample_ambient(global_uv + vec2(-step_uv.x,  step_uv.y) * 0.7, aspect) * 0.07;
+    blurred += sample_ambient(global_uv + vec2( step_uv.x, -step_uv.y) * 0.7, aspect) * 0.07;
+    blurred += sample_ambient(global_uv + vec2(-step_uv.x, -step_uv.y) * 0.7, aspect) * 0.07;
+
+    // Subtle frosted sheen
+    vec3 glass = mix(blurred, vec3(0.14, 0.20, 0.30), 0.16);
+    float a = mask * 0.78 * u_opacity * alpha;
+    gl_FragColor = vec4(glass * a, a);
+}
+"#;
+
 /// Compiled NEON DE custom shader suite cached for the lifetime of a `GlesRenderer`.
 #[derive(Debug, Clone)]
 pub struct NeonShaders {
     pub shadow: GlesPixelProgram,
     pub border: GlesPixelProgram,
     pub backdrop: GlesPixelProgram,
+    pub frosted_glass: GlesPixelProgram,
 }
 
 impl NeonShaders {
@@ -146,10 +207,24 @@ impl NeonShaders {
             ],
         )?;
 
+        let frosted_glass = renderer.compile_custom_pixel_shader(
+            FROSTED_GLASS_FRAGMENT_SHADER,
+            &[
+                UniformName::new("u_output_size", UniformType::_2f),
+                UniformName::new("u_window_origin", UniformType::_2f),
+                UniformName::new("u_corner_radius", UniformType::_1f),
+                UniformName::new("u_blur_strength", UniformType::_1f),
+                UniformName::new("u_opacity", UniformType::_1f),
+                UniformName::new("u_primary", UniformType::_4f),
+                UniformName::new("u_accent", UniformType::_4f),
+            ],
+        )?;
+
         Ok(Self {
             shadow,
             border,
             backdrop,
+            frosted_glass,
         })
     }
 }

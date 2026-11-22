@@ -2,13 +2,18 @@
 
 use smithay::{
     backend::input::{
-        AbsolutePositionEvent, Axis, AxisSource, ButtonState, Event, InputBackend, InputEvent,
-        KeyState, KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent,
+        AbsolutePositionEvent, Axis, AxisSource, ButtonState, Event, GestureBeginEvent,
+        GestureEndEvent, GesturePinchUpdateEvent, GestureSwipeUpdateEvent, InputBackend,
+        InputEvent, KeyState, KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent,
     },
     input::{
         keyboard::{FilterResult, Keysym, keysyms},
         pointer::{
-            AxisFrame, ButtonEvent, Focus, GrabStartData as PointerGrabStartData, MotionEvent,
+            AxisFrame, ButtonEvent, Focus, GestureHoldBeginEvent, GestureHoldEndEvent,
+            GesturePinchBeginEvent, GesturePinchEndEvent,
+            GesturePinchUpdateEvent as PointerGesturePinchUpdateEvent, GestureSwipeBeginEvent,
+            GestureSwipeEndEvent, GestureSwipeUpdateEvent as PointerGestureSwipeUpdateEvent,
+            GrabStartData as PointerGrabStartData, MotionEvent,
         },
     },
     reexports::wayland_protocols::xdg::shell::server::xdg_toplevel,
@@ -30,6 +35,7 @@ enum CompositorAction {
     Quit,
     SpawnTerminal,
     ToggleOverview,
+    LockSession,
     CloseFocused,
     CycleFocus,
     ToggleMaximize,
@@ -54,6 +60,14 @@ pub fn process_input_event<B: InputBackend>(state: &mut NeonState, event: InputE
         }
         InputEvent::PointerButton { event } => handle_pointer_button::<B>(state, event),
         InputEvent::PointerAxis { event } => handle_pointer_axis::<B>(state, event),
+        InputEvent::GestureSwipeBegin { event } => handle_gesture_swipe_begin::<B>(state, event),
+        InputEvent::GestureSwipeUpdate { event } => handle_gesture_swipe_update::<B>(state, event),
+        InputEvent::GestureSwipeEnd { event } => handle_gesture_swipe_end::<B>(state, event),
+        InputEvent::GesturePinchBegin { event } => handle_gesture_pinch_begin::<B>(state, event),
+        InputEvent::GesturePinchUpdate { event } => handle_gesture_pinch_update::<B>(state, event),
+        InputEvent::GesturePinchEnd { event } => handle_gesture_pinch_end::<B>(state, event),
+        InputEvent::GestureHoldBegin { event } => handle_gesture_hold_begin::<B>(state, event),
+        InputEvent::GestureHoldEnd { event } => handle_gesture_hold_end::<B>(state, event),
         _ => {}
     }
 }
@@ -68,6 +82,7 @@ fn handle_keyboard<B: InputBackend>(state: &mut NeonState, event: B::KeyboardKey
         return;
     };
 
+    let is_locked = state.is_locked();
     let action = keyboard.input::<CompositorAction, _>(
         state,
         keycode,
@@ -75,6 +90,11 @@ fn handle_keyboard<B: InputBackend>(state: &mut NeonState, event: B::KeyboardKey
         serial,
         time,
         |_state, modifiers, handle| {
+            // Security invariant: while locked via ext_session_lock_v1, forward all keys strictly
+            // to the lock screen surface and suppress compositor shortcuts.
+            if is_locked {
+                return FilterResult::Forward;
+            }
             if key_state != KeyState::Pressed {
                 return FilterResult::Forward;
             }
@@ -128,6 +148,9 @@ fn handle_keyboard<B: InputBackend>(state: &mut NeonState, event: B::KeyboardKey
                         || sym == Keysym::from(keysyms::KEY_A)
                     {
                         return FilterResult::Intercept(CompositorAction::ToggleOverview);
+                    }
+                    if sym == Keysym::from(keysyms::KEY_l) || sym == Keysym::from(keysyms::KEY_L) {
+                        return FilterResult::Intercept(CompositorAction::LockSession);
                     }
                     if sym == Keysym::from(keysyms::KEY_q) || sym == Keysym::from(keysyms::KEY_Q) {
                         return FilterResult::Intercept(CompositorAction::CloseFocused);
@@ -195,6 +218,9 @@ fn handle_keyboard<B: InputBackend>(state: &mut NeonState, event: B::KeyboardKey
             CompositorAction::ToggleOverview => {
                 state.toggle_overview(serial);
             }
+            CompositorAction::LockSession => {
+                state.lock_session();
+            }
             CompositorAction::CloseFocused => state.close_focused_window(),
             CompositorAction::CycleFocus => state.cycle_focus(serial),
             CompositorAction::ToggleMaximize => state.toggle_maximize_focused(),
@@ -241,10 +267,19 @@ fn handle_pointer_motion_absolute<B: InputBackend>(
     state.pointer_location = pos;
 
     let serial = SERIAL_COUNTER.next_serial();
-    let under = state.surface_under(pos);
+    let under = if state.is_locked() {
+        state
+            .lock_state
+            .primary_surface()
+            .cloned()
+            .map(|s| (s, (0.0, 0.0).into()))
+    } else {
+        state.surface_under(pos)
+    };
 
-    // Optional FocusFollowsMouse policy (ClickToFocus remains default).
-    if state.wm.focus_policy() == FocusPolicy::FocusFollowsMouse
+    // Optional FocusFollowsMouse policy (ClickToFocus remains default; disabled while locked).
+    if !state.is_locked()
+        && state.wm.focus_policy() == FocusPolicy::FocusFollowsMouse
         && let Some((window, _)) = state.window_under(pos)
         && window_id(&window) != state.wm.focused_id()
     {
@@ -274,7 +309,7 @@ fn handle_pointer_button<B: InputBackend>(state: &mut NeonState, event: B::Point
     let button = event.button_code();
     let button_state = event.state();
 
-    if button_state == ButtonState::Pressed && !pointer.is_grabbed() {
+    if !state.is_locked() && button_state == ButtonState::Pressed && !pointer.is_grabbed() {
         let pos = state.pointer_location;
         let alt_held = state
             .seat
@@ -407,5 +442,172 @@ fn handle_pointer_axis<B: InputBackend>(state: &mut NeonState, event: B::Pointer
     if let Some(pointer) = state.seat.get_pointer() {
         pointer.axis(state, frame);
         pointer.frame(state);
+    }
+}
+
+fn handle_gesture_swipe_begin<B: InputBackend>(
+    state: &mut NeonState,
+    event: B::GestureSwipeBeginEvent,
+) {
+    let fingers = event.fingers();
+    if !state.is_locked() && fingers == 3 {
+        state.swipe_gesture = crate::state::SwipeGestureState {
+            active: true,
+            fingers,
+            dx: 0.0,
+            dy: 0.0,
+            triggered: false,
+        };
+        return;
+    }
+
+    if let Some(pointer) = state.seat.get_pointer() {
+        pointer.gesture_swipe_begin(
+            state,
+            &GestureSwipeBeginEvent {
+                serial: SERIAL_COUNTER.next_serial(),
+                time: event.time_msec(),
+                fingers,
+            },
+        );
+    }
+}
+
+fn handle_gesture_swipe_update<B: InputBackend>(
+    state: &mut NeonState,
+    event: B::GestureSwipeUpdateEvent,
+) {
+    if state.swipe_gesture.active {
+        state.swipe_gesture.dx += event.delta_x();
+        state.swipe_gesture.dy += event.delta_y();
+        if !state.swipe_gesture.triggered {
+            let serial = SERIAL_COUNTER.next_serial();
+            if state.swipe_gesture.dx.abs() >= 120.0
+                && state.swipe_gesture.dx.abs() > state.swipe_gesture.dy.abs()
+            {
+                state.swipe_gesture.triggered = true;
+                if state.swipe_gesture.dx > 0.0 {
+                    state.switch_workspace_prev(serial);
+                } else {
+                    state.switch_workspace_next(serial);
+                }
+            } else if state.swipe_gesture.dy <= -90.0 {
+                state.swipe_gesture.triggered = true;
+                state.set_overview_open(true, serial);
+            } else if state.swipe_gesture.dy >= 90.0 {
+                state.swipe_gesture.triggered = true;
+                state.set_overview_open(false, serial);
+            }
+        }
+        return;
+    }
+
+    if let Some(pointer) = state.seat.get_pointer() {
+        pointer.gesture_swipe_update(
+            state,
+            &PointerGestureSwipeUpdateEvent {
+                time: event.time_msec(),
+                delta: event.delta(),
+            },
+        );
+    }
+}
+
+fn handle_gesture_swipe_end<B: InputBackend>(
+    state: &mut NeonState,
+    event: B::GestureSwipeEndEvent,
+) {
+    if state.swipe_gesture.active {
+        state.swipe_gesture = Default::default();
+        return;
+    }
+
+    if let Some(pointer) = state.seat.get_pointer() {
+        pointer.gesture_swipe_end(
+            state,
+            &GestureSwipeEndEvent {
+                serial: SERIAL_COUNTER.next_serial(),
+                time: event.time_msec(),
+                cancelled: event.cancelled(),
+            },
+        );
+    }
+}
+
+fn handle_gesture_pinch_begin<B: InputBackend>(
+    state: &mut NeonState,
+    event: B::GesturePinchBeginEvent,
+) {
+    if let Some(pointer) = state.seat.get_pointer() {
+        pointer.gesture_pinch_begin(
+            state,
+            &GesturePinchBeginEvent {
+                serial: SERIAL_COUNTER.next_serial(),
+                time: event.time_msec(),
+                fingers: event.fingers(),
+            },
+        );
+    }
+}
+
+fn handle_gesture_pinch_update<B: InputBackend>(
+    state: &mut NeonState,
+    event: B::GesturePinchUpdateEvent,
+) {
+    if let Some(pointer) = state.seat.get_pointer() {
+        pointer.gesture_pinch_update(
+            state,
+            &PointerGesturePinchUpdateEvent {
+                time: event.time_msec(),
+                delta: event.delta(),
+                scale: event.scale(),
+                rotation: event.rotation(),
+            },
+        );
+    }
+}
+
+fn handle_gesture_pinch_end<B: InputBackend>(
+    state: &mut NeonState,
+    event: B::GesturePinchEndEvent,
+) {
+    if let Some(pointer) = state.seat.get_pointer() {
+        pointer.gesture_pinch_end(
+            state,
+            &GesturePinchEndEvent {
+                serial: SERIAL_COUNTER.next_serial(),
+                time: event.time_msec(),
+                cancelled: event.cancelled(),
+            },
+        );
+    }
+}
+
+fn handle_gesture_hold_begin<B: InputBackend>(
+    state: &mut NeonState,
+    event: B::GestureHoldBeginEvent,
+) {
+    if let Some(pointer) = state.seat.get_pointer() {
+        pointer.gesture_hold_begin(
+            state,
+            &GestureHoldBeginEvent {
+                serial: SERIAL_COUNTER.next_serial(),
+                time: event.time_msec(),
+                fingers: event.fingers(),
+            },
+        );
+    }
+}
+
+fn handle_gesture_hold_end<B: InputBackend>(state: &mut NeonState, event: B::GestureHoldEndEvent) {
+    if let Some(pointer) = state.seat.get_pointer() {
+        pointer.gesture_hold_end(
+            state,
+            &GestureHoldEndEvent {
+                serial: SERIAL_COUNTER.next_serial(),
+                time: event.time_msec(),
+                cancelled: event.cancelled(),
+            },
+        );
     }
 }

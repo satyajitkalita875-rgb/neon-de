@@ -1068,6 +1068,9 @@ fn ipc_server_state_overview_workspace_and_effects_roundtrip() {
                 reduced_motion: Some(true),
                 shadows_enabled: Some(false),
                 borders_enabled: None,
+                blur_enabled: Some(false),
+                blur_strength: Some(1.5),
+                inactive_opacity: Some(0.9),
                 corner_radius: Some(16.0),
                 speed_scale: None,
             })
@@ -1080,7 +1083,28 @@ fn ipc_server_state_overview_workspace_and_effects_roundtrip() {
         };
         assert!(effects.reduced_motion);
         assert!(!effects.shadows_enabled);
+        assert!(!effects.blur_enabled);
         assert!((effects.corner_radius - 16.0).abs() < 1e-4);
+
+        // Configure fractional scaling via IPC ConfigureOutput
+        let out_res = client
+            .request(IpcRequest::ConfigureOutput {
+                name: "NEON-Test-1".into(),
+                x: None,
+                y: None,
+                scale: Some(1.5),
+                primary: Some(true),
+                transform: Some("normal".into()),
+            })
+            .unwrap();
+        let IpcResult::Ok {
+            payload: IpcPayload::Outputs { outputs },
+        } = out_res
+        else {
+            panic!("Expected Outputs payload");
+        };
+        assert_eq!(outputs.len(), 1);
+        assert!((outputs[0].scale - 1.5).abs() < 1e-4);
 
         client_done_clone.store(true, Ordering::SeqCst);
     });
@@ -1095,4 +1119,241 @@ fn ipc_server_state_overview_workspace_and_effects_roundtrip() {
     assert!(state.overview_open);
     assert!(state.effects.config.reduced_motion);
     assert!(!state.effects.config.shadows_enabled);
+    assert!(!state.effects.config.blur_enabled);
+}
+
+#[test]
+fn multi_monitor_hotplug_disconnect_migrates_safely() {
+    let (_event_loop, _display, mut state) = create_headless_server();
+    let second_output = Output::new(
+        "HDMI-A-1".to_string(),
+        PhysicalProperties {
+            size: (0, 0).into(),
+            subpixel: Subpixel::Unknown,
+            make: "NEON DE".into(),
+            model: "Secondary Monitor".into(),
+        },
+    );
+    let mode = Mode {
+        size: (1920, 1080).into(),
+        refresh: 60_000,
+    };
+    second_output.change_current_state(
+        Some(mode),
+        Some(Transform::Normal),
+        None,
+        Some((1280, 0).into()),
+    );
+    second_output.set_preferred(mode);
+
+    let first_id = state.output_manager.primary_output().unwrap().id;
+    let second_id = state.register_output(second_output, (1280, 0).into());
+    assert_eq!(state.output_manager.all_outputs().len(), 2);
+
+    // Hotplug-disconnect primary monitor -> secondary becomes primary seamlessly
+    assert!(state.disconnect_output(first_id));
+    assert_eq!(state.output_manager.all_outputs().len(), 1);
+    assert_eq!(state.output_manager.primary_output().unwrap().id, second_id);
+    assert_eq!(state.primary_output.as_ref().unwrap().name(), "HDMI-A-1");
+}
+
+#[test]
+fn ext_session_lock_isolates_focus_and_restores_on_unlock() {
+    use wayland_protocols::ext::session_lock::v1::client::{
+        ext_session_lock_manager_v1, ext_session_lock_surface_v1, ext_session_lock_v1,
+    };
+
+    #[derive(Default)]
+    struct LockTestClient {
+        compositor: Option<wl_compositor::WlCompositor>,
+        output: Option<wayland_client::protocol::wl_output::WlOutput>,
+        lock_mgr: Option<ext_session_lock_manager_v1::ExtSessionLockManagerV1>,
+        locked_event: bool,
+        configured_size: (u32, u32),
+    }
+
+    impl Dispatch<wl_registry::WlRegistry, ()> for LockTestClient {
+        fn event(
+            state: &mut Self,
+            reg: &wl_registry::WlRegistry,
+            event: wl_registry::Event,
+            _: &(),
+            _: &Connection,
+            qh: &QueueHandle<Self>,
+        ) {
+            if let wl_registry::Event::Global {
+                name,
+                interface,
+                version,
+            } = event
+            {
+                match interface.as_str() {
+                    "wl_compositor" => {
+                        state.compositor = Some(reg.bind(name, version.min(5), qh, ()))
+                    }
+                    "wl_output" => state.output = Some(reg.bind(name, version.min(4), qh, ())),
+                    "ext_session_lock_manager_v1" => {
+                        state.lock_mgr = Some(reg.bind(name, 1, qh, ()))
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    impl Dispatch<wl_compositor::WlCompositor, ()> for LockTestClient {
+        fn event(
+            _: &mut Self,
+            _: &wl_compositor::WlCompositor,
+            _: wl_compositor::Event,
+            _: &(),
+            _: &Connection,
+            _: &QueueHandle<Self>,
+        ) {
+        }
+    }
+    impl Dispatch<wl_surface::WlSurface, ()> for LockTestClient {
+        fn event(
+            _: &mut Self,
+            _: &wl_surface::WlSurface,
+            _: wl_surface::Event,
+            _: &(),
+            _: &Connection,
+            _: &QueueHandle<Self>,
+        ) {
+        }
+    }
+    impl Dispatch<wayland_client::protocol::wl_output::WlOutput, ()> for LockTestClient {
+        fn event(
+            _: &mut Self,
+            _: &wayland_client::protocol::wl_output::WlOutput,
+            _: wayland_client::protocol::wl_output::Event,
+            _: &(),
+            _: &Connection,
+            _: &QueueHandle<Self>,
+        ) {
+        }
+    }
+    impl Dispatch<ext_session_lock_manager_v1::ExtSessionLockManagerV1, ()> for LockTestClient {
+        fn event(
+            _: &mut Self,
+            _: &ext_session_lock_manager_v1::ExtSessionLockManagerV1,
+            _: ext_session_lock_manager_v1::Event,
+            _: &(),
+            _: &Connection,
+            _: &QueueHandle<Self>,
+        ) {
+        }
+    }
+    impl Dispatch<ext_session_lock_v1::ExtSessionLockV1, ()> for LockTestClient {
+        fn event(
+            state: &mut Self,
+            _: &ext_session_lock_v1::ExtSessionLockV1,
+            event: ext_session_lock_v1::Event,
+            _: &(),
+            _: &Connection,
+            _: &QueueHandle<Self>,
+        ) {
+            if let ext_session_lock_v1::Event::Locked = event {
+                state.locked_event = true;
+            }
+        }
+    }
+    impl Dispatch<ext_session_lock_surface_v1::ExtSessionLockSurfaceV1, ()> for LockTestClient {
+        fn event(
+            state: &mut Self,
+            ls: &ext_session_lock_surface_v1::ExtSessionLockSurfaceV1,
+            event: ext_session_lock_surface_v1::Event,
+            _: &(),
+            _: &Connection,
+            _: &QueueHandle<Self>,
+        ) {
+            if let ext_session_lock_surface_v1::Event::Configure {
+                serial,
+                width,
+                height,
+            } = event
+            {
+                ls.ack_configure(serial);
+                state.configured_size = (width, height);
+            }
+        }
+    }
+
+    let (_event_loop, mut display, mut state) = create_headless_server();
+    let (server_sock, client_sock) = UnixStream::pair().unwrap();
+    state.insert_client(server_sock);
+
+    let locked_flag = Arc::new(AtomicBool::new(false));
+    let locked_flag_clone = Arc::clone(&locked_flag);
+    let allow_unlock = Arc::new(AtomicBool::new(false));
+    let allow_unlock_clone = Arc::clone(&allow_unlock);
+
+    let handle = thread::spawn(move || {
+        let conn = Connection::from_socket(client_sock).unwrap();
+        let mut queue = conn.new_event_queue::<LockTestClient>();
+        let qh = queue.handle();
+        let mut cstate = LockTestClient::default();
+
+        let _reg = conn.display().get_registry(&qh, ());
+        queue.roundtrip(&mut cstate).unwrap();
+
+        let comp = cstate.compositor.clone().unwrap();
+        let output = cstate.output.clone().unwrap();
+        let mgr = cstate
+            .lock_mgr
+            .clone()
+            .expect("ext_session_lock_manager_v1 advertised");
+
+        let lock = mgr.lock(&qh, ());
+        let surf = comp.create_surface(&qh, ());
+        let lock_surf = lock.get_lock_surface(&surf, &output, &qh, ());
+        queue.roundtrip(&mut cstate).unwrap();
+
+        assert!(
+            cstate.locked_event,
+            "client must receive Locked confirmation"
+        );
+        assert_eq!(cstate.configured_size, (1280, 800));
+        locked_flag_clone.store(true, Ordering::SeqCst);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !allow_unlock_clone.load(Ordering::SeqCst) && Instant::now() < deadline {
+            queue.roundtrip(&mut cstate).unwrap();
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        lock_surf.destroy();
+        surf.destroy();
+        lock.unlock_and_destroy();
+        conn.flush().unwrap();
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !locked_flag.load(Ordering::SeqCst) && Instant::now() < deadline {
+        pump_server(&mut display, &mut state);
+        thread::sleep(Duration::from_millis(5));
+    }
+    pump_server(&mut display, &mut state);
+
+    assert!(state.is_locked(), "compositor must report locked state");
+    assert!(
+        state.lock_state.primary_surface().is_some(),
+        "lock surface must be registered"
+    );
+
+    allow_unlock.store(true, Ordering::SeqCst);
+    while !handle.is_finished() && Instant::now() < deadline {
+        pump_server(&mut display, &mut state);
+        thread::sleep(Duration::from_millis(5));
+    }
+    handle.join().unwrap();
+    for _ in 0..5 {
+        pump_server(&mut display, &mut state);
+        thread::sleep(Duration::from_millis(5));
+    }
+
+    assert!(
+        !state.is_locked(),
+        "compositor must return to unlocked state cleanly"
+    );
 }

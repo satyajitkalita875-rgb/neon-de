@@ -8,8 +8,8 @@ NEON DE is built in eight verifiable milestones. Every milestone produces a comp
 | **M2 — Window Management** | Full window state machine, intelligent placement, snapping/optional tiling, maximize/minimize/restore, fullscreen, dynamic workspaces, window rules, crate extraction (`neon-window-manager`, `neon-workspaces`) | **Completed (Verified)** |
 | **M3 — Rendering Engine** | Retained scene graph (`neon-scene`), modular renderer (`neon-renderer`), damage tracking, rounded corners, shadows, frame-driven animation engine (`neon-effects`), `zwp_linux_dmabuf_v1` | **Completed (Verified)** |
 | **M4 — Desktop Shell** | Typed Unix socket IPC (`neon-ipc`), `zwlr_layer_shell_v1`, GTK4 `neon-shell` (top panel, dock, activities overview, application grid, search, workspace previews) | **Completed (Verified)** |
-| **M5 — Advanced Compositor** | GPU blur & translucency, touchpad gestures, DRM/KMS bare-metal multi-monitor backend (`neon-output`), hotplugging, fractional scaling, XWayland, `ext_session_lock_v1` lock screen | **Next** |
-| **M6 — Settings Application** | Versioned XDG config service (`neon-config`), GTK4 macOS-inspired `neon-settings` app with live IPC updates across all categories | Planned |
+| **M5 — Advanced Compositor** | GPU frosted-glass blur & translucency, touchpad gestures (`zwp_pointer_gestures_v1`), multi-monitor (`neon-output`) & hotplugging, fractional scaling (`wp_fractional_scale_v1` + `wp_viewporter`), XWayland (`X11Wm`), `ext_session_lock_v1` + `neon-lockscreen` | **Completed (Verified)** |
+| **M6 — Settings Application** | Versioned XDG config service (`neon-config`), GTK4 macOS-inspired `neon-settings` app with live IPC updates across all categories | **Next** |
 | **M7 — System Integration** | D-Bus integration (`neon-system`): NetworkManager, PipeWire/WirePlumber, BlueZ, UPower, notifications daemon, polkit, XDG Desktop Portals | Planned |
 | **M8 — Production Readiness** | Crash recovery, profiling, accessibility, packaging, session `.desktop` files (`neon-session`), bare-metal QA | Planned |
 
@@ -45,3 +45,12 @@ NEON DE is built in eight verifiable milestones. Every milestone produces a comp
 - [x] Implemented `zwlr_layer_shell_v1` in `neon-compositor` + `neon-renderer` (exclusive zone work-area reservation, upper/lower layer compositing Z-order, `None`/`OnDemand`/`Exclusive` keyboard interactivity).
 - [x] Built `crates/neon-shell` in Rust + GTK4 + `gtk4-layer-shell`: Top Panel (Activities, dynamic workspace pills, live clock, active title), Floating Dock (XDG favorites, running window indicators, app grid trigger), Activities Overview (live search, workspace previews, open window cards, XDG Desktop Entry application grid with categories).
 - [x] Verified full nested NEON DE session running `neon-compositor --shell` + `neon-shell` + real Wayland apps simultaneously, plus automated unit & IPC integration tests.
+
+## Milestone 5 Acceptance Criteria
+
+- [x] Extracted `crates/neon-output` (multi-monitor discovery, horizontal auto-layout, fractional scale + rotation geometry, display mirroring, safe hotplug disconnect with primary fallback & window migration).
+- [x] Added GPU frosted-glass blur & translucency shader (`FROSTED_GLASS_FRAGMENT_SHADER`), live IPC blur/opacity toggles, and `--no-blur` fallback.
+- [x] Implemented `wp_fractional_scale_v1`, `wp_viewporter`, `wp_presentation`, and `zwp_pointer_gestures_v1` (+ 3-finger swipe workspace/overview navigation).
+- [x] Implemented `ext_session_lock_v1` with strict focus & render isolation + standalone `crates/neon-lockscreen` binary (`Super + L` / IPC `LockSession`).
+- [x] Implemented XWayland (`XWaylandShellState` + `X11Wm`) for legacy X11 client compatibility.
+- [x] Verified all automated unit, protocol, multi-monitor, IPC, and lock-screen tests plus live nested execution of frosted-glass shaders, XWayland, and `neon-lockscreen`.

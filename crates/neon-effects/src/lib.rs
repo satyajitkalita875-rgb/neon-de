@@ -251,7 +251,7 @@ struct WindowAnimations {
     last_focus_value: f32,
 }
 
-/// Global effects configuration (supports accessibility reduced motion and speed scaling).
+/// Global effects configuration (supports accessibility reduced motion, blur, and speed scaling).
 #[derive(Debug, Clone, Copy)]
 pub struct EffectsConfig {
     pub enabled: bool,
@@ -259,6 +259,9 @@ pub struct EffectsConfig {
     pub speed_scale: f64,
     pub shadows_enabled: bool,
     pub borders_enabled: bool,
+    pub blur_enabled: bool,
+    pub blur_strength: f32,
+    pub inactive_opacity: f32,
     pub corner_radius: f32,
 }
 
@@ -270,6 +273,9 @@ impl Default for EffectsConfig {
             speed_scale: 1.0,
             shadows_enabled: true,
             borders_enabled: true,
+            blur_enabled: true,
+            blur_strength: 1.0,
+            inactive_opacity: 0.96,
             corner_radius: 12.0,
         }
     }

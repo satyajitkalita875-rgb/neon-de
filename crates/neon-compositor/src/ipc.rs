@@ -12,7 +12,8 @@ use neon_ipc::{
     IpcResult, IpcServerMessage, MAX_FRAME_BYTES, OutputInfo, PROTOCOL_VERSION, WindowInfo,
     WorkspaceInfo, bind_ipc_listener, encode_frame, verify_peer_credentials,
 };
-use neon_window_manager::WindowId;
+use neon_output::{OutputConfigPatch, OutputTransform};
+use neon_window_manager::{WindowId, geometry::Point as WmPoint};
 use smithay::utils::SERIAL_COUNTER;
 use tracing::{debug, info, warn};
 
@@ -439,11 +440,63 @@ fn handle_ipc_request(
                 payload: IpcPayload::Overview { open },
             }
         }
+        IpcRequest::LockSession => {
+            state.lock_session();
+            IpcResult::Ok {
+                payload: IpcPayload::Ack,
+            }
+        }
+        IpcRequest::ConfigureOutput {
+            name,
+            x,
+            y,
+            scale,
+            primary,
+            transform,
+        } => {
+            let parsed_transform =
+                transform
+                    .as_deref()
+                    .and_then(|s| match s.to_lowercase().as_str() {
+                        "normal" => Some(OutputTransform::Normal),
+                        "90" | "rotate90" | "rotate_90" => Some(OutputTransform::Rotate90),
+                        "180" | "rotate180" | "rotate_180" => Some(OutputTransform::Rotate180),
+                        "270" | "rotate270" | "rotate_270" => Some(OutputTransform::Rotate270),
+                        "flipped" => Some(OutputTransform::Flipped),
+                        _ => None,
+                    });
+            let position = match (x, y) {
+                (Some(px), Some(py)) => Some(WmPoint::new(px, py)),
+                _ => None,
+            };
+            let patch = OutputConfigPatch {
+                position,
+                scale,
+                primary,
+                transform: parsed_transform,
+                ..Default::default()
+            };
+            if state.configure_output_by_name(&name, &patch).is_some() {
+                IpcResult::Ok {
+                    payload: IpcPayload::Outputs {
+                        outputs: build_outputs(state),
+                    },
+                }
+            } else {
+                IpcResult::Err {
+                    code: "output_not_found".into(),
+                    message: format!("Output '{name}' not found"),
+                }
+            }
+        }
         IpcRequest::UpdateEffects {
             enabled,
             reduced_motion,
             shadows_enabled,
             borders_enabled,
+            blur_enabled,
+            blur_strength,
+            inactive_opacity,
             corner_radius,
             speed_scale,
         } => {
@@ -458,6 +511,15 @@ fn handle_ipc_request(
             }
             if let Some(v) = borders_enabled {
                 state.effects.config.borders_enabled = v;
+            }
+            if let Some(v) = blur_enabled {
+                state.effects.config.blur_enabled = v;
+            }
+            if let Some(v) = blur_strength {
+                state.effects.config.blur_strength = v.clamp(0.0, 2.0);
+            }
+            if let Some(v) = inactive_opacity {
+                state.effects.config.inactive_opacity = v.clamp(0.4, 1.0);
             }
             if let Some(v) = corner_radius {
                 state.effects.config.corner_radius = v.clamp(0.0, 32.0);
@@ -488,6 +550,7 @@ pub fn build_snapshot(state: &NeonState) -> DesktopSnapshot {
     DesktopSnapshot {
         active_workspace_index: state.wm.workspaces().active_index(),
         overview_open: state.overview_open,
+        locked: state.is_locked(),
         windows: build_windows(state),
         workspaces: build_workspaces(state),
         outputs: build_outputs(state),
@@ -537,18 +600,25 @@ fn build_workspaces(state: &NeonState) -> Vec<WorkspaceInfo> {
 }
 
 fn build_outputs(state: &NeonState) -> Vec<OutputInfo> {
-    let Some(output) = state.primary_output.as_ref() else {
-        return Vec::new();
-    };
-    let size = state.output_logical_size();
-    let refresh_mhz = output.current_mode().map(|m| m.refresh).unwrap_or(60_000);
-    vec![OutputInfo {
-        name: output.name(),
-        width: size.w,
-        height: size.h,
-        scale: output.current_scale().fractional_scale(),
-        refresh_mhz,
-    }]
+    state
+        .output_manager
+        .all_outputs()
+        .into_iter()
+        .map(|o| {
+            let logical = o.logical_size();
+            OutputInfo {
+                name: o.name.clone(),
+                x: o.position.x,
+                y: o.position.y,
+                width: logical.w,
+                height: logical.h,
+                scale: o.scale,
+                refresh_mhz: o.current_mode.refresh_mhz,
+                primary: o.primary,
+                transform: format!("{:?}", o.transform).to_lowercase(),
+            }
+        })
+        .collect()
 }
 
 fn build_effects(state: &NeonState) -> EffectsInfo {
@@ -558,6 +628,9 @@ fn build_effects(state: &NeonState) -> EffectsInfo {
         reduced_motion: cfg.reduced_motion,
         shadows_enabled: cfg.shadows_enabled,
         borders_enabled: cfg.borders_enabled,
+        blur_enabled: cfg.blur_enabled,
+        blur_strength: cfg.blur_strength,
+        inactive_opacity: cfg.inactive_opacity,
         corner_radius: cfg.corner_radius,
         speed_scale: cfg.speed_scale,
     }

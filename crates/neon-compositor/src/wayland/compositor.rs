@@ -15,12 +15,14 @@ use smithay::{
             with_states,
         },
         dmabuf::{DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier},
+        fractional_scale::{FractionalScaleHandler, with_fractional_scale},
         shell::{
             wlr_layer::{KeyboardInteractivity, LayerSurfaceCachedState, LayerSurfaceData},
             xdg::{XdgPopupSurfaceData, XdgToplevelSurfaceData},
         },
         shm::{ShmHandler, ShmState},
     },
+    xwayland::XWaylandClientData,
 };
 use tracing::{debug, trace};
 
@@ -65,16 +67,47 @@ impl DmabufHandler for NeonState {
     }
 }
 
+impl FractionalScaleHandler for NeonState {
+    fn new_fractional_scale(&mut self, surface: WlSurface) {
+        let scale = self
+            .primary_output
+            .as_ref()
+            .map(|o| o.current_scale().fractional_scale())
+            .unwrap_or(1.0);
+        with_states(&surface, |states| {
+            with_fractional_scale(states, |fs| {
+                fs.set_preferred_scale(scale);
+            });
+        });
+    }
+}
+
 impl CompositorHandler for NeonState {
     fn compositor_state(&mut self) -> &mut CompositorState {
         &mut self.compositor_state
     }
 
     fn client_compositor_state<'a>(&self, client: &'a Client) -> &'a CompositorClientState {
-        &client
-            .get_data::<NeonClientData>()
-            .expect("NeonClientData must be attached to every Wayland client")
-            .compositor_state
+        if let Some(data) = client.get_data::<NeonClientData>() {
+            &data.compositor_state
+        } else if let Some(data) = client.get_data::<XWaylandClientData>() {
+            &data.compositor_state
+        } else {
+            panic!("Unknown Wayland client data attached to client")
+        }
+    }
+
+    fn new_surface(&mut self, surface: &WlSurface) {
+        let scale = self
+            .primary_output
+            .as_ref()
+            .map(|o| o.current_scale().fractional_scale())
+            .unwrap_or(1.0);
+        with_states(surface, |states| {
+            with_fractional_scale(states, |fs| {
+                fs.set_preferred_scale(scale);
+            });
+        });
     }
 
     fn commit(&mut self, surface: &WlSurface) {

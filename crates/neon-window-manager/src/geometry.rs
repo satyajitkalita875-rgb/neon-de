@@ -1,7 +1,9 @@
 //! Logical geometry helpers and smart window snapping calculations.
 
+use serde::{Deserialize, Serialize};
+
 /// 2D point in logical desktop coordinates.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Point {
     pub x: i32,
     pub y: i32,
@@ -14,7 +16,7 @@ impl Point {
 }
 
 /// 2D size in logical desktop coordinates.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Size {
     pub w: i32,
     pub h: i32,
@@ -31,7 +33,7 @@ impl Size {
 }
 
 /// Axis-aligned rectangle in logical desktop coordinates.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Rect {
     pub loc: Point,
     pub size: Size,

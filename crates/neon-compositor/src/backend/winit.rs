@@ -5,7 +5,7 @@ use std::{cell::RefCell, path::PathBuf, rc::Rc, time::Duration};
 
 use anyhow::{Context, Result};
 use neon_ipc::default_socket_path;
-use neon_renderer::NeonRenderer;
+use neon_renderer::{BlurSettings, NeonRenderer};
 use smithay::{
     backend::{
         renderer::{ImportDma, gles::GlesRenderer},
@@ -27,7 +27,9 @@ use smithay::{
 };
 use tracing::{error, info, warn};
 
-use crate::{input::process_input_event, ipc::IpcServer, state::NeonState};
+use crate::{
+    input::process_input_event, ipc::IpcServer, state::NeonState, wayland::xwayland::spawn_xwayland,
+};
 
 /// Configuration for running the nested `winit` backend.
 #[derive(Debug, Clone)]
@@ -37,10 +39,12 @@ pub struct WinitConfig {
     pub socket_name: Option<String>,
     pub ipc_socket: Option<PathBuf>,
     pub spawn_shell: bool,
+    pub enable_xwayland: bool,
     pub startup_command: Option<String>,
     pub startup_args: Vec<String>,
     pub reduced_motion: bool,
     pub shadows_enabled: bool,
+    pub blur_enabled: bool,
 }
 
 /// Runs the NEON DE Wayland compositor inside a nested `winit` window on the host desktop.
@@ -80,6 +84,7 @@ pub fn run_winit(config: WinitConfig) -> Result<()> {
     );
     state.effects.config.reduced_motion = config.reduced_motion;
     state.effects.config.shadows_enabled = config.shadows_enabled;
+    state.effects.config.blur_enabled = config.blur_enabled;
     state.ipc_socket_path = Some(ipc_path.clone());
 
     let ipc_server = Rc::new(RefCell::new(
@@ -265,6 +270,11 @@ pub fn run_winit(config: WinitConfig) -> Result<()> {
             .map_err(|err| anyhow::anyhow!("Failed to insert frame pacing timer: {err}"))?;
     }
 
+    // Start XWayland for legacy X11 client compatibility when enabled.
+    if config.enable_xwayland {
+        spawn_xwayland(&mut state);
+    }
+
     // Optionally spawn `neon-shell` alongside the compositor.
     if config.spawn_shell {
         spawn_sibling_binary(&state, "neon-shell");
@@ -320,24 +330,45 @@ fn render_frame(
     output: &Output,
     state: &mut NeonState,
 ) {
-    let _animating = state.sync_scene_graph();
-    let _dirty_regions = state.scene.take_dirty_regions();
+    let is_locked = state.is_locked();
+    if !is_locked {
+        let _animating = state.sync_scene_graph();
+        let _dirty_regions = state.scene.take_dirty_regions();
+    }
 
     let size = backend.window_size();
     let full_damage = Rectangle::from_size(size);
+    let blur = BlurSettings {
+        enabled: state.effects.config.blur_enabled,
+        strength: state.effects.config.blur_strength,
+        corner_radius: state.effects.config.corner_radius,
+    };
 
     let (should_submit, render_damage) = {
         let age = backend.buffer_age().unwrap_or(0);
         match backend.bind() {
             Ok((renderer, mut framebuffer)) => {
-                match neon_renderer.render_scene(
-                    output,
-                    renderer,
-                    &mut framebuffer,
-                    age,
-                    &state.scene,
-                    |id| state.managed_windows.get(&id),
-                ) {
+                let result = if is_locked {
+                    let lock_surface = state.lock_state.surface_for_output(&output.name());
+                    neon_renderer.render_locked(
+                        output,
+                        renderer,
+                        &mut framebuffer,
+                        age,
+                        lock_surface,
+                    )
+                } else {
+                    neon_renderer.render_scene(
+                        output,
+                        renderer,
+                        &mut framebuffer,
+                        age,
+                        &state.scene,
+                        blur,
+                        |id| state.managed_windows.get(&id),
+                    )
+                };
+                match result {
                     Ok(res) => match res.damage {
                         Some(damage) => (true, Some(damage.clone())),
                         None => (!*presented_once, None),
@@ -364,14 +395,16 @@ fn render_frame(
     }
 
     let now = state.clock.now();
-    for window in state.space.elements() {
-        window.send_frame(output, now, Some(Duration::ZERO), |_, _| {
-            Some(output.clone())
-        });
-    }
-    for layer in layer_map_for_output(output).layers() {
-        layer.send_frame(output, now, Some(Duration::ZERO), |_, _| {
-            Some(output.clone())
-        });
+    if !is_locked {
+        for window in state.space.elements() {
+            window.send_frame(output, now, Some(Duration::ZERO), |_, _| {
+                Some(output.clone())
+            });
+        }
+        for layer in layer_map_for_output(output).layers() {
+            layer.send_frame(output, now, Some(Duration::ZERO), |_, _| {
+                Some(output.clone())
+            });
+        }
     }
 }

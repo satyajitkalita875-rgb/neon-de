@@ -152,10 +152,14 @@ pub struct WorkspaceInfo {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OutputInfo {
     pub name: String,
+    pub x: i32,
+    pub y: i32,
     pub width: i32,
     pub height: i32,
     pub scale: f64,
     pub refresh_mhz: i32,
+    pub primary: bool,
+    pub transform: String,
 }
 
 /// Snapshot of live compositor effects settings.
@@ -165,6 +169,9 @@ pub struct EffectsInfo {
     pub reduced_motion: bool,
     pub shadows_enabled: bool,
     pub borders_enabled: bool,
+    pub blur_enabled: bool,
+    pub blur_strength: f32,
+    pub inactive_opacity: f32,
     pub corner_radius: f32,
     pub speed_scale: f64,
 }
@@ -174,6 +181,7 @@ pub struct EffectsInfo {
 pub struct DesktopSnapshot {
     pub active_workspace_index: usize,
     pub overview_open: bool,
+    pub locked: bool,
     pub windows: Vec<WindowInfo>,
     pub workspaces: Vec<WorkspaceInfo>,
     pub outputs: Vec<OutputInfo>,
@@ -219,11 +227,23 @@ pub enum IpcRequest {
     SetOverview {
         open: bool,
     },
+    LockSession,
+    ConfigureOutput {
+        name: String,
+        x: Option<i32>,
+        y: Option<i32>,
+        scale: Option<f64>,
+        primary: Option<bool>,
+        transform: Option<String>,
+    },
     UpdateEffects {
         enabled: Option<bool>,
         reduced_motion: Option<bool>,
         shadows_enabled: Option<bool>,
         borders_enabled: Option<bool>,
+        blur_enabled: Option<bool>,
+        blur_strength: Option<f32>,
+        inactive_opacity: Option<f32>,
         corner_radius: Option<f32>,
         speed_scale: Option<f64>,
     },

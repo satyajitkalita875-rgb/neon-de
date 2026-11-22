@@ -3,12 +3,14 @@ resolver = "2"
 members = [
     "crates/neon-workspaces",
     "crates/neon-window-manager",
+    "crates/neon-output",
     "crates/neon-effects",
     "crates/neon-scene",
     "crates/neon-renderer",
     "crates/neon-ipc",
     "crates/neon-compositor",
     "crates/neon-shell",
+    "crates/neon-lockscreen",
 ]
 
 [workspace.package]
@@ -21,6 +23,7 @@ repository = "https://github.com/neon-de/neon-de"
 [workspace.dependencies]
 neon-workspaces = { path = "crates/neon-workspaces" }
 neon-window-manager = { path = "crates/neon-window-manager" }
+neon-output = { path = "crates/neon-output" }
 neon-effects = { path = "crates/neon-effects" }
 neon-scene = { path = "crates/neon-scene" }
 neon-renderer = { path = "crates/neon-renderer" }
@@ -30,6 +33,7 @@ smithay = { version = "0.7.0", default-features = false, features = [
     "desktop",
     "renderer_glow",
     "wayland_frontend",
+    "xwayland",
     "use_system_lib",
 ] }
 gtk4 = { version = "0.11", features = ["v4_12"] }

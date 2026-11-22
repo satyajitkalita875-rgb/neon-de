@@ -39,6 +39,14 @@ struct Cli {
     #[arg(long, default_value_t = false)]
     no_shadows: bool,
 
+    /// Disable GPU frosted-glass blur / translucency.
+    #[arg(long, default_value_t = false)]
+    no_blur: bool,
+
+    /// Disable XWayland legacy X11 compatibility server.
+    #[arg(long, default_value_t = false)]
+    no_xwayland: bool,
+
     /// Optional Wayland client command to launch automatically inside NEON DE.
     #[arg(short = 'c', long = "command")]
     command: Option<String>,
@@ -65,9 +73,11 @@ fn main() -> Result<()> {
         socket_name: cli.socket,
         ipc_socket: cli.ipc_socket,
         spawn_shell: cli.shell,
+        enable_xwayland: !cli.no_xwayland,
         startup_command: cli.command,
         startup_args: cli.command_args,
         reduced_motion: cli.reduced_motion,
         shadows_enabled: !cli.no_shadows,
+        blur_enabled: !cli.no_blur,
     })
 }

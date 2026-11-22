@@ -2,7 +2,7 @@
 
 **NEON DE** is an independent, next-generation Linux desktop environment built in **Rust** with **Smithay** and **Wayland**.
 
-> **Project Status**: **Milestone 4 (Desktop Shell & IPC)** — Custom Smithay `0.7.0` Wayland compositor + independent GTK4 Desktop Shell across 8 modular crates (`neon-compositor`, `neon-shell`, `neon-ipc`, `neon-renderer`, `neon-scene`, `neon-effects`, `neon-window-manager`, `neon-workspaces`): floating-first window management, GNOME-inspired dynamic workspaces, retained scene graph, custom GLES shaders, `zwlr_layer_shell_v1`, `zwp_linux_dmabuf_v1`, authenticated Unix socket IPC (`SO_PEERCRED`), Top Panel, Floating Dock, Activities Overview, Workspace Previews, and XDG Application Grid. Settings app, advanced effects, DRM/KMS multi-monitor, and system integration follow in Milestones 5–8.
+> **Project Status**: **Milestone 5 (Advanced Compositor)** — Custom Smithay `0.7.0` Wayland compositor + independent GTK4 Desktop Shell + `ext_session_lock_v1` Lock Screen across 10 modular crates (`neon-compositor`, `neon-shell`, `neon-lockscreen`, `neon-output`, `neon-ipc`, `neon-renderer`, `neon-scene`, `neon-effects`, `neon-window-manager`, `neon-workspaces`): floating-first window management, GNOME-inspired dynamic workspaces, multi-monitor layout & hotplugging, fractional scaling (`wp_fractional_scale_v1` + `wp_viewporter`), touchpad gestures (`zwp_pointer_gestures_v1`), GPU frosted-glass blur + shadows + focus rings, `zwlr_layer_shell_v1`, `zwp_linux_dmabuf_v1`, XWayland (`X11Wm`), secure session locking, and authenticated Unix socket IPC (`SO_PEERCRED`). Settings app, Linux system integration, and bare-metal packaging follow in Milestones 6–8.
 
 ## Vision
 

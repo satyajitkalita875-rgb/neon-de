@@ -17,7 +17,7 @@ use smithay::{
         element::{
             AsRenderElements, Kind,
             solid::{SolidColorBuffer, SolidColorRenderElement},
-            surface::WaylandSurfaceRenderElement,
+            surface::{WaylandSurfaceRenderElement, render_elements_from_surface_tree},
         },
         gles::{GlesError, GlesRenderer, GlesTarget, Uniform, element::PixelShaderElement},
     },
@@ -25,6 +25,7 @@ use smithay::{
     output::Output,
     render_elements,
     utils::{Logical, Physical, Point, Rectangle, Scale, Size},
+    wayland::session_lock::LockSurface,
     wayland::shell::wlr_layer::Layer as WlrLayer,
 };
 use tracing::{info, warn};
@@ -33,6 +34,27 @@ use crate::shaders::NeonShaders;
 
 /// Fallback clear color (`#0C0F17`) used if shaders are unavailable.
 pub const FALLBACK_CLEAR_COLOR: Color32F = Color32F::new(0.047, 0.059, 0.090, 1.0);
+
+/// Opaque security curtain color (`#05070D`) used while `ext_session_lock_v1` is locked.
+pub const LOCK_CURTAIN_COLOR: Color32F = Color32F::new(0.020, 0.027, 0.051, 1.0);
+
+/// Live blur parameters supplied to [`NeonRenderer::render_scene`].
+#[derive(Debug, Clone, Copy)]
+pub struct BlurSettings {
+    pub enabled: bool,
+    pub strength: f32,
+    pub corner_radius: f32,
+}
+
+impl Default for BlurSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            strength: 1.0,
+            corner_radius: 12.0,
+        }
+    }
+}
 
 render_elements! {
     /// Unified render element type composited by [`NeonRenderer`].
@@ -67,6 +89,17 @@ struct CachedBackdrop {
     accent: [f32; 4],
 }
 
+#[derive(Debug, Clone)]
+struct CachedGlass {
+    element: PixelShaderElement,
+    area: Rectangle<i32, Logical>,
+    output_size: [f32; 2],
+    window_origin: [f32; 2],
+    corner_radius: f32,
+    blur_strength: f32,
+    opacity: f32,
+}
+
 /// Stateful per-output GPU renderer with compiled custom shaders and cached damage-aware elements.
 #[derive(Debug)]
 pub struct NeonRenderer {
@@ -74,6 +107,7 @@ pub struct NeonRenderer {
     damage_tracker: OutputDamageTracker,
     shadow_cache: HashMap<WindowId, CachedShadow>,
     border_cache: HashMap<WindowId, CachedBorder>,
+    glass_cache: HashMap<WindowId, CachedGlass>,
     backdrop_cache: Option<CachedBackdrop>,
 }
 
@@ -85,7 +119,9 @@ impl NeonRenderer {
     pub fn new(renderer: &mut GlesRenderer, output: &Output) -> Self {
         let shaders = match NeonShaders::compile(renderer) {
             Ok(compiled) => {
-                info!("Compiled NEON DE custom GLES shaders (shadow, border, backdrop)");
+                info!(
+                    "Compiled NEON DE custom GLES shaders (shadow, border, backdrop, frosted-glass)"
+                );
                 Some(compiled)
             }
             Err(err) => {
@@ -102,6 +138,7 @@ impl NeonRenderer {
             damage_tracker: OutputDamageTracker::from_output(output),
             shadow_cache: HashMap::new(),
             border_cache: HashMap::new(),
+            glass_cache: HashMap::new(),
             backdrop_cache: None,
         }
     }
@@ -110,7 +147,41 @@ impl NeonRenderer {
         self.shaders.is_some()
     }
 
+    /// Renders ONLY the active `ext_session_lock_v1` lock surface over an opaque security curtain.
+    ///
+    /// Guarantees that zero regular desktop windows, panels, dock, or overview surfaces are drawn
+    /// while the session is locked.
+    pub fn render_locked<'a>(
+        &'a mut self,
+        output: &Output,
+        renderer: &mut GlesRenderer,
+        framebuffer: &mut GlesTarget<'_>,
+        age: usize,
+        lock_surface: Option<&LockSurface>,
+    ) -> Result<RenderOutputResult<'a>, OutputDamageTrackerError<GlesError>> {
+        let scale_f = output.current_scale().fractional_scale();
+        let scale = Scale::from(scale_f);
+        let mut elements: Vec<NeonRenderElement> = Vec::new();
+
+        if let Some(surface) = lock_surface {
+            let lock_elements: Vec<WaylandSurfaceRenderElement<GlesRenderer>> =
+                render_elements_from_surface_tree(
+                    renderer,
+                    surface.wl_surface(),
+                    (0, 0),
+                    scale,
+                    1.0,
+                    Kind::Unspecified,
+                );
+            elements.extend(lock_elements.into_iter().map(NeonRenderElement::from));
+        }
+
+        self.damage_tracker
+            .render_output(renderer, framebuffer, age, &elements, LOCK_CURTAIN_COLOR)
+    }
+
     /// Renders the retained [`SceneGraph`] into `framebuffer` with full `OutputDamageTracker` support.
+    #[allow(clippy::too_many_arguments)]
     pub fn render_scene<'a, F>(
         &'a mut self,
         output: &Output,
@@ -118,6 +189,7 @@ impl NeonRenderer {
         framebuffer: &mut GlesTarget<'_>,
         age: usize,
         scene: &SceneGraph,
+        blur: BlurSettings,
         mut resolve_window: F,
     ) -> Result<RenderOutputResult<'a>, OutputDamageTrackerError<GlesError>>
     where
@@ -162,6 +234,14 @@ impl NeonRenderer {
             elements.extend(layer_elements.into_iter().map(NeonRenderElement::from));
         }
 
+        let output_logical_size = output
+            .current_mode()
+            .map(|m| {
+                let sz = m.size.to_f64().to_logical(scale_f);
+                [sz.w as f32, sz.h as f32]
+            })
+            .unwrap_or([1280.0, 800.0]);
+
         let mut inserted_lower_layers = false;
         for node in nodes {
             if !inserted_lower_layers && matches!(node.content, NodeContent::Backdrop { .. }) {
@@ -184,7 +264,11 @@ impl NeonRenderer {
             );
 
             match &node.content {
-                NodeContent::Window { window_id, .. } => {
+                NodeContent::Window {
+                    window_id,
+                    fullscreen,
+                    ..
+                } => {
                     seen_windows.insert(*window_id);
 
                     // 1. Client Wayland surface tree (top-most within this window subtree).
@@ -203,7 +287,23 @@ impl NeonRenderer {
                         elements.extend(surface_elements.into_iter().map(NeonRenderElement::from));
                     }
 
-                    // 2. Rounded focus ring / subtle rim border behind the client surface.
+                    // 2. Frosted-glass blur plate behind translucent non-fullscreen windows.
+                    if blur.enabled
+                        && !fullscreen
+                        && eff_rect.size.w > 0
+                        && eff_rect.size.h > 0
+                        && let Some(elem) = self.get_or_update_glass(
+                            *window_id,
+                            eff_rect,
+                            output_logical_size,
+                            blur,
+                            node.opacity,
+                        )
+                    {
+                        elements.push(NeonRenderElement::from(elem));
+                    }
+
+                    // 3. Rounded focus ring / subtle rim border behind the client surface.
                     if let Some(border) = node.border
                         && eff_rect.size.w > 0
                         && eff_rect.size.h > 0
@@ -257,6 +357,7 @@ impl NeonRenderer {
         // Prune cached shader elements for windows that are no longer visible or were closed.
         self.shadow_cache.retain(|id, _| seen_windows.contains(id));
         self.border_cache.retain(|id, _| seen_windows.contains(id));
+        self.glass_cache.retain(|id, _| seen_windows.contains(id));
 
         self.damage_tracker.render_output(
             renderer,
@@ -265,6 +366,75 @@ impl NeonRenderer {
             &elements,
             FALLBACK_CLEAR_COLOR,
         )
+    }
+
+    fn get_or_update_glass(
+        &mut self,
+        id: WindowId,
+        window_rect: Rectangle<i32, Logical>,
+        output_size: [f32; 2],
+        blur: BlurSettings,
+        opacity: f32,
+    ) -> Option<PixelShaderElement> {
+        let program = self.shaders.as_ref()?.frosted_glass.clone();
+        let window_origin = [window_rect.loc.x as f32, window_rect.loc.y as f32];
+        let primary = [0.047_f32, 0.059, 0.090, 1.0];
+        let accent = [0.090_f32, 0.145, 0.245, 1.0];
+
+        let make_uniforms = || {
+            vec![
+                Uniform::new("u_output_size", output_size),
+                Uniform::new("u_window_origin", window_origin),
+                Uniform::new("u_corner_radius", blur.corner_radius),
+                Uniform::new("u_blur_strength", blur.strength),
+                Uniform::new("u_opacity", opacity),
+                Uniform::new("u_primary", primary),
+                Uniform::new("u_accent", accent),
+            ]
+        };
+
+        if let Some(cached) = self.glass_cache.get_mut(&id) {
+            if cached.area != window_rect {
+                cached.element.resize(window_rect, None);
+                cached.area = window_rect;
+            }
+            if cached.output_size != output_size
+                || cached.window_origin != window_origin
+                || (cached.corner_radius - blur.corner_radius).abs() > 1e-4
+                || (cached.blur_strength - blur.strength).abs() > 1e-4
+                || (cached.opacity - opacity).abs() > 1e-4
+            {
+                cached.element.update_uniforms(make_uniforms());
+                cached.output_size = output_size;
+                cached.window_origin = window_origin;
+                cached.corner_radius = blur.corner_radius;
+                cached.blur_strength = blur.strength;
+                cached.opacity = opacity;
+            }
+            return Some(cached.element.clone());
+        }
+
+        let element = PixelShaderElement::new(
+            program,
+            window_rect,
+            None,
+            1.0,
+            make_uniforms(),
+            Kind::Unspecified,
+        );
+        self.glass_cache.insert(
+            id,
+            CachedGlass {
+                element: element.clone(),
+                area: window_rect,
+                output_size,
+                window_origin,
+                corner_radius: blur.corner_radius,
+                blur_strength: blur.strength,
+                opacity,
+            },
+        );
+        Some(element)
     }
 
     fn get_or_update_shadow(
