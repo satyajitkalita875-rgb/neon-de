@@ -1,23 +1,30 @@
 //! NEON DE macOS Launchpad & Mission Control (`zwlr_layer_shell_v1` `Layer::Overlay`).
 //!
-//! Default view is a clean, spacious macOS Launchpad: centered frosted search box,
-//! 7×5 grid of crisp 64px app icons, bottom pagination dots, Enter-to-launch, and
-//! click-anywhere-empty or Esc to dismiss. Includes a clean Mission Control tab for
-//! switching workspaces and open windows.
+//! Features a live GPU-blurred desktop wallpaper backdrop, smooth macOS zoom+fade
+//! opening and closing animations, horizontal `SlideLeftRight` multi-page app grid
+//! controllable via mouse wheel / trackpad scrolling, arrow keys, or pagination dots,
+//! and a clean Mission Control workspace switcher tab.
 
-use std::{cell::RefCell, rc::Rc};
+use std::{
+    cell::{Cell, RefCell},
+    path::PathBuf,
+    rc::Rc,
+    time::{Duration, Instant},
+};
 
 use gtk4::{
-    Align, Application, ApplicationWindow, Box as GtkBox, Button, EventControllerKey, FlowBox,
-    GestureClick, Grid, Label, Orientation, SearchEntry, SelectionMode, Stack, StackTransitionType,
-    gdk, glib, prelude::*,
+    Align, Application, ApplicationWindow, Box as GtkBox, Button, ContentFit, EventControllerKey,
+    EventControllerScroll, EventControllerScrollFlags, FlowBox, GestureClick, Grid, Label,
+    Orientation, Overlay, Picture, PolicyType, ScrolledWindow, SearchEntry, SelectionMode, Stack,
+    StackTransitionType, gdk, gio, glib, prelude::*,
 };
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
-use neon_ipc::{DesktopSnapshot, IpcRequest};
+use neon_ipc::{AppearanceInfo, DesktopSnapshot, IpcRequest};
 
 use crate::{
     desktop_apps::{DesktopApp, load_app_icon},
     ipc_bridge::IpcCommandSender,
+    wallpaper::resolve_wallpaper_path,
 };
 
 const LAUNCHPAD_COLS: usize = 7;
@@ -27,16 +34,25 @@ const APPS_PER_PAGE: usize = LAUNCHPAD_COLS * LAUNCHPAD_ROWS;
 /// Fullscreen macOS Launchpad + Mission Control overlay.
 pub struct Overview {
     pub window: ApplicationWindow,
+    backdrop_overlay: Overlay,
+    blur_picture: Picture,
+    content_box: GtkBox,
+    current_wp: RefCell<Option<PathBuf>>,
+    desired_open: Rc<Cell<bool>>,
+    anim_gen: Rc<Cell<u64>>,
     mode_stack: Stack,
     launchpad_tab_btn: Button,
     mission_tab_btn: Button,
     search_entry: SearchEntry,
-    apps_grid: Grid,
+    page_stack: Stack,
     dots_box: GtkBox,
     workspaces_box: GtkBox,
     windows_flow: FlowBox,
     all_apps: Rc<Vec<DesktopApp>>,
-    current_page: Rc<RefCell<usize>>,
+    current_page: Rc<Cell<usize>>,
+    page_count: Rc<Cell<usize>>,
+    dot_buttons: Rc<RefCell<Vec<Button>>>,
+    last_scroll_at: Rc<RefCell<Instant>>,
     last_snapshot: Rc<RefCell<Option<DesktopSnapshot>>>,
     ipc: IpcCommandSender,
 }
@@ -61,13 +77,34 @@ impl Overview {
             window.set_keyboard_mode(KeyboardMode::None);
         }
 
-        let root = GtkBox::new(Orientation::Vertical, 18);
-        root.add_css_class("neon-launchpad-scrim");
+        // Fullscreen overlay: live GPU-blurred desktop wallpaper + translucent tint + animated Launchpad
+        let backdrop_overlay = Overlay::new();
+        backdrop_overlay.add_css_class("neon-launchpad-overlay");
+        backdrop_overlay.add_css_class("lp-closed");
 
-        // Top centered macOS Launchpad search box + minimalist segmented tab switcher
+        let blur_picture = Picture::new();
+        blur_picture.add_css_class("neon-launchpad-blur-bg");
+        blur_picture.set_content_fit(ContentFit::Cover);
+        blur_picture.set_can_shrink(true);
+        blur_picture.set_size_request(1, 1);
+        blur_picture.set_hexpand(true);
+        blur_picture.set_vexpand(true);
+
+        let initial_wp = resolve_wallpaper_path(None, false);
+        if let Some(ref wp) = initial_wp {
+            blur_picture.set_file(Some(&gio::File::for_path(wp)));
+        }
+
+        let content_box = GtkBox::new(Orientation::Vertical, 18);
+        content_box.add_css_class("neon-launchpad-scrim");
+        content_box.add_css_class("neon-launchpad-content");
+        content_box.set_hexpand(true);
+        content_box.set_vexpand(true);
+
+        // Top centered macOS Launchpad search box + minimalist Liquid Glass segmented switcher
         let top_area = GtkBox::new(Orientation::Vertical, 12);
         top_area.set_halign(Align::Center);
-        top_area.set_margin_top(14);
+        top_area.set_margin_top(16);
 
         let search_entry = SearchEntry::new();
         search_entry.add_css_class("neon-launchpad-search");
@@ -90,32 +127,28 @@ impl Overview {
         mode_bar.append(&mission_tab_btn);
         top_area.append(&mode_bar);
 
-        root.append(&top_area);
+        content_box.append(&top_area);
 
         // Main stack switching cleanly between Launchpad (default) and Mission Control
         let mode_stack = Stack::new();
         mode_stack.set_vexpand(true);
         mode_stack.set_hexpand(true);
         mode_stack.set_transition_type(StackTransitionType::Crossfade);
-        mode_stack.set_transition_duration(140);
+        mode_stack.set_transition_duration(180);
 
-        // === Page 1: macOS Launchpad ===
-        let launchpad_page = GtkBox::new(Orientation::Vertical, 16);
+        // === Page 1: macOS Launchpad (smooth horizontal sliding page stack) ===
+        let launchpad_page = GtkBox::new(Orientation::Vertical, 14);
         launchpad_page.set_vexpand(true);
         launchpad_page.set_hexpand(true);
 
-        let grid_holder = GtkBox::new(Orientation::Vertical, 0);
-        grid_holder.set_vexpand(true);
-        grid_holder.set_valign(Align::Center);
-        grid_holder.set_halign(Align::Center);
-
-        let apps_grid = Grid::new();
-        apps_grid.set_column_spacing(26);
-        apps_grid.set_row_spacing(20);
-        apps_grid.set_column_homogeneous(true);
-        apps_grid.set_row_homogeneous(true);
-        grid_holder.append(&apps_grid);
-        launchpad_page.append(&grid_holder);
+        let page_stack = Stack::new();
+        page_stack.set_vexpand(true);
+        page_stack.set_hexpand(true);
+        page_stack.set_halign(Align::Center);
+        page_stack.set_valign(Align::Center);
+        page_stack.set_transition_type(StackTransitionType::SlideLeftRight);
+        page_stack.set_transition_duration(260);
+        launchpad_page.append(&page_stack);
 
         let dots_box = GtkBox::new(Orientation::Horizontal, 10);
         dots_box.set_halign(Align::Center);
@@ -148,47 +181,97 @@ impl Overview {
         mode_stack.add_named(&mission_page, Some("mission"));
         mode_stack.set_visible_child_name("launchpad");
 
-        root.append(&mode_stack);
-        window.set_child(Some(&root));
+        content_box.append(&mode_stack);
+
+        let blur_holder = ScrolledWindow::builder()
+            .hscrollbar_policy(PolicyType::External)
+            .vscrollbar_policy(PolicyType::External)
+            .propagate_natural_width(false)
+            .propagate_natural_height(false)
+            .can_target(false)
+            .focusable(false)
+            .child(&blur_picture)
+            .build();
+
+        backdrop_overlay.set_child(Some(&blur_holder));
+        backdrop_overlay.add_overlay(&content_box);
+        window.set_child(Some(&backdrop_overlay));
 
         let overview = Rc::new(Self {
             window,
+            backdrop_overlay,
+            blur_picture,
+            content_box,
+            current_wp: RefCell::new(initial_wp),
+            desired_open: Rc::new(Cell::new(false)),
+            anim_gen: Rc::new(Cell::new(0)),
             mode_stack,
             launchpad_tab_btn,
             mission_tab_btn,
             search_entry,
-            apps_grid,
+            page_stack,
             dots_box,
             workspaces_box,
             windows_flow,
             all_apps: Rc::new(apps),
-            current_page: Rc::new(RefCell::new(0)),
+            current_page: Rc::new(Cell::new(0)),
+            page_count: Rc::new(Cell::new(1)),
+            dot_buttons: Rc::new(RefCell::new(Vec::new())),
+            last_scroll_at: Rc::new(RefCell::new(
+                Instant::now()
+                    .checked_sub(Duration::from_secs(1))
+                    .unwrap_or_else(Instant::now),
+            )),
             last_snapshot: Rc::new(RefCell::new(None)),
             ipc: ipc.clone(),
         });
 
-        // Clicking empty backdrop dismisses Launchpad immediately (macOS behavior)
+        // Mouse wheel & touchpad scrolling turns Launchpad pages smoothly!
+        let scroll_ctrl = EventControllerScroll::new(EventControllerScrollFlags::BOTH_AXES);
+        {
+            let ov = Rc::clone(&overview);
+            scroll_ctrl.connect_scroll(move |_, dx, dy| {
+                if ov.mode_stack.visible_child_name().as_deref() != Some("launchpad") {
+                    return glib::Propagation::Proceed;
+                }
+                let primary = if dy.abs() >= dx.abs() { dy } else { dx };
+                if primary.abs() < 0.08 {
+                    return glib::Propagation::Proceed;
+                }
+                let now = Instant::now();
+                if now.duration_since(*ov.last_scroll_at.borrow()) < Duration::from_millis(200) {
+                    return glib::Propagation::Stop;
+                }
+                *ov.last_scroll_at.borrow_mut() = now;
+                if primary > 0.0 {
+                    ov.step_page(1);
+                } else {
+                    ov.step_page(-1);
+                }
+                glib::Propagation::Stop
+            });
+        }
+        overview.content_box.add_controller(scroll_ctrl);
+
+        // Clicking empty backdrop dismisses Launchpad smoothly (macOS behavior)
         let bg_click = GestureClick::new();
         {
-            let ipc = ipc.clone();
+            let ov = Rc::clone(&overview);
             let search = overview.search_entry.clone();
-            let grid = overview.apps_grid.clone();
             bg_click.connect_released(move |gesture, _, x, y| {
                 if let Some(widget) = gesture.widget()
                     && let Some(picked) = widget.pick(x, y, gtk4::PickFlags::DEFAULT)
                 {
                     let on_interactive = picked.is_ancestor(&search)
                         || picked == search.clone().upcast::<gtk4::Widget>()
-                        || picked.ancestor(Button::static_type()).is_some()
-                        || (picked.is_ancestor(&grid)
-                            && picked.ancestor(Button::static_type()).is_some());
+                        || picked.ancestor(Button::static_type()).is_some();
                     if !on_interactive {
-                        ipc.send(IpcRequest::SetOverview { open: false });
+                        ov.request_close();
                     }
                 }
             });
         }
-        root.add_controller(bg_click);
+        overview.content_box.add_controller(bg_click);
 
         // Mode switcher tabs
         {
@@ -204,21 +287,21 @@ impl Overview {
             });
         }
 
-        // Keyboard navigation: Esc closes, Left/Right flips Launchpad pages, Enter launches top match
+        // Keyboard navigation: Esc closes, Left/Right/PageUp/PageDown turns Launchpad pages
         let key_ctrl = EventControllerKey::new();
         {
             let ov = Rc::clone(&overview);
             key_ctrl.connect_key_pressed(move |_, key, _, _| {
                 if key == gdk::Key::Escape {
-                    ov.ipc.send(IpcRequest::SetOverview { open: false });
+                    ov.request_close();
                     return glib::Propagation::Stop;
                 }
                 if ov.search_entry.text().is_empty() {
-                    if key == gdk::Key::Right {
+                    if matches!(key, gdk::Key::Right | gdk::Key::Page_Down) {
                         ov.step_page(1);
                         return glib::Propagation::Stop;
                     }
-                    if key == gdk::Key::Left {
+                    if matches!(key, gdk::Key::Left | gdk::Key::Page_Up) {
                         ov.step_page(-1);
                         return glib::Propagation::Stop;
                     }
@@ -235,7 +318,7 @@ impl Overview {
                 let matches = ov.filtered_apps();
                 if let Some(first) = matches.first() {
                     first.launch();
-                    ov.ipc.send(IpcRequest::SetOverview { open: false });
+                    ov.request_close();
                 }
             });
         }
@@ -244,7 +327,7 @@ impl Overview {
         {
             let ov = Rc::clone(&overview);
             overview.search_entry.connect_search_changed(move |_| {
-                *ov.current_page.borrow_mut() = 0;
+                ov.current_page.set(0);
                 ov.rebuild_launchpad();
             });
         }
@@ -252,6 +335,16 @@ impl Overview {
         overview.rebuild_launchpad();
         overview.window.set_visible(false);
         overview
+    }
+
+    pub fn update_appearance(&self, appearance: &AppearanceInfo) {
+        let light = appearance.theme == "neon_light" || appearance.theme == "light";
+        if let Some(wp) = resolve_wallpaper_path(appearance.wallpaper.as_deref(), light)
+            && self.current_wp.borrow().as_ref() != Some(&wp)
+        {
+            self.blur_picture.set_file(Some(&gio::File::for_path(&wp)));
+            *self.current_wp.borrow_mut() = Some(wp);
+        }
     }
 
     pub fn set_mode(&self, mode: &str) {
@@ -265,28 +358,65 @@ impl Overview {
         }
     }
 
+    pub fn request_close(&self) {
+        self.set_open(false);
+        self.ipc.send(IpcRequest::SetOverview { open: false });
+    }
+
     pub fn set_open(&self, open: bool) {
-        if gtk4_layer_shell::is_supported() {
-            self.window.set_keyboard_mode(if open {
-                KeyboardMode::Exclusive
-            } else {
-                KeyboardMode::None
-            });
+        if self.desired_open.get() == open && self.window.is_visible() == open {
+            return;
         }
-        self.window.set_visible(open);
+        let epoch = self.anim_gen.get().wrapping_add(1);
+        self.anim_gen.set(epoch);
+        self.desired_open.set(open);
+
         if open {
+            if gtk4_layer_shell::is_supported() {
+                self.window.set_keyboard_mode(KeyboardMode::Exclusive);
+            }
             self.set_mode("launchpad");
-            *self.current_page.borrow_mut() = 0;
+            self.current_page.set(0);
             self.search_entry.set_text("");
             self.rebuild_launchpad();
+
+            // Reveal in closed zoomed-out state, then smoothly animate into open state
+            self.backdrop_overlay.remove_css_class("lp-open");
+            self.backdrop_overlay.add_css_class("lp-closed");
+            self.window.set_visible(true);
             self.window.present();
             self.search_entry.grab_focus();
+
+            let overlay = self.backdrop_overlay.clone();
+            let gen_cell = Rc::clone(&self.anim_gen);
+            glib::timeout_add_local_once(Duration::from_millis(16), move || {
+                if gen_cell.get() == epoch {
+                    overlay.remove_css_class("lp-closed");
+                    overlay.add_css_class("lp-open");
+                }
+            });
+        } else {
+            // Play smooth macOS zoom-out + blur fade-out before hiding the layer surface
+            self.backdrop_overlay.remove_css_class("lp-open");
+            self.backdrop_overlay.add_css_class("lp-closed");
+
+            let win = self.window.clone();
+            let gen_cell = Rc::clone(&self.anim_gen);
+            glib::timeout_add_local_once(Duration::from_millis(210), move || {
+                if gen_cell.get() == epoch {
+                    if gtk4_layer_shell::is_supported() {
+                        win.set_keyboard_mode(KeyboardMode::None);
+                    }
+                    win.set_visible(false);
+                }
+            });
         }
     }
 
     pub fn update(&self, snapshot: &DesktopSnapshot) {
         *self.last_snapshot.borrow_mut() = Some(snapshot.clone());
-        if self.window.is_visible() != snapshot.overview_open {
+        self.update_appearance(&snapshot.appearance);
+        if self.desired_open.get() != snapshot.overview_open {
             self.set_open(snapshot.overview_open);
         }
         self.rebuild_mission_control(snapshot);
@@ -301,98 +431,147 @@ impl Overview {
             .collect()
     }
 
-    fn step_page(&self, delta: isize) {
-        let total = self.filtered_apps().len();
-        let page_count = total.div_ceil(APPS_PER_PAGE).max(1);
-        let cur = *self.current_page.borrow() as isize;
-        let next = (cur + delta).clamp(0, (page_count - 1) as isize) as usize;
-        if next != *self.current_page.borrow() {
-            *self.current_page.borrow_mut() = next;
-            self.rebuild_launchpad();
+    fn go_to_page(&self, target: usize) {
+        let total = self.page_count.get().max(1);
+        let next = target.min(total - 1);
+        if next == self.current_page.get() {
+            return;
+        }
+        self.current_page.set(next);
+        self.page_stack
+            .set_visible_child_name(&format!("page-{next}"));
+        for (idx, dot) in self.dot_buttons.borrow().iter().enumerate() {
+            if idx == next {
+                dot.add_css_class("active");
+            } else {
+                dot.remove_css_class("active");
+            }
         }
     }
 
+    fn step_page(&self, delta: isize) {
+        let total = self.page_count.get().max(1) as isize;
+        let cur = self.current_page.get() as isize;
+        let next = (cur + delta).clamp(0, total - 1) as usize;
+        self.go_to_page(next);
+    }
+
     fn rebuild_launchpad(&self) {
-        while let Some(child) = self.apps_grid.first_child() {
-            self.apps_grid.remove(&child);
+        while let Some(child) = self.page_stack.first_child() {
+            self.page_stack.remove(&child);
         }
         while let Some(child) = self.dots_box.first_child() {
             self.dots_box.remove(&child);
         }
+        self.dot_buttons.borrow_mut().clear();
 
         let matches = self.filtered_apps();
-        let page_count = matches.len().div_ceil(APPS_PER_PAGE).max(1);
-        let mut page = *self.current_page.borrow();
-        if page >= page_count {
-            page = 0;
-            *self.current_page.borrow_mut() = 0;
-        }
+        let total_pages = matches.len().div_ceil(APPS_PER_PAGE).max(1);
+        self.page_count.set(total_pages);
+        let active_page = self.current_page.get().min(total_pages - 1);
+        self.current_page.set(active_page);
 
-        let start = page * APPS_PER_PAGE;
-        let page_slice = matches.iter().skip(start).take(APPS_PER_PAGE);
+        for p in 0..total_pages {
+            let apps_grid = Grid::new();
+            apps_grid.set_column_spacing(26);
+            apps_grid.set_row_spacing(20);
+            apps_grid.set_column_homogeneous(true);
+            apps_grid.set_row_homogeneous(true);
+            apps_grid.set_halign(Align::Center);
+            apps_grid.set_valign(Align::Center);
 
-        for (idx, app) in page_slice.enumerate() {
-            let col = (idx % LAUNCHPAD_COLS) as i32;
-            let row = (idx / LAUNCHPAD_COLS) as i32;
+            let start = p * APPS_PER_PAGE;
+            for (idx, app) in matches.iter().skip(start).take(APPS_PER_PAGE).enumerate() {
+                let col = (idx % LAUNCHPAD_COLS) as i32;
+                let row = (idx / LAUNCHPAD_COLS) as i32;
 
-            let tile = Button::new();
-            tile.add_css_class("neon-launchpad-tile");
-            if let Some(comment) = &app.comment {
-                tile.set_tooltip_text(Some(comment));
+                let tile = Button::new();
+                tile.add_css_class("neon-launchpad-tile");
+                if let Some(comment) = &app.comment {
+                    tile.set_tooltip_text(Some(comment));
+                }
+
+                let vbox = GtkBox::new(Orientation::Vertical, 8);
+                vbox.set_halign(Align::Center);
+                vbox.set_valign(Align::Center);
+
+                let icon = load_app_icon(app.icon.as_deref(), &app.name, 68);
+                vbox.append(&icon);
+
+                let name_lbl = Label::new(Some(&app.name));
+                name_lbl.add_css_class("neon-launchpad-label");
+                name_lbl.set_max_width_chars(14);
+                name_lbl.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+                vbox.append(&name_lbl);
+
+                tile.set_child(Some(&vbox));
+
+                let app_clone = app.clone();
+                let ipc = self.ipc.clone();
+                let overlay = self.backdrop_overlay.clone();
+                let win = self.window.clone();
+                let desired = Rc::clone(&self.desired_open);
+                let gen_cell = Rc::clone(&self.anim_gen);
+                tile.connect_clicked(move |_| {
+                    app_clone.launch();
+                    let epoch = gen_cell.get().wrapping_add(1);
+                    gen_cell.set(epoch);
+                    desired.set(false);
+                    overlay.remove_css_class("lp-open");
+                    overlay.add_css_class("lp-closed");
+                    ipc.send(IpcRequest::SetOverview { open: false });
+                    let win_c = win.clone();
+                    let gen_c = Rc::clone(&gen_cell);
+                    glib::timeout_add_local_once(Duration::from_millis(200), move || {
+                        if gen_c.get() == epoch {
+                            if gtk4_layer_shell::is_supported() {
+                                win_c.set_keyboard_mode(KeyboardMode::None);
+                            }
+                            win_c.set_visible(false);
+                        }
+                    });
+                });
+
+                apps_grid.attach(&tile, col, row, 1, 1);
             }
 
-            let vbox = GtkBox::new(Orientation::Vertical, 8);
-            vbox.set_halign(Align::Center);
-            vbox.set_valign(Align::Center);
-
-            let icon = load_app_icon(app.icon.as_deref(), &app.name, 68);
-            vbox.append(&icon);
-
-            let name_lbl = Label::new(Some(&app.name));
-            name_lbl.add_css_class("neon-launchpad-label");
-            name_lbl.set_max_width_chars(14);
-            name_lbl.set_ellipsize(gtk4::pango::EllipsizeMode::End);
-            vbox.append(&name_lbl);
-
-            tile.set_child(Some(&vbox));
-
-            let app_clone = app.clone();
-            let ipc = self.ipc.clone();
-            tile.connect_clicked(move |_| {
-                app_clone.launch();
-                ipc.send(IpcRequest::SetOverview { open: false });
-            });
-
-            self.apps_grid.attach(&tile, col, row, 1, 1);
+            self.page_stack
+                .add_named(&apps_grid, Some(&format!("page-{p}")));
         }
 
-        // macOS Launchpad bottom pagination dots
-        if page_count > 1 {
-            for p in 0..page_count {
+        self.page_stack
+            .set_visible_child_name(&format!("page-{active_page}"));
+
+        // macOS Launchpad bottom pagination dots (clickable, smooth slide)
+        if total_pages > 1 {
+            let mut dots_vec = Vec::with_capacity(total_pages);
+            for p in 0..total_pages {
                 let dot = Button::new();
                 dot.add_css_class("neon-page-dot");
-                if p == page {
+                if p == active_page {
                     dot.add_css_class("active");
                 }
                 dot.set_tooltip_text(Some(&format!("Page {}", p + 1)));
-                let page_ref = Rc::clone(&self.current_page);
-                let grid_ref = self.apps_grid.clone();
-                let dots_ref = self.dots_box.clone();
-                let apps_ref = Rc::clone(&self.all_apps);
-                let search_ref = self.search_entry.clone();
-                let ipc_ref = self.ipc.clone();
-                dot.connect_clicked(move |_| {
-                    *page_ref.borrow_mut() = p;
-                    rebuild_launchpad_page(
-                        &grid_ref,
-                        &dots_ref,
-                        &apps_ref,
-                        &search_ref,
-                        &page_ref,
-                        &ipc_ref,
-                    );
-                });
+                dots_vec.push(dot.clone());
                 self.dots_box.append(&dot);
+            }
+            *self.dot_buttons.borrow_mut() = dots_vec;
+
+            for (p, dot) in self.dot_buttons.borrow().iter().enumerate() {
+                let page_cell = Rc::clone(&self.current_page);
+                let stack_ref = self.page_stack.clone();
+                let all_dots = Rc::clone(&self.dot_buttons);
+                dot.connect_clicked(move |_| {
+                    page_cell.set(p);
+                    stack_ref.set_visible_child_name(&format!("page-{p}"));
+                    for (idx, d) in all_dots.borrow().iter().enumerate() {
+                        if idx == p {
+                            d.add_css_class("active");
+                        } else {
+                            d.remove_css_class("active");
+                        }
+                    }
+                });
             }
         }
     }
@@ -495,93 +674,6 @@ impl Overview {
             card.append(&top_row);
             card.append(&focus_btn);
             self.windows_flow.insert(&card, -1);
-        }
-    }
-}
-
-fn rebuild_launchpad_page(
-    apps_grid: &Grid,
-    dots_box: &GtkBox,
-    all_apps: &Rc<Vec<DesktopApp>>,
-    search_entry: &SearchEntry,
-    current_page: &Rc<RefCell<usize>>,
-    ipc: &IpcCommandSender,
-) {
-    while let Some(child) = apps_grid.first_child() {
-        apps_grid.remove(&child);
-    }
-    while let Some(child) = dots_box.first_child() {
-        dots_box.remove(&child);
-    }
-
-    let query = search_entry.text().to_string();
-    let matches: Vec<DesktopApp> = all_apps
-        .iter()
-        .filter(|a| a.matches_query(&query))
-        .cloned()
-        .collect();
-    let page_count = matches.len().div_ceil(APPS_PER_PAGE).max(1);
-    let page = (*current_page.borrow()).min(page_count - 1);
-    *current_page.borrow_mut() = page;
-
-    let start = page * APPS_PER_PAGE;
-    for (idx, app) in matches.iter().skip(start).take(APPS_PER_PAGE).enumerate() {
-        let col = (idx % LAUNCHPAD_COLS) as i32;
-        let row = (idx / LAUNCHPAD_COLS) as i32;
-
-        let tile = Button::new();
-        tile.add_css_class("neon-launchpad-tile");
-        if let Some(comment) = &app.comment {
-            tile.set_tooltip_text(Some(comment));
-        }
-        let vbox = GtkBox::new(Orientation::Vertical, 8);
-        vbox.set_halign(Align::Center);
-        vbox.set_valign(Align::Center);
-
-        let icon = load_app_icon(app.icon.as_deref(), &app.name, 68);
-        vbox.append(&icon);
-
-        let lbl = Label::new(Some(&app.name));
-        lbl.add_css_class("neon-launchpad-label");
-        lbl.set_max_width_chars(14);
-        lbl.set_ellipsize(gtk4::pango::EllipsizeMode::End);
-        vbox.append(&lbl);
-
-        tile.set_child(Some(&vbox));
-        let app_clone = app.clone();
-        let ipc_c = ipc.clone();
-        tile.connect_clicked(move |_| {
-            app_clone.launch();
-            ipc_c.send(IpcRequest::SetOverview { open: false });
-        });
-        apps_grid.attach(&tile, col, row, 1, 1);
-    }
-
-    if page_count > 1 {
-        for p in 0..page_count {
-            let dot = Button::new();
-            dot.add_css_class("neon-page-dot");
-            if p == page {
-                dot.add_css_class("active");
-            }
-            let page_ref = Rc::clone(current_page);
-            let grid_ref = apps_grid.clone();
-            let dots_ref = dots_box.clone();
-            let apps_ref = Rc::clone(all_apps);
-            let search_ref = search_entry.clone();
-            let ipc_ref = ipc.clone();
-            dot.connect_clicked(move |_| {
-                *page_ref.borrow_mut() = p;
-                rebuild_launchpad_page(
-                    &grid_ref,
-                    &dots_ref,
-                    &apps_ref,
-                    &search_ref,
-                    &page_ref,
-                    &ipc_ref,
-                );
-            });
-            dots_box.append(&dot);
         }
     }
 }

@@ -118,7 +118,7 @@ const CATEGORIES: &[CategoryDef] = &[
         title: "Notifications",
         icon: "preferences-system-notifications-symbolic",
         group: 2,
-        keywords: "alerts toasts banners do not disturb dbus test",
+        keywords: "alerts toasts banners do not disturb dbus focus",
     },
     // Group 3: Input Devices
     CategoryDef {

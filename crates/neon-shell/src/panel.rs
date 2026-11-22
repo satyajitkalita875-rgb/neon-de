@@ -1,10 +1,10 @@
 //! NEON DE macOS × GNOME 47 Top Menu Bar (`zwlr_layer_shell_v1` `Layer::Top` anchored Top+Left+Right).
 
-use std::time::Duration;
+use std::{cell::Cell, f64::consts::PI, rc::Rc, time::Duration};
 
 use gtk4::{
-    Align, Application, ApplicationWindow, Box as GtkBox, Button, CenterBox, Image, Label,
-    Orientation, glib, prelude::*,
+    Align, Application, ApplicationWindow, Box as GtkBox, Button, CenterBox, DrawingArea, Image,
+    Label, Orientation, glib, prelude::*,
 };
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 use neon_ipc::{DesktopSnapshot, IpcRequest};
@@ -30,6 +30,8 @@ pub struct TopPanel {
     power_btn: Button,
     power_icon: Image,
     power_pct_label: Label,
+    cc_icon_area: DrawingArea,
+    is_light_theme: Rc<Cell<bool>>,
     notif_dot: GtkBox,
     ipc: IpcCommandSender,
 }
@@ -176,20 +178,82 @@ impl TopPanel {
             power_btn.connect_clicked(move |_| qs.toggle());
         }
 
-        let cc_inner = GtkBox::new(Orientation::Horizontal, 3);
-        let cc_icon = Image::from_icon_name("view-more-symbolic");
-        cc_icon.set_pixel_size(15);
+        let is_light_theme = Rc::new(Cell::new(false));
+
+        // Authentic macOS Control Center dual-toggle-switches menu bar icon
+        let cc_inner = GtkBox::new(Orientation::Horizontal, 4);
+        let cc_icon_area = DrawingArea::new();
+        cc_icon_area.set_content_width(18);
+        cc_icon_area.set_content_height(15);
+        cc_icon_area.set_valign(Align::Center);
+        {
+            let light_flag = Rc::clone(&is_light_theme);
+            cc_icon_area.set_draw_func(move |_, cr, w, h| {
+                let (r, g, b) = if light_flag.get() {
+                    (0.06, 0.09, 0.16)
+                } else {
+                    (0.95, 0.97, 1.0)
+                };
+                let w = f64::from(w);
+                let h = f64::from(h);
+                let pill_h = 5.4;
+                let pill_w = w - 2.0;
+                let rx = pill_h * 0.5;
+
+                // Helper to trace a horizontal capsule
+                let trace_pill = |cr: &gtk4::cairo::Context, x: f64, y: f64, pw: f64, ph: f64| {
+                    let rad = ph * 0.5;
+                    cr.new_sub_path();
+                    cr.arc(x + pw - rad, y + rad, rad, -PI * 0.5, PI * 0.5);
+                    cr.arc(x + rad, y + rad, rad, PI * 0.5, PI * 1.5);
+                    cr.close_path();
+                };
+
+                // Top pill: outlined track + solid knob on left
+                let top_y = 1.2;
+                cr.set_source_rgba(r, g, b, 0.92);
+                cr.set_line_width(1.25);
+                trace_pill(cr, 1.0, top_y, pill_w, pill_h);
+                let _ = cr.stroke();
+                cr.arc(1.0 + rx, top_y + rx, rx - 0.8, 0.0, 2.0 * PI);
+                let _ = cr.fill();
+
+                // Bottom pill: filled track + bright knob on right
+                let bot_y = h - pill_h - 1.2;
+                cr.set_source_rgba(r, g, b, 0.34);
+                trace_pill(cr, 1.0, bot_y, pill_w, pill_h);
+                let _ = cr.fill();
+                cr.set_source_rgba(r, g, b, 0.96);
+                cr.set_line_width(1.1);
+                trace_pill(cr, 1.0, bot_y, pill_w, pill_h);
+                let _ = cr.stroke();
+                cr.arc(1.0 + pill_w - rx, bot_y + rx, rx - 0.5, 0.0, 2.0 * PI);
+                let _ = cr.fill();
+            });
+        }
+
         let notif_dot = GtkBox::new(Orientation::Horizontal, 0);
         notif_dot.add_css_class("neon-notif-dot");
         notif_dot.set_valign(Align::Center);
         notif_dot.set_visible(false);
-        cc_inner.append(&cc_icon);
+        cc_inner.append(&cc_icon_area);
         cc_inner.append(&notif_dot);
 
         let cc_btn = Button::new();
         cc_btn.add_css_class("neon-tray-btn");
+        cc_btn.add_css_class("neon-cc-toggle-btn");
         cc_btn.set_child(Some(&cc_inner));
-        cc_btn.set_tooltip_text(Some("Control Center & Notifications"));
+        cc_btn.set_tooltip_text(Some("Control Center"));
+        {
+            let cc_btn_c = cc_btn.clone();
+            quick_settings.set_on_state_change(move |open| {
+                if open {
+                    cc_btn_c.add_css_class("active");
+                } else {
+                    cc_btn_c.remove_css_class("active");
+                }
+            });
+        }
         {
             let qs = quick_settings;
             cc_btn.connect_clicked(move |_| qs.toggle());
@@ -224,12 +288,20 @@ impl TopPanel {
             power_btn,
             power_icon,
             power_pct_label,
+            cc_icon_area,
+            is_light_theme,
             notif_dot,
             ipc,
         }
     }
 
     pub fn update(&self, snapshot: &DesktopSnapshot) {
+        let light =
+            snapshot.appearance.theme == "neon_light" || snapshot.appearance.theme == "light";
+        if self.is_light_theme.get() != light {
+            self.is_light_theme.set(light);
+            self.cc_icon_area.queue_draw();
+        }
         self.window.set_visible(snapshot.appearance.panel_visible);
         self.clock_btn.set_visible(snapshot.appearance.show_clock);
         self.clock_label.set_visible(snapshot.appearance.show_clock);

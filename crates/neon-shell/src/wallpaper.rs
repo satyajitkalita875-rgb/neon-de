@@ -81,7 +81,7 @@ impl WallpaperLayer {
     }
 }
 
-fn resolve_wallpaper_path(explicit: Option<&str>, is_light: bool) -> Option<PathBuf> {
+pub fn resolve_wallpaper_path(explicit: Option<&str>, is_light: bool) -> Option<PathBuf> {
     if let Some(raw) = explicit
         && !raw.trim().is_empty()
     {

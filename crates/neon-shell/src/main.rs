@@ -16,9 +16,7 @@ use std::{path::PathBuf, sync::Arc, time::Duration};
 use clap::Parser;
 use gtk4::{Application, gio, glib, prelude::*};
 use neon_system::{
-    notifications::{
-        NESTED_BUS_NAME, NotificationEvent, NotificationStore, start_notification_daemon,
-    },
+    notifications::{NotificationEvent, NotificationStore, start_notification_daemon},
     start_system_monitor,
 };
 use tracing::{info, warn};
@@ -66,10 +64,6 @@ fn main() {
             None
         }
     };
-    let active_notif_bus = notif_daemon
-        .as_ref()
-        .map(|h| h.bus_name.clone())
-        .unwrap_or_else(|| NESTED_BUS_NAME.to_string());
 
     let (sys_tx, sys_rx) = start_system_monitor(Duration::from_secs(2));
 
@@ -102,7 +96,6 @@ fn main() {
             ipc_sender.clone(),
             sys_tx.clone(),
             Arc::clone(&notif_store),
-            active_notif_bus.clone(),
             toast_overlay.clone(),
         );
         let top_panel = TopPanel::build(

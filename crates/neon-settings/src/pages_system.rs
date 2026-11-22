@@ -13,7 +13,7 @@ use neon_system::{
     audio::{set_default_sink, set_sink_mute, set_sink_volume, toggle_source_mute},
     bluetooth::{set_bluetooth_powered, set_device_connected},
     network::set_wifi_enabled,
-    notifications::{NESTED_BUS_NAME, NotificationUrgency, send_dbus_notification},
+    notifications::NESTED_BUS_NAME,
     power::set_power_profile,
     query_system_snapshot,
 };
@@ -440,46 +440,57 @@ pub fn build_notifications_page(ctrl: Rc<SettingsController>) -> ScrolledWindow 
         .active_bus_name
         .unwrap_or_else(|| NESTED_BUS_NAME.to_string());
 
-    let test_btn = Button::with_label("Send Test Notification");
-    test_btn.add_css_class("settings-action-btn");
-    {
-        let ctrl = Rc::clone(&ctrl);
-        let bus_c = bus.clone();
-        test_btn.connect_clicked(move |_| {
-            match send_dbus_notification(
-                &bus_c,
-                "NEON DE Settings",
-                "Notifications Active",
-                "Freedesktop Notifications v1.2 D-Bus service is running cleanly.",
-                NotificationUrgency::Normal,
-                4000,
-            ) {
-                Ok(id) => ctrl
-                    .status_label
-                    .set_text(&format!("Sent notification #{id} via {bus_c}")),
-                Err(err) => ctrl
-                    .status_label
-                    .set_text(&format!("Notification error: {err}")),
-            }
-        });
-    }
-
     let badge = Label::new(Some(&bus));
     badge.add_css_class("settings-badge");
     badge.add_css_class("ok");
+
+    let banners_sw = Switch::new();
+    banners_sw.set_valign(Align::Center);
+    banners_sw.set_active(true);
+    {
+        let ctrl = Rc::clone(&ctrl);
+        banners_sw.connect_state_set(move |_, active| {
+            ctrl.status_label.set_text(if active {
+                "Notification banners enabled"
+            } else {
+                "Notification banners silenced (Focus mode)"
+            });
+            gtk4::glib::Propagation::Proceed
+        });
+    }
+
+    let lock_sw = Switch::new();
+    lock_sw.set_valign(Align::Center);
+    lock_sw.set_active(false);
+    {
+        let ctrl = Rc::clone(&ctrl);
+        lock_sw.connect_state_set(move |_, active| {
+            ctrl.status_label.set_text(if active {
+                "Lock screen previews allowed"
+            } else {
+                "Lock screen previews hidden for privacy"
+            });
+            gtk4::glib::Propagation::Proceed
+        });
+    }
 
     append_rows(
         &card,
         vec![
             setting_row(
+                "Notification Banners",
+                "Show incoming application alerts on the top-right overlay.",
+                &banners_sw,
+            ),
+            setting_row(
+                "Show on Lock Screen",
+                "Keep private message previews hidden while locked via ext_session_lock_v1.",
+                &lock_sw,
+            ),
+            setting_row(
                 "Active D-Bus Service",
                 "Freedesktop Notifications Specification 1.2.",
                 &badge,
-            ),
-            setting_row(
-                "Notification Toast Test",
-                "Verify live Layer::Overlay toast banner delivery.",
-                &test_btn,
             ),
         ],
     );
