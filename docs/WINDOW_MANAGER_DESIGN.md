@@ -1,35 +1,50 @@
-# NEON DE — Window Manager Design
+# NEON DE — Window Manager & Dynamic Workspace Design
 
 ## 1. Philosophy
 
-NEON DE uses a **GNOME-inspired floating window management model** as the default workflow, paired with predictable keyboard navigation, smart window placement, and optional snapping/tiling (Milestone 2).
+NEON DE uses a **GNOME-inspired floating window management model** as the default workflow, combined with predictable keyboard navigation, intelligent collision-avoiding placement, dynamic workspaces, configurable window rules, and optional smart edge snapping/tiling.
 
-## 2. Window Identity & Model
+## 2. Extracted Workspace Crates (Milestone 2)
 
-Every managed toplevel window is tracked in `WindowRegistry` (`crates/neon-compositor/src/window.rs`) with a monotonic `WindowId(u64)` independent of Wayland object IDs, storing:
+- **`crates/neon-workspaces`** (`WorkspaceManager<W>`, `WorkspaceId`, `WorkspacePolicy`):
+  - Maintains an ordered list of workspaces with stable `WorkspaceId(u64)`.
+  - Enforces GNOME-style dynamic workspace invariants:
+    1. At least one workspace always exists.
+    2. Whenever the trailing workspace becomes non-empty, a fresh empty trailing workspace is appended automatically.
+    3. Empty non-active intermediate workspaces are pruned automatically without disturbing remaining workspace order.
+    4. An active empty workspace stays alive until the user navigates away.
+- **`crates/neon-window-manager`** (`WindowManager`, `WindowId`, `ManagedWindow`, `WindowMode`, `SnapRegion`, `FocusPolicy`, `WindowRulesEngine`):
+  - **Exclusive State Machine (`WindowMode`)**: Encodes `Floating`, `Snapped(SnapRegion)`, `Maximized`, `Fullscreen`, and `Minimized { restore_mode }` as an exclusive tagged enum so conflicting states (e.g., `Maximized + Fullscreen` or `Minimized + Fullscreen`) are structurally impossible.
+  - **Intelligent Floating Placement**:
+    - Transient child dialogs inherit their parent's workspace and center cleanly over their parent window (clamped to output bounds).
+    - Rule-centered windows center in the output work area.
+    - General floating windows use collision-aware cascading inside the work area.
+  - **Smart Snapping (`SnapRegion`)**: `LeftHalf`, `RightHalf`, `TopLeft`, `TopRight`, `BottomLeft`, `BottomRight` with configurable gap and proper `xdg_toplevel::State::Tiled*` negotiation.
+  - **Focus Management**: Configurable `FocusPolicy` (`ClickToFocus` default; `FocusFollowsMouse` optional) and per-workspace MRU focus stacks so switching workspaces always restores focus to the last active visible window on the destination workspace.
+  - **Window Rules Engine**: Ordered matching against `app_id` and `title` supporting initial mode, initial size, centering, initial workspace, and focus-on-map policies.
 
-- `WindowId` — stable internal identifier
-- Smithay `Window` handle (backing `ToplevelSurface` / `WlSurface`)
-- `app_id` & `title` (synced from `xdg_toplevel`)
-- Logical `position` and `size`
-- Focus / active state (`xdg_toplevel::State::Activated`)
-- Lifecycle state (`Mapped` / `Unmapped`, plus planned `Minimized`, `Maximized`, `Fullscreen`, `WorkspaceId`, `OutputId`, parent-child transient links in Milestone 2)
+## 3. Compositor Integration & Shortcuts (`crates/neon-compositor`)
 
-## 3. Milestone 1 Implemented Behaviour
+Only non-minimized windows belonging to the active workspace are mapped in Smithay's `Space<Window>`; inactive-workspace and minimized windows remain live in `NeonState::managed_windows` and remap seamlessly when switching workspaces or restoring.
 
-- **Floating placement**: Cascade placement inside the active output geometry, clamped to stay visible on screen.
-- **Click-to-focus & raise**: Clicking any window activates it, raises it to the top of the stacking order, and transfers keyboard focus to its `WlSurface`.
-- **Keyboard focus lifecycle**: Newly mapped toplevels automatically receive focus; when a focused window closes, focus transfers cleanly to the next top-most mapped window (or clears if none remain).
-- **Interactive move & resize**: Supports both client-initiated (`xdg_toplevel.move` / `xdg_toplevel.resize`) and compositor-initiated (`Alt + Left Drag` to move, `Alt + Right Drag` to resize) pointer grabs.
-- **Compositor keybindings (Milestone 1)**:
-  - `Alt + Q` or `Super + Q`: Request graceful close (`xdg_toplevel.send_close()`) on the focused window.
-  - `Alt + Tab`: Cycle focus to the next mapped window.
-  - `Super + Return`: Spawn a terminal (`weston-terminal` / `alacritty` / `kitty`) connected to the NEON DE Wayland socket.
-  - `Ctrl + Alt + Escape`: Cleanly exit the nested compositor session.
+### Keyboard & Pointer Bindings (Milestones 1–2)
 
-## 4. Planned Evolution (Milestone 2)
-
-- Extract `crates/neon-window-manager` and `crates/neon-workspaces`.
-- Explicit window state machine preventing conflicting states (e.g., minimized + fullscreen).
-- Dynamic workspace lifecycle (automatic empty trailing workspace, automatic cleanup of unused workspaces, predictable ordering).
-- Smart snapping (edge half/quarter tiling), window rules by `app_id`/title, transient dialog centering and modal parent tracking.
+| Shortcut | Action |
+|---|---|
+| `Super + Return` | Spawn terminal inside NEON DE |
+| `Alt + Tab` | Cycle focus across visible windows on active workspace |
+| `Alt + Q` / `Super + Q` | Graceful close (`xdg_toplevel.close`) on focused window |
+| `Alt + Left Drag` | Interactive move (auto-restores floating if maximized/snapped) |
+| `Alt + Right Drag` | Interactive resize |
+| `Super + Left` / `Super + Right` | Toggle Left Half / Right Half smart snap |
+| `Super + Up` | Toggle Maximize |
+| `Super + Down` | Restore Floating (or Minimize if already Floating) |
+| `Super + F` / `Super + F11` | Toggle Fullscreen |
+| `Super + H` | Minimize focused window |
+| `Super + Shift + H` | Restore most recently minimized window on active workspace |
+| `Super + Page_Down` / `Ctrl + Alt + Right` | Switch to next workspace |
+| `Super + Page_Up` / `Ctrl + Alt + Left` | Switch to previous workspace |
+| `Super + Shift + Page_Down` / `Ctrl + Alt + Shift + Right` | Move focused window to next workspace (creating one dynamically if needed) |
+| `Super + Shift + Page_Up` / `Ctrl + Alt + Shift + Left` | Move focused window to previous workspace |
+| `Super + 1..9` | Switch directly to workspace 1–9 |
+| `Ctrl + Alt + Escape` | Cleanly exit nested NEON DE session |

@@ -21,7 +21,7 @@ use tracing::trace;
 
 use crate::{
     state::{NeonClientData, NeonState},
-    window::{window_id, window_matches_surface},
+    window::{from_wm_point, to_wm_size},
 };
 
 impl BufferHandler for NeonState {
@@ -54,13 +54,7 @@ impl CompositorHandler for NeonState {
         }
 
         // Refresh window geometry & handle initial xdg_toplevel configure handshake.
-        let matching_window = self
-            .space
-            .elements()
-            .find(|window| window_matches_surface(window, surface))
-            .cloned();
-
-        if let Some(window) = matching_window {
+        if let Some((id, window)) = self.find_window_by_surface(surface) {
             window.on_commit();
 
             if let Some(toplevel) = window.toplevel() {
@@ -73,21 +67,46 @@ impl CompositorHandler for NeonState {
                 });
 
                 if !initial_configure_sent {
-                    trace!("Sending initial xdg_toplevel configure");
+                    // Evaluate any matching window rules before sending the initial configure so
+                    // maximized/snapped/sized rules take effect on the very first frame.
+                    let work_area = self.work_area();
+                    if let Some((_eval, update)) = self.wm.apply_rules_if_needed(id, work_area) {
+                        self.apply_layout_update(&update);
+                    }
+                    trace!(?id, "Sending initial xdg_toplevel configure");
                     toplevel.send_configure();
                 }
 
                 // Update window metadata size & mapped status once a buffer/geometry is committed.
                 let bbox = window.geometry();
-                if let Some(id) = window_id(&window)
-                    && let Some(record) = self.windows.get_mut(id)
+                let was_mapped = self.wm.get(id).map(|w| w.mapped).unwrap_or(false);
+                let work_area = self.work_area();
+                let recentered =
+                    self.wm
+                        .update_committed_size(id, to_wm_size(bbox.size), work_area);
+
+                if let Some(new_loc) = recentered
+                    && self
+                        .wm
+                        .get(id)
+                        .map(|w| w.is_visible_on(self.wm.active_workspace_id()))
+                        .unwrap_or(false)
                 {
-                    record.size = bbox.size;
-                    if !record.mapped && bbox.size.w > 0 && bbox.size.h > 0 {
-                        record.mapped = true;
-                        let serial = SERIAL_COUNTER.next_serial();
-                        self.focus_window(Some(&window), serial);
-                    }
+                    self.space
+                        .map_element(window.clone(), from_wm_point(new_loc), false);
+                }
+
+                if !was_mapped
+                    && bbox.size.w > 0
+                    && bbox.size.h > 0
+                    && self
+                        .wm
+                        .get(id)
+                        .map(|w| w.is_visible_on(self.wm.active_workspace_id()))
+                        .unwrap_or(false)
+                {
+                    let serial = SERIAL_COUNTER.next_serial();
+                    self.focus_window(Some(&window), serial);
                 }
             }
         }

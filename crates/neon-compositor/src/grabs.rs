@@ -16,7 +16,10 @@ use smithay::{
     utils::{Logical, Point, Rectangle, Size},
 };
 
-use crate::{state::NeonState, window::window_id};
+use crate::{
+    state::NeonState,
+    window::{to_wm_point, window_id},
+};
 
 /// Interactive floating window move grab.
 pub struct MoveSurfaceGrab {
@@ -39,10 +42,8 @@ impl PointerGrab<NeonState> for MoveSurfaceGrab {
         let new_location = self.initial_window_location.to_f64() + delta;
         let rounded: Point<i32, Logical> = new_location.to_i32_round();
         data.space.map_element(self.window.clone(), rounded, true);
-        if let Some(id) = window_id(&self.window)
-            && let Some(record) = data.windows.get_mut(id)
-        {
-            record.location = rounded;
+        if let Some(id) = window_id(&self.window) {
+            data.wm.set_floating_location(id, to_wm_point(rounded));
         }
     }
 
@@ -255,10 +256,9 @@ impl PointerGrab<NeonState> for ResizeSurfaceGrab {
         if self.edges.intersects(ResizeEdge::LEFT | ResizeEdge::TOP) {
             data.space
                 .map_element(self.window.clone(), (new_x, new_y), true);
-            if let Some(id) = window_id(&self.window)
-                && let Some(record) = data.windows.get_mut(id)
-            {
-                record.location = (new_x, new_y).into();
+            if let Some(id) = window_id(&self.window) {
+                data.wm
+                    .set_floating_location(id, to_wm_point((new_x, new_y).into()));
             }
         }
 

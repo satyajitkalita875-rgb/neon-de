@@ -1,4 +1,4 @@
-//! Input routing, keyboard shortcut interception, click-to-focus, and pointer handling.
+//! Input routing, compositor shortcuts, focus policies, and interactive move/resize grabs.
 
 use smithay::{
     backend::input::{
@@ -6,7 +6,7 @@ use smithay::{
         KeyState, KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent,
     },
     input::{
-        keyboard::{FilterResult, keysyms},
+        keyboard::{FilterResult, Keysym, keysyms},
         pointer::{
             AxisFrame, ButtonEvent, Focus, GrabStartData as PointerGrabStartData, MotionEvent,
         },
@@ -19,6 +19,7 @@ use tracing::info;
 use crate::{
     grabs::{MoveSurfaceGrab, ResizeEdge, ResizeSurfaceGrab},
     state::NeonState,
+    window::{FocusPolicy, SnapRegion, window_id},
 };
 
 const BTN_LEFT: u32 = 0x110;
@@ -29,6 +30,17 @@ enum CompositorAction {
     SpawnTerminal,
     CloseFocused,
     CycleFocus,
+    ToggleMaximize,
+    UnmaximizeOrMinimize,
+    ToggleFullscreen,
+    MinimizeFocused,
+    RestoreLastMinimized,
+    Snap(SnapRegion),
+    SwitchWorkspaceNext,
+    SwitchWorkspacePrev,
+    SwitchWorkspaceIndex(usize),
+    MoveFocusedToNextWorkspace,
+    MoveFocusedToPrevWorkspace,
 }
 
 /// Processes a backend-agnostic Smithay [`InputEvent`] and routes it through NEON DE's seat.
@@ -67,21 +79,97 @@ fn handle_keyboard<B: InputBackend>(state: &mut NeonState, event: B::KeyboardKey
 
             let sym = handle.modified_sym();
 
-            if modifiers.ctrl && modifiers.alt && sym == keysyms::KEY_Escape.into() {
+            // Emergency / nested exit
+            if modifiers.ctrl && modifiers.alt && sym == Keysym::from(keysyms::KEY_Escape) {
                 return FilterResult::Intercept(CompositorAction::Quit);
             }
 
-            if modifiers.logo && sym == keysyms::KEY_Return.into() {
-                return FilterResult::Intercept(CompositorAction::SpawnTerminal);
+            // Dynamic workspace navigation: Ctrl+Alt+Left/Right or Super+Page_Up/Page_Down
+            if modifiers.ctrl && modifiers.alt && !modifiers.shift {
+                if sym == Keysym::from(keysyms::KEY_Right) {
+                    return FilterResult::Intercept(CompositorAction::SwitchWorkspaceNext);
+                }
+                if sym == Keysym::from(keysyms::KEY_Left) {
+                    return FilterResult::Intercept(CompositorAction::SwitchWorkspacePrev);
+                }
+            }
+            if modifiers.ctrl && modifiers.alt && modifiers.shift {
+                if sym == Keysym::from(keysyms::KEY_Right) {
+                    return FilterResult::Intercept(CompositorAction::MoveFocusedToNextWorkspace);
+                }
+                if sym == Keysym::from(keysyms::KEY_Left) {
+                    return FilterResult::Intercept(CompositorAction::MoveFocusedToPrevWorkspace);
+                }
             }
 
-            if (modifiers.logo || modifiers.alt)
-                && (sym == keysyms::KEY_q.into() || sym == keysyms::KEY_Q.into())
+            if modifiers.logo {
+                if modifiers.shift {
+                    if sym == Keysym::from(keysyms::KEY_Page_Down) {
+                        return FilterResult::Intercept(
+                            CompositorAction::MoveFocusedToNextWorkspace,
+                        );
+                    }
+                    if sym == Keysym::from(keysyms::KEY_Page_Up) {
+                        return FilterResult::Intercept(
+                            CompositorAction::MoveFocusedToPrevWorkspace,
+                        );
+                    }
+                    if sym == Keysym::from(keysyms::KEY_H) || sym == Keysym::from(keysyms::KEY_h) {
+                        return FilterResult::Intercept(CompositorAction::RestoreLastMinimized);
+                    }
+                } else {
+                    if sym == Keysym::from(keysyms::KEY_Return) {
+                        return FilterResult::Intercept(CompositorAction::SpawnTerminal);
+                    }
+                    if sym == Keysym::from(keysyms::KEY_q) || sym == Keysym::from(keysyms::KEY_Q) {
+                        return FilterResult::Intercept(CompositorAction::CloseFocused);
+                    }
+                    if sym == Keysym::from(keysyms::KEY_Page_Down) {
+                        return FilterResult::Intercept(CompositorAction::SwitchWorkspaceNext);
+                    }
+                    if sym == Keysym::from(keysyms::KEY_Page_Up) {
+                        return FilterResult::Intercept(CompositorAction::SwitchWorkspacePrev);
+                    }
+                    if sym == Keysym::from(keysyms::KEY_Left) {
+                        return FilterResult::Intercept(CompositorAction::Snap(
+                            SnapRegion::LeftHalf,
+                        ));
+                    }
+                    if sym == Keysym::from(keysyms::KEY_Right) {
+                        return FilterResult::Intercept(CompositorAction::Snap(
+                            SnapRegion::RightHalf,
+                        ));
+                    }
+                    if sym == Keysym::from(keysyms::KEY_Up) {
+                        return FilterResult::Intercept(CompositorAction::ToggleMaximize);
+                    }
+                    if sym == Keysym::from(keysyms::KEY_Down) {
+                        return FilterResult::Intercept(CompositorAction::UnmaximizeOrMinimize);
+                    }
+                    if sym == Keysym::from(keysyms::KEY_f)
+                        || sym == Keysym::from(keysyms::KEY_F)
+                        || sym == Keysym::from(keysyms::KEY_F11)
+                    {
+                        return FilterResult::Intercept(CompositorAction::ToggleFullscreen);
+                    }
+                    if sym == Keysym::from(keysyms::KEY_h) || sym == Keysym::from(keysyms::KEY_H) {
+                        return FilterResult::Intercept(CompositorAction::MinimizeFocused);
+                    }
+                    if let Some(ws_idx) = digit_keysym_to_workspace_index(sym) {
+                        return FilterResult::Intercept(CompositorAction::SwitchWorkspaceIndex(
+                            ws_idx,
+                        ));
+                    }
+                }
+            }
+
+            if modifiers.alt
+                && (sym == Keysym::from(keysyms::KEY_q) || sym == Keysym::from(keysyms::KEY_Q))
             {
                 return FilterResult::Intercept(CompositorAction::CloseFocused);
             }
 
-            if modifiers.alt && sym == keysyms::KEY_Tab.into() {
+            if modifiers.alt && sym == Keysym::from(keysyms::KEY_Tab) {
                 return FilterResult::Intercept(CompositorAction::CycleFocus);
             }
 
@@ -95,16 +183,40 @@ fn handle_keyboard<B: InputBackend>(state: &mut NeonState, event: B::KeyboardKey
                 info!("Ctrl+Alt+Escape pressed; exiting NEON DE nested session");
                 state.loop_signal.stop();
             }
-            CompositorAction::SpawnTerminal => {
-                state.spawn_terminal();
+            CompositorAction::SpawnTerminal => state.spawn_terminal(),
+            CompositorAction::CloseFocused => state.close_focused_window(),
+            CompositorAction::CycleFocus => state.cycle_focus(serial),
+            CompositorAction::ToggleMaximize => state.toggle_maximize_focused(),
+            CompositorAction::UnmaximizeOrMinimize => state.unmaximize_or_minimize_focused(serial),
+            CompositorAction::ToggleFullscreen => state.toggle_fullscreen_focused(),
+            CompositorAction::MinimizeFocused => state.minimize_focused(serial),
+            CompositorAction::RestoreLastMinimized => state.restore_last_minimized(serial),
+            CompositorAction::Snap(region) => state.snap_focused(region),
+            CompositorAction::SwitchWorkspaceNext => {
+                state.switch_workspace_next(serial);
             }
-            CompositorAction::CloseFocused => {
-                state.close_focused_window();
+            CompositorAction::SwitchWorkspacePrev => {
+                state.switch_workspace_prev(serial);
             }
-            CompositorAction::CycleFocus => {
-                state.cycle_focus(serial);
+            CompositorAction::SwitchWorkspaceIndex(index) => {
+                state.switch_workspace_index(index, serial);
+            }
+            CompositorAction::MoveFocusedToNextWorkspace => {
+                state.move_focused_to_next_workspace(true, serial);
+            }
+            CompositorAction::MoveFocusedToPrevWorkspace => {
+                state.move_focused_to_prev_workspace(true, serial);
             }
         }
+    }
+}
+
+fn digit_keysym_to_workspace_index(sym: Keysym) -> Option<usize> {
+    let raw = sym.raw();
+    if (keysyms::KEY_1..=keysyms::KEY_9).contains(&raw) {
+        Some((raw - keysyms::KEY_1) as usize)
+    } else {
+        None
     }
 }
 
@@ -119,6 +231,14 @@ fn handle_pointer_motion_absolute<B: InputBackend>(
 
     let serial = SERIAL_COUNTER.next_serial();
     let under = state.surface_under(pos);
+
+    // Optional FocusFollowsMouse policy (ClickToFocus remains default).
+    if state.wm.focus_policy() == FocusPolicy::FocusFollowsMouse
+        && let Some((window, _)) = state.window_under(pos)
+        && window_id(&window) != state.wm.focused_id()
+    {
+        state.focus_window_with_raise(Some(&window), serial, false);
+    }
 
     if let Some(pointer) = state.seat.get_pointer() {
         pointer.motion(
@@ -151,12 +271,21 @@ fn handle_pointer_button<B: InputBackend>(state: &mut NeonState, event: B::Point
             .map(|kbd| kbd.modifier_state().alt)
             .unwrap_or(false);
 
-        if let Some((window, window_loc)) = state.window_under(pos) {
+        if let Some((window, mut window_loc)) = state.window_under(pos) {
             // Click-to-focus & raise
             state.focus_window(Some(&window), serial);
 
-            // Compositor-initiated Alt+Left move or Alt+Right resize
+            // Compositor-initiated Alt+Left move (auto-unmaximizes/unsnaps cleanly)
             if alt_held && button == BTN_LEFT {
+                if let Some(id) = window_id(&window) {
+                    let work_area = state.work_area();
+                    if let Some(update) = state.wm.set_floating(id, work_area) {
+                        state.apply_layout_update(&update);
+                        if let Some(loc) = state.space.element_location(&window) {
+                            window_loc = loc;
+                        }
+                    }
+                }
                 let start_data = PointerGrabStartData {
                     focus: state.surface_under(pos),
                     button,
@@ -172,6 +301,15 @@ fn handle_pointer_button<B: InputBackend>(state: &mut NeonState, event: B::Point
             }
 
             if alt_held && button == BTN_RIGHT {
+                if let Some(id) = window_id(&window) {
+                    let work_area = state.work_area();
+                    if let Some(update) = state.wm.set_floating(id, work_area) {
+                        state.apply_layout_update(&update);
+                        if let Some(loc) = state.space.element_location(&window) {
+                            window_loc = loc;
+                        }
+                    }
+                }
                 let initial_size = window.geometry().size;
                 if let Some(toplevel) = window.toplevel() {
                     toplevel.with_pending_state(|s| {

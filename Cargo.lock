@@ -907,12 +907,29 @@ dependencies = [
  "anyhow",
  "bitflags 2.13.2",
  "clap",
+ "neon-window-manager",
+ "neon-workspaces",
  "smithay",
  "tempfile",
  "tracing",
  "tracing-subscriber",
  "wayland-client",
  "wayland-protocols",
+]
+
+[[package]]
+name = "neon-window-manager"
+version = "0.1.0"
+dependencies = [
+ "neon-workspaces",
+ "tracing",
+]
+
+[[package]]
+name = "neon-workspaces"
+version = "0.1.0"
+dependencies = [
+ "tracing",
 ]
 
 [[package]]

@@ -1,0 +1,11 @@
+[package]
+name = "neon-window-manager"
+description = "Floating window manager, state machine, placement, snapping, and rules engine for NEON DE"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+neon-workspaces.workspace = true
+tracing.workspace = true

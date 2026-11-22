@@ -163,6 +163,7 @@ pub fn run_winit(config: WinitConfig) -> Result<()> {
                         None,
                     );
                     output_for_winit.set_preferred(mode);
+                    state.relayout_non_floating_windows();
                 }
                 WinitEvent::Input(input_event) => {
                     process_input_event(state, input_event);

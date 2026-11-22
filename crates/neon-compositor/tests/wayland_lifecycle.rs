@@ -1,8 +1,12 @@
 //! End-to-end Wayland protocol integration tests for `neon-compositor`.
 //!
 //! Spins up a real `NeonState` + `wayland-server::Display` on an isolated Unix socket pair
-//! and drives real `wayland-client` connections exercising `wl_compositor`, `wl_shm`,
-//! `xdg_wm_base`, `xdg_toplevel`, `wl_seat` (keyboard & pointer), and window lifecycle.
+//! and drives real `wayland-client` connections exercising:
+//! - Milestone 1: `wl_compositor`, `wl_shm`, `xdg_wm_base`, `xdg_toplevel`, `wl_seat`
+//!   (keyboard & pointer delivery), cascading placement, focus cycling, and destruction.
+//! - Milestone 2: Dynamic workspaces, workspace switching, moving windows between workspaces,
+//!   empty workspace pruning, minimize/restore, smart snapping, maximize/fullscreen state
+//!   machine, and window rules.
 
 use std::{
     io::Write,
@@ -16,7 +20,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use neon_compositor::state::NeonState;
+use neon_compositor::{
+    state::NeonState,
+    window::{SnapRegion, WindowMatcher, WindowMode, WindowRule, WindowRuleAction},
+};
 use smithay::{
     backend::input::{ButtonState, KeyState},
     input::{
@@ -48,6 +55,8 @@ struct TestClientState {
     keyboard: Option<wl_keyboard::WlKeyboard>,
     pointer: Option<wl_pointer::WlPointer>,
     configured: bool,
+    last_configure_size: (i32, i32),
+    last_configure_states: Vec<u32>,
     received_keymap: bool,
     received_keyboard_enter: bool,
     received_keys: Vec<u32>,
@@ -190,8 +199,22 @@ impl Dispatch<xdg_toplevel::XdgToplevel, ()> for TestClientState {
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        if let xdg_toplevel::Event::Close = event {
-            state.received_close = true;
+        match event {
+            xdg_toplevel::Event::Configure {
+                width,
+                height,
+                states,
+            } => {
+                state.last_configure_size = (width, height);
+                state.last_configure_states = states
+                    .chunks_exact(4)
+                    .map(|c| u32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect();
+            }
+            xdg_toplevel::Event::Close => {
+                state.received_close = true;
+            }
+            _ => {}
         }
     }
 }
@@ -345,7 +368,6 @@ fn client_window_create_commit_keyboard_and_destroy() {
 
         let _registry = conn.display().get_registry(&qh, ());
         queue.roundtrip(&mut cstate).unwrap();
-        // Second roundtrip to receive wl_seat capabilities & keyboard keymap
         queue.roundtrip(&mut cstate).unwrap();
 
         let compositor = cstate.compositor.clone().expect("wl_compositor advertised");
@@ -373,7 +395,6 @@ fn client_window_create_commit_keyboard_and_destroy() {
 
         client_mapped_clone.store(true, Ordering::SeqCst);
 
-        // Wait until server injects a key event and sends close request
         let deadline = Instant::now() + Duration::from_secs(5);
         while !allow_exit_clone.load(Ordering::SeqCst) && Instant::now() < deadline {
             queue.roundtrip(&mut cstate).unwrap();
@@ -381,7 +402,6 @@ fn client_window_create_commit_keyboard_and_destroy() {
         }
         queue.roundtrip(&mut cstate).unwrap();
 
-        // Destroy window cleanly
         toplevel.destroy();
         xdg_surface.destroy();
         buffer.destroy();
@@ -392,7 +412,6 @@ fn client_window_create_commit_keyboard_and_destroy() {
         cstate
     });
 
-    // Pump server until client maps its buffer
     let deadline = Instant::now() + Duration::from_secs(5);
     while !client_mapped.load(Ordering::SeqCst) && Instant::now() < deadline {
         pump_server(&mut display, &mut state);
@@ -400,24 +419,24 @@ fn client_window_create_commit_keyboard_and_destroy() {
     }
     pump_server(&mut display, &mut state);
 
-    assert_eq!(state.windows.len(), 1, "one window should be registered");
+    assert_eq!(state.wm.len(), 1, "one window should be registered");
     let focused_id = state
-        .windows
+        .wm
         .focused_id()
         .expect("newly mapped window must be focused");
-    let record = state.windows.get(focused_id).unwrap();
+    let record = state.wm.get(focused_id).unwrap();
     assert!(
         record.mapped,
         "window must be marked mapped after SHM commit"
     );
     assert_eq!(record.title.as_deref(), Some("NEON DE Test Terminal"));
     assert_eq!(record.app_id.as_deref(), Some("org.neonde.test-terminal"));
-    assert_eq!(record.size, (320, 200).into());
+    assert_eq!(record.current_geometry.size.w, 320);
+    assert_eq!(record.current_geometry.size.h, 200);
 
-    // Deliver a real pointer enter + left click inside the window bounds
     let click_pos: Point<f64, Logical> = (
-        f64::from(record.location.x) + 20.0,
-        f64::from(record.location.y) + 20.0,
+        f64::from(record.current_geometry.loc.x) + 20.0,
+        f64::from(record.current_geometry.loc.y) + 20.0,
     )
         .into();
     let under = state.surface_under(click_pos);
@@ -447,7 +466,6 @@ fn client_window_create_commit_keyboard_and_destroy() {
         pointer.frame(&mut state);
     }
 
-    // Deliver a real keyboard press (KEY_A -> evdev 30, XKB keycode 38) and close request
     if let Some(kbd) = state.seat.get_keyboard() {
         let serial = SERIAL_COUNTER.next_serial();
         kbd.input::<(), _>(
@@ -470,43 +488,20 @@ fn client_window_create_commit_keyboard_and_destroy() {
     }
 
     let cstate = client_handle.join().expect("client thread exited cleanly");
-    // Pump after client disconnect to confirm cleanup
     for _ in 0..5 {
         pump_server(&mut display, &mut state);
         thread::sleep(Duration::from_millis(5));
     }
 
-    assert!(cstate.received_keymap, "client must receive XKB keymap");
-    assert!(
-        cstate.received_keyboard_enter,
-        "focused client must receive wl_keyboard.enter"
-    );
-    assert!(
-        cstate.received_keys.contains(&30),
-        "client must receive forwarded key event (evdev 30)"
-    );
-    assert!(
-        cstate.received_pointer_enter,
-        "client must receive wl_pointer.enter"
-    );
-    assert!(
-        cstate.received_pointer_buttons.contains(&0x110),
-        "client must receive forwarded left pointer button (0x110)"
-    );
-    assert!(
-        cstate.received_close,
-        "client must receive xdg_toplevel.close"
-    );
-    assert!(
-        state.windows.is_empty(),
-        "window registry must be empty after destruction"
-    );
-    assert_eq!(
-        state.space.elements().count(),
-        0,
-        "desktop space must have no mapped windows after destruction"
-    );
-    assert_eq!(state.windows.focused_id(), None);
+    assert!(cstate.received_keymap);
+    assert!(cstate.received_keyboard_enter);
+    assert!(cstate.received_keys.contains(&30));
+    assert!(cstate.received_pointer_enter);
+    assert!(cstate.received_pointer_buttons.contains(&0x110));
+    assert!(cstate.received_close);
+    assert!(state.wm.is_empty());
+    assert_eq!(state.space.elements().count(), 0);
+    assert_eq!(state.wm.focused_id(), None);
 }
 
 #[test]
@@ -537,7 +532,6 @@ fn multiple_windows_cascade_focus_and_cycle() {
         let shm = cstate.shm.clone().unwrap();
         let wm_base = cstate.wm_base.clone().unwrap();
 
-        // Window 1
         let s1 = compositor.create_surface(&qh, ());
         let xs1 = wm_base.get_xdg_surface(&s1, &qh, ());
         let t1 = xs1.get_toplevel(&qh, ());
@@ -548,7 +542,6 @@ fn multiple_windows_cascade_focus_and_cycle() {
         s1.attach(Some(&b1), 0, 0);
         s1.commit();
 
-        // Window 2
         let s2 = compositor.create_surface(&qh, ());
         let xs2 = wm_base.get_xdg_surface(&s2, &qh, ());
         let t2 = xs2.get_toplevel(&qh, ());
@@ -568,7 +561,6 @@ fn multiple_windows_cascade_focus_and_cycle() {
             thread::sleep(Duration::from_millis(10));
         }
 
-        // Destroy Window 1 while Window 2 remains alive
         t1.destroy();
         xs1.destroy();
         b1.destroy();
@@ -597,33 +589,30 @@ fn multiple_windows_cascade_focus_and_cycle() {
     }
     pump_server(&mut display, &mut state);
 
-    assert_eq!(state.windows.len(), 2);
+    assert_eq!(state.wm.len(), 2);
 
-    // Collect both windows and verify distinct cascaded positions
     let ids: Vec<_> = state
         .space
         .elements()
         .filter_map(neon_compositor::window::window_id)
         .collect();
     assert_eq!(ids.len(), 2);
-    let loc0 = state.windows.get(ids[0]).unwrap().location;
-    let loc1 = state.windows.get(ids[1]).unwrap().location;
+    let loc0 = state.wm.get(ids[0]).unwrap().current_geometry.loc;
+    let loc1 = state.wm.get(ids[1]).unwrap().current_geometry.loc;
     assert_ne!(
         loc0, loc1,
         "floating windows must cascade to distinct locations"
     );
 
-    // Cycle focus from Window 2 -> Window 1
-    let before_cycle = state.windows.focused_id().unwrap();
+    let before_cycle = state.wm.focused_id().unwrap();
     state.cycle_focus(SERIAL_COUNTER.next_serial());
-    let after_cycle = state.windows.focused_id().unwrap();
-    assert_ne!(before_cycle, after_cycle, "Alt+Tab cycle must switch focus");
+    let after_cycle = state.wm.focused_id().unwrap();
+    assert_ne!(before_cycle, after_cycle);
     assert_eq!(
-        state.windows.get(after_cycle).unwrap().title.as_deref(),
+        state.wm.get(after_cycle).unwrap().title.as_deref(),
         Some("Window One")
     );
 
-    // Close focused Window 1 -> focus must automatically return to Window 2
     allow_close_first.store(true, Ordering::SeqCst);
     while !first_closed.load(Ordering::SeqCst) && Instant::now() < deadline {
         pump_server(&mut display, &mut state);
@@ -631,17 +620,13 @@ fn multiple_windows_cascade_focus_and_cycle() {
     }
     pump_server(&mut display, &mut state);
 
-    assert_eq!(state.windows.len(), 1);
-    let remaining_focus = state
-        .windows
-        .focused_id()
-        .expect("Window Two should gain focus");
+    assert_eq!(state.wm.len(), 1);
+    let remaining_focus = state.wm.focused_id().expect("Window Two should gain focus");
     assert_eq!(
-        state.windows.get(remaining_focus).unwrap().title.as_deref(),
+        state.wm.get(remaining_focus).unwrap().title.as_deref(),
         Some("Window Two")
     );
 
-    // Verify focused surface matches Window Two's WlSurface
     let kbd_focus = state
         .seat
         .get_keyboard()
@@ -660,5 +645,288 @@ fn multiple_windows_cascade_focus_and_cycle() {
         pump_server(&mut display, &mut state);
         thread::sleep(Duration::from_millis(5));
     }
-    assert!(state.windows.is_empty());
+    assert!(state.wm.is_empty());
+}
+
+#[test]
+fn workspace_switching_window_movement_and_dynamic_pruning() {
+    let (_event_loop, mut display, mut state) = create_headless_server();
+    let (server_sock, client_sock) = UnixStream::pair().unwrap();
+    state.insert_client(server_sock);
+
+    let both_mapped = Arc::new(AtomicBool::new(false));
+    let both_mapped_clone = Arc::clone(&both_mapped);
+    let allow_close_second = Arc::new(AtomicBool::new(false));
+    let allow_close_second_clone = Arc::clone(&allow_close_second);
+    let second_closed = Arc::new(AtomicBool::new(false));
+    let second_closed_clone = Arc::clone(&second_closed);
+    let allow_exit = Arc::new(AtomicBool::new(false));
+    let allow_exit_clone = Arc::clone(&allow_exit);
+
+    let client_handle = thread::spawn(move || {
+        let conn = Connection::from_socket(client_sock).unwrap();
+        let mut queue = conn.new_event_queue::<TestClientState>();
+        let qh = queue.handle();
+        let mut cstate = TestClientState::default();
+
+        let _registry = conn.display().get_registry(&qh, ());
+        queue.roundtrip(&mut cstate).unwrap();
+
+        let compositor = cstate.compositor.clone().unwrap();
+        let shm = cstate.shm.clone().unwrap();
+        let wm_base = cstate.wm_base.clone().unwrap();
+
+        let s1 = compositor.create_surface(&qh, ());
+        let xs1 = wm_base.get_xdg_surface(&s1, &qh, ());
+        let t1 = xs1.get_toplevel(&qh, ());
+        t1.set_title("Workspace 1 App".into());
+        s1.commit();
+        queue.roundtrip(&mut cstate).unwrap();
+        let (_f1, p1, b1) = create_shm_buffer(&shm, &qh, 400, 300);
+        s1.attach(Some(&b1), 0, 0);
+        s1.commit();
+
+        let s2 = compositor.create_surface(&qh, ());
+        let xs2 = wm_base.get_xdg_surface(&s2, &qh, ());
+        let t2 = xs2.get_toplevel(&qh, ());
+        t2.set_title("Workspace 2 App".into());
+        s2.commit();
+        queue.roundtrip(&mut cstate).unwrap();
+        let (_f2, p2, b2) = create_shm_buffer(&shm, &qh, 400, 300);
+        s2.attach(Some(&b2), 0, 0);
+        s2.commit();
+        queue.roundtrip(&mut cstate).unwrap();
+
+        both_mapped_clone.store(true, Ordering::SeqCst);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !allow_close_second_clone.load(Ordering::SeqCst) && Instant::now() < deadline {
+            queue.roundtrip(&mut cstate).unwrap();
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        t2.destroy();
+        xs2.destroy();
+        b2.destroy();
+        p2.destroy();
+        s2.destroy();
+        queue.roundtrip(&mut cstate).unwrap();
+        second_closed_clone.store(true, Ordering::SeqCst);
+
+        while !allow_exit_clone.load(Ordering::SeqCst) && Instant::now() < deadline {
+            queue.roundtrip(&mut cstate).unwrap();
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        t1.destroy();
+        xs1.destroy();
+        b1.destroy();
+        p1.destroy();
+        s1.destroy();
+        conn.flush().unwrap();
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !both_mapped.load(Ordering::SeqCst) && Instant::now() < deadline {
+        pump_server(&mut display, &mut state);
+        thread::sleep(Duration::from_millis(5));
+    }
+    pump_server(&mut display, &mut state);
+
+    // Initially: 2 windows on workspace 0, plus trailing empty workspace 1.
+    assert_eq!(state.wm.workspaces().len(), 2);
+    assert_eq!(state.space.elements().count(), 2);
+
+    // Move focused "Workspace 2 App" to next workspace and follow it -> creates workspace 2.
+    state
+        .move_focused_to_next_workspace(true, SERIAL_COUNTER.next_serial())
+        .expect("should move to workspace 1");
+    assert_eq!(state.wm.workspaces().len(), 3);
+    assert_eq!(state.wm.workspaces().active_index(), 1);
+    assert_eq!(
+        state.space.elements().count(),
+        1,
+        "only Workspace 2 App should be mapped in Space on workspace 1"
+    );
+    assert_eq!(
+        state.managed_windows.len(),
+        2,
+        "both windows remain managed across workspaces"
+    );
+
+    // Switch back to workspace 0 -> Workspace 1 App is mapped and focused.
+    state
+        .switch_workspace_prev(SERIAL_COUNTER.next_serial())
+        .expect("switch to ws 0");
+    assert_eq!(state.space.elements().count(), 1);
+    let focused_ws0 = state.wm.focused_id().unwrap();
+    assert_eq!(
+        state.wm.get(focused_ws0).unwrap().title.as_deref(),
+        Some("Workspace 1 App")
+    );
+
+    // Switch back to workspace 1, close Workspace 2 App, then switch back to workspace 0 ->
+    // empty workspace 1 is automatically pruned so only [ws0, trailing empty] remain!
+    state
+        .switch_workspace_next(SERIAL_COUNTER.next_serial())
+        .expect("switch to ws 1");
+    allow_close_second.store(true, Ordering::SeqCst);
+    while !second_closed.load(Ordering::SeqCst) && Instant::now() < deadline {
+        pump_server(&mut display, &mut state);
+        thread::sleep(Duration::from_millis(5));
+    }
+    pump_server(&mut display, &mut state);
+
+    state
+        .switch_workspace_prev(SERIAL_COUNTER.next_serial())
+        .expect("return to ws 0");
+    assert_eq!(
+        state.wm.workspaces().len(),
+        2,
+        "empty dynamic workspace must be pruned when left"
+    );
+    assert_eq!(state.space.elements().count(), 1);
+
+    allow_exit.store(true, Ordering::SeqCst);
+    while !client_handle.is_finished() && Instant::now() < deadline {
+        pump_server(&mut display, &mut state);
+        thread::sleep(Duration::from_millis(5));
+    }
+    client_handle.join().unwrap();
+}
+
+#[test]
+fn rules_snap_minimize_restore_and_fullscreen_state_machine() {
+    let (_event_loop, mut display, mut state) = create_headless_server();
+    // Register a window rule that opens `org.neonde.ruled-app` maximized.
+    state.wm.add_rule(WindowRule {
+        name: "start-maximized".into(),
+        matcher: WindowMatcher {
+            app_id_exact: Some("org.neonde.ruled-app".into()),
+            ..Default::default()
+        },
+        action: WindowRuleAction {
+            initial_mode: Some(WindowMode::Maximized),
+            ..Default::default()
+        },
+    });
+
+    let (server_sock, client_sock) = UnixStream::pair().unwrap();
+    state.insert_client(server_sock);
+
+    let mapped = Arc::new(AtomicBool::new(false));
+    let mapped_clone = Arc::clone(&mapped);
+    let allow_exit = Arc::new(AtomicBool::new(false));
+    let allow_exit_clone = Arc::clone(&allow_exit);
+
+    let client_handle = thread::spawn(move || {
+        let conn = Connection::from_socket(client_sock).unwrap();
+        let mut queue = conn.new_event_queue::<TestClientState>();
+        let qh = queue.handle();
+        let mut cstate = TestClientState::default();
+
+        let _registry = conn.display().get_registry(&qh, ());
+        queue.roundtrip(&mut cstate).unwrap();
+
+        let compositor = cstate.compositor.clone().unwrap();
+        let shm = cstate.shm.clone().unwrap();
+        let wm_base = cstate.wm_base.clone().unwrap();
+
+        let surface = compositor.create_surface(&qh, ());
+        let xdg_surface = wm_base.get_xdg_surface(&surface, &qh, ());
+        let toplevel = xdg_surface.get_toplevel(&qh, ());
+        toplevel.set_app_id("org.neonde.ruled-app".into());
+        surface.commit();
+
+        queue.roundtrip(&mut cstate).unwrap();
+        // Initial configure must reflect the Maximized rule (1280x800).
+        assert_eq!(cstate.last_configure_size, (1280, 800));
+        assert!(
+            cstate
+                .last_configure_states
+                .contains(&(xdg_toplevel::State::Maximized as u32))
+        );
+
+        let (_f, pool, buffer) = create_shm_buffer(&shm, &qh, 1280, 800);
+        surface.attach(Some(&buffer), 0, 0);
+        surface.commit();
+        queue.roundtrip(&mut cstate).unwrap();
+
+        mapped_clone.store(true, Ordering::SeqCst);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !allow_exit_clone.load(Ordering::SeqCst) && Instant::now() < deadline {
+            queue.roundtrip(&mut cstate).unwrap();
+            thread::sleep(Duration::from_millis(10));
+        }
+        queue.roundtrip(&mut cstate).unwrap();
+
+        toplevel.destroy();
+        xdg_surface.destroy();
+        buffer.destroy();
+        pool.destroy();
+        surface.destroy();
+        conn.flush().unwrap();
+        cstate
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !mapped.load(Ordering::SeqCst) && Instant::now() < deadline {
+        pump_server(&mut display, &mut state);
+        thread::sleep(Duration::from_millis(5));
+    }
+    pump_server(&mut display, &mut state);
+
+    let id = state.wm.focused_id().unwrap();
+    assert_eq!(state.wm.get(id).unwrap().mode, WindowMode::Maximized);
+
+    // Snap left half -> 640x800 at (0, 0)
+    state.snap_focused(SnapRegion::LeftHalf);
+    pump_server(&mut display, &mut state);
+    assert_eq!(
+        state.wm.get(id).unwrap().mode,
+        WindowMode::Snapped(SnapRegion::LeftHalf)
+    );
+    assert_eq!(state.wm.get(id).unwrap().current_geometry.size.w, 640);
+
+    // Minimize -> unmapped from Space and focus cleared
+    state.minimize_focused(SERIAL_COUNTER.next_serial());
+    pump_server(&mut display, &mut state);
+    assert!(state.wm.get(id).unwrap().mode.is_minimized());
+    assert_eq!(state.space.elements().count(), 0);
+    assert_eq!(state.wm.focused_id(), None);
+
+    // Restore -> remapped into Space back in Snapped(LeftHalf) and refocused
+    state.restore_last_minimized(SERIAL_COUNTER.next_serial());
+    pump_server(&mut display, &mut state);
+    assert_eq!(
+        state.wm.get(id).unwrap().mode,
+        WindowMode::Snapped(SnapRegion::LeftHalf)
+    );
+    assert_eq!(state.space.elements().count(), 1);
+    assert_eq!(state.wm.focused_id(), Some(id));
+
+    // Toggle fullscreen -> Fullscreen (never simultaneously Maximized!)
+    state.toggle_fullscreen_focused();
+    pump_server(&mut display, &mut state);
+    assert_eq!(state.wm.get(id).unwrap().mode, WindowMode::Fullscreen);
+
+    allow_exit.store(true, Ordering::SeqCst);
+    while !client_handle.is_finished() && Instant::now() < deadline {
+        pump_server(&mut display, &mut state);
+        thread::sleep(Duration::from_millis(5));
+    }
+    let cstate = client_handle.join().unwrap();
+    assert_eq!(cstate.last_configure_size, (1280, 800));
+    assert!(
+        cstate
+            .last_configure_states
+            .contains(&(xdg_toplevel::State::Fullscreen as u32))
+    );
+    assert!(
+        !cstate
+            .last_configure_states
+            .contains(&(xdg_toplevel::State::Maximized as u32)),
+        "Fullscreen and Maximized must never be active simultaneously"
+    );
 }

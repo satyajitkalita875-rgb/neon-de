@@ -2,7 +2,7 @@
 
 **NEON DE** is an independent, next-generation Linux desktop environment built in **Rust** with **Smithay** and **Wayland**.
 
-> **Project Status**: **Milestone 1 (Initial Compositor)** — Custom Wayland compositor running on a nested `winit` + OpenGL ES (`glow`) backend with XDG Shell client support, keyboard and mouse input, floating window management basics, and click-to-focus. Desktop shell, dynamic workspaces, effects engine, settings application, and DRM/KMS bare-metal session are planned for subsequent milestones.
+> **Project Status**: **Milestone 2 (Window Management & Dynamic Workspaces)** — Custom Smithay `0.7.0` Wayland compositor with extracted `neon-window-manager` and `neon-workspaces` crates: floating-first window management, exclusive window state machine (floating/snapped/maximized/fullscreen/minimized), GNOME-inspired dynamic workspaces, parent-child dialog centering, window rules, keyboard/pointer input, and nested `winit` + OpenGL ES rendering. Retained scene graph, effects/animations, GTK4 desktop shell, settings app, and DRM/KMS bare-metal session follow in Milestones 3–8.
 
 ## Vision
 

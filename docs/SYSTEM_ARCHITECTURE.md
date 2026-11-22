@@ -33,24 +33,28 @@ NEON SESSION (planned — Milestone 8)
 └── Linux System Services (PipeWire, NetworkManager, UPower, BlueZ, polkit, portals)
 ```
 
-## 3. Milestone 1 Internal Module Structure (`crates/neon-compositor`)
+## 3. Current Workspace Crate Structure (Milestone 2)
 
 ```text
-crates/neon-compositor/src/
-├── lib.rs            # Public library surface for binaries and integration tests
-├── main.rs           # CLI parsing, tracing setup, nested session bootstrap
-├── state.rs          # NeonState: Wayland global states, Space, Seat, WindowRegistry
-├── window.rs         # WindowId, ManagedWindow metadata, WindowRegistry, placement policy
-├── wayland/
-│   ├── mod.rs        # Smithay handler trait implementations & delegate_* macros
-│   ├── compositor.rs # wl_compositor, wl_subcompositor, BufferHandler, ShmHandler
-│   ├── xdg_shell.rs  # xdg_wm_base, xdg_surface, xdg_toplevel, xdg_popup, grabs
-│   └── seat.rs       # wl_seat, wl_data_device, SelectionHandler, OutputHandler
-├── input.rs          # Keyboard & pointer event dispatch, compositor keybindings, click-to-focus
-├── grabs.rs          # Interactive window move and resize pointer grabs
-└── backend/
-    ├── mod.rs        # Backend selection & shared rendering helpers
-    └── winit.rs      # Nested winit + GlesRenderer backend, frame loop, damage tracking
+crates/
+├── neon-workspaces/          # GNOME-inspired dynamic workspace manager (WorkspaceManager, WorkspaceId)
+├── neon-window-manager/      # WindowMode state machine, placement, snapping, focus policy, window rules
+└── neon-compositor/          # Custom Smithay 0.7.0 Wayland compositor binary & library
+    └── src/
+        ├── lib.rs            # Public library surface for binaries and integration tests
+        ├── main.rs           # CLI parsing, tracing setup, nested session bootstrap
+        ├── state.rs          # NeonState: Wayland global states, Space, Seat, WindowManager integration
+        ├── window.rs         # Bridge helpers between neon-window-manager & Smithay Window/Logical types
+        ├── wayland/
+        │   ├── mod.rs        # Smithay handler trait implementations & delegate_* macros
+        │   ├── compositor.rs # wl_compositor, wl_subcompositor, BufferHandler, ShmHandler
+        │   ├── xdg_shell.rs  # xdg_wm_base, xdg_surface, xdg_toplevel, xdg_popup, rules, state transitions
+        │   └── seat.rs       # wl_seat, wl_data_device, SelectionHandler, OutputHandler
+        ├── input.rs          # Keyboard/pointer dispatch, workspace & snap shortcuts, focus policies
+        ├── grabs.rs          # Interactive window move and resize pointer grabs
+        └── backend/
+            ├── mod.rs        # Backend selection & shared rendering helpers
+            └── winit.rs      # Nested winit + GlesRenderer backend, frame loop, damage tracking
 ```
 
 ## 4. Key Architectural Decisions & Trade-offs
