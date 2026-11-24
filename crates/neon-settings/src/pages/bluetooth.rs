@@ -1,5 +1,4 @@
-//! 5.9 Bluetooth settings: BlueZ D-Bus adapter power, discovery scan toggle,
-//! paired & nearby device management (Pair / Connect / Disconnect / Remove).
+//! Bluetooth settings: BlueZ adapter power, nearby discovery, and paired/nearby device management.
 
 use std::rc::Rc;
 
@@ -20,24 +19,15 @@ struct BtSnapshot {
 }
 
 pub fn build_page(ctrl: Rc<SettingsController>) -> ScrolledWindow {
-    let (scroller, page) = page_shell(
-        "Bluetooth",
-        "Control Bluetooth radio power, discover nearby peripherals, pair, connect, or remove devices via BlueZ.",
-        None,
-        &ctrl,
-    );
+    let (scroller, page) = page_shell();
 
-    let root = GtkBox::new(Orientation::Vertical, 4);
+    let root = GtkBox::new(Orientation::Vertical, 2);
     page.append(&root);
 
     let loading_card = boxed_card();
     let spin = Spinner::new();
     spin.start();
-    loading_card.append(&setting_row(
-        "Querying BlueZ Service…",
-        "Loading adapter status and paired devices from org.bluez.",
-        &spin,
-    ));
+    loading_card.append(&setting_row("Loading Bluetooth…", "", &spin));
     root.append(&loading_card);
 
     let ctrl_done = Rc::clone(&ctrl);
@@ -58,7 +48,7 @@ fn render_bluetooth(root: &GtkBox, ctrl: Rc<SettingsController>, snap: BtSnapsho
         root.remove(&child);
     }
 
-    root.append(&section_heading("Bluetooth Adapter"));
+    root.append(&section_heading("Adapter"));
     let adapter_card = boxed_card();
 
     let power_sw = Switch::new();
@@ -74,13 +64,13 @@ fn render_bluetooth(root: &GtkBox, ctrl: Rc<SettingsController>, snap: BtSnapsho
                 move |res| match res {
                     Ok(()) => {
                         ctrl_done.set_status_ok(if active {
-                            "Bluetooth powered on"
+                            "Bluetooth on"
                         } else {
-                            "Bluetooth powered off"
+                            "Bluetooth off"
                         });
                         ctrl_done.rebuild_page("bluetooth");
                     }
-                    Err(e) => ctrl_done.set_status_err(&format!("Bluetooth power failed: {e}")),
+                    Err(e) => ctrl_done.set_status_err(&format!("Bluetooth failed: {e}")),
                 },
             );
             glib::Propagation::Proceed
@@ -90,7 +80,7 @@ fn render_bluetooth(root: &GtkBox, ctrl: Rc<SettingsController>, snap: BtSnapsho
     let scan_btn = Button::with_label(if snap.status.discovering {
         "Stop Scanning"
     } else {
-        "Discover Nearby Devices"
+        "Scan"
     });
     scan_btn.add_css_class("settings-secondary-btn");
     scan_btn.set_sensitive(snap.status.available && snap.status.powered);
@@ -104,13 +94,13 @@ fn render_bluetooth(root: &GtkBox, ctrl: Rc<SettingsController>, snap: BtSnapsho
                 move |res| match res {
                     Ok(()) => {
                         ctrl_done.set_status_ok(if enable_disc {
-                            "Bluetooth discovery started — click Refresh after a few seconds"
+                            "Scanning for devices…"
                         } else {
-                            "Bluetooth discovery stopped"
+                            "Stopped scanning"
                         });
                         ctrl_done.rebuild_page("bluetooth");
                     }
-                    Err(e) => ctrl_done.set_status_err(&format!("Discovery toggle failed: {e}")),
+                    Err(e) => ctrl_done.set_status_err(&format!("Scan failed: {e}")),
                 },
             );
         });
@@ -123,7 +113,7 @@ fn render_bluetooth(root: &GtkBox, ctrl: Rc<SettingsController>, snap: BtSnapsho
         refresh_btn.connect_clicked(move |_| ctrl_c.rebuild_page("bluetooth"));
     }
 
-    let scan_controls = GtkBox::new(Orientation::Horizontal, 8);
+    let scan_controls = GtkBox::new(Orientation::Horizontal, 6);
     scan_controls.set_valign(Align::Center);
     scan_controls.append(&scan_btn);
     scan_controls.append(&refresh_btn);
@@ -132,22 +122,18 @@ fn render_bluetooth(root: &GtkBox, ctrl: Rc<SettingsController>, snap: BtSnapsho
         .status
         .adapter_alias
         .clone()
-        .unwrap_or_else(|| "No Bluetooth adapter detected".into());
+        .unwrap_or_else(|| "No Bluetooth adapter found".into());
 
     append_rows(
         &adapter_card,
         vec![
+            setting_row("Bluetooth", &adapter_name, &power_sw),
             setting_row(
-                "Bluetooth Power",
-                &format!("Adapter: {adapter_name}"),
-                &power_sw,
-            ),
-            setting_row(
-                "Device Discovery",
+                "Nearby Devices",
                 if snap.status.discovering {
-                    "Currently scanning for nearby Bluetooth devices…"
+                    "Discovering nearby peripherals…"
                 } else {
-                    "Scan for headphones, keyboards, mice, and speakers."
+                    "Search for headphones, keyboards, mice, and speakers."
                 },
                 &scan_controls,
             ),
@@ -155,26 +141,21 @@ fn render_bluetooth(root: &GtkBox, ctrl: Rc<SettingsController>, snap: BtSnapsho
     );
     root.append(&adapter_card);
 
-    // ── Devices List ─────────────────────────────────────────────────────────
-    root.append(&section_heading("Paired & Discovered Devices"));
+    root.append(&section_heading("Devices"));
     let dev_card = boxed_card();
 
     if !snap.status.available {
-        dev_card.append(&info_row(
-            "BlueZ Daemon Unavailable",
-            "Start bluetooth.service or attach a Bluetooth adapter to pair devices.",
-            "Offline",
-        ));
+        dev_card.append(&info_row("Bluetooth Unavailable", "BlueZ service is offline.", "Offline"));
     } else if snap.all_devices.is_empty() {
         dev_card.append(&info_row(
-            "No Bluetooth Devices Found",
-            "Enable Bluetooth and click Discover Nearby Devices to find peripherals.",
-            "0 devices",
+            "No Devices",
+            "Turn on Bluetooth and click Scan to discover devices.",
+            "—",
         ));
     } else {
         let mut rows = Vec::new();
         for dev in snap.all_devices.into_iter().take(20) {
-            let right = GtkBox::new(Orientation::Horizontal, 8);
+            let right = GtkBox::new(Orientation::Horizontal, 6);
             right.set_valign(Align::Center);
 
             if dev.connected {
@@ -190,7 +171,7 @@ fn render_bluetooth(root: &GtkBox, ctrl: Rc<SettingsController>, snap: BtSnapsho
                         move || bluetooth::set_device_connected(&p, false),
                         move |res| match res {
                             Ok(()) => {
-                                ctrl_done.set_status_ok("Disconnected Bluetooth device");
+                                ctrl_done.set_status_ok("Disconnected");
                                 ctrl_done.rebuild_page("bluetooth");
                             }
                             Err(e) => ctrl_done.set_status_err(&format!("Disconnect failed: {e}")),
@@ -206,12 +187,12 @@ fn render_bluetooth(root: &GtkBox, ctrl: Rc<SettingsController>, snap: BtSnapsho
                 conn_btn.connect_clicked(move |_| {
                     let ctrl_done = Rc::clone(&ctrl_c);
                     let p = path.clone();
-                    ctrl_c.set_status_info("Connecting Bluetooth device…");
+                    ctrl_c.set_status_info("Connecting…");
                     run_async(
                         move || bluetooth::set_device_connected(&p, true),
                         move |res| match res {
                             Ok(()) => {
-                                ctrl_done.set_status_ok("Connected Bluetooth device");
+                                ctrl_done.set_status_ok("Connected");
                                 ctrl_done.rebuild_page("bluetooth");
                             }
                             Err(e) => ctrl_done.set_status_err(&format!("Connect failed: {e}")),
@@ -219,7 +200,7 @@ fn render_bluetooth(root: &GtkBox, ctrl: Rc<SettingsController>, snap: BtSnapsho
                     );
                 });
 
-                let rem_btn = Button::with_label("Remove");
+                let rem_btn = Button::with_label("Forget");
                 rem_btn.add_css_class("settings-secondary-btn");
                 let ctrl_r = Rc::clone(&ctrl);
                 let path_r = dev.object_path.clone();
@@ -229,9 +210,9 @@ fn render_bluetooth(root: &GtkBox, ctrl: Rc<SettingsController>, snap: BtSnapsho
                     let p = path_r.clone();
                     confirm_action_dialog(
                         &ctrl_r.window,
-                        &format!("Remove {name_r}?"),
-                        "This unpairs the Bluetooth device from this computer.",
-                        "Remove",
+                        &format!("Forget {name_r}?"),
+                        "This removes the paired Bluetooth device.",
+                        "Forget",
                         true,
                         move || {
                             let ctrl_done = Rc::clone(&ctrl_inner);
@@ -239,7 +220,7 @@ fn render_bluetooth(root: &GtkBox, ctrl: Rc<SettingsController>, snap: BtSnapsho
                                 move || bluetooth::remove_device(&p),
                                 move |res| match res {
                                     Ok(()) => {
-                                        ctrl_done.set_status_ok("Removed Bluetooth device");
+                                        ctrl_done.set_status_ok("Removed device");
                                         ctrl_done.rebuild_page("bluetooth");
                                     }
                                     Err(e) => ctrl_done.set_status_err(&format!("Remove failed: {e}")),
@@ -258,12 +239,12 @@ fn render_bluetooth(root: &GtkBox, ctrl: Rc<SettingsController>, snap: BtSnapsho
                 pair_btn.connect_clicked(move |_| {
                     let ctrl_done = Rc::clone(&ctrl_c);
                     let p = path.clone();
-                    ctrl_c.set_status_info("Pairing Bluetooth device…");
+                    ctrl_c.set_status_info("Pairing…");
                     run_async(
                         move || bluetooth::pair_device(&p),
                         move |res| match res {
                             Ok(()) => {
-                                ctrl_done.set_status_ok("Paired Bluetooth device");
+                                ctrl_done.set_status_ok("Paired");
                                 ctrl_done.rebuild_page("bluetooth");
                             }
                             Err(e) => ctrl_done.set_status_err(&format!("Pairing failed: {e}")),
@@ -276,9 +257,9 @@ fn render_bluetooth(root: &GtkBox, ctrl: Rc<SettingsController>, snap: BtSnapsho
             let state_txt = if dev.connected {
                 "Connected"
             } else if dev.paired {
-                "Paired"
+                "Not Connected"
             } else {
-                "Nearby (Unpaired)"
+                "Nearby"
             };
             rows.push(setting_row(
                 &dev.name,

@@ -15,6 +15,7 @@ members = [
     "crates/neon-lockscreen",
     "crates/neon-settings",
     "crates/neon-session",
+    "crates/neon-mcp",
 ]
 
 [workspace.package]

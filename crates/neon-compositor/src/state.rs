@@ -200,6 +200,8 @@ pub struct NeonState {
     pub vt_switch_hook: Option<VtSwitchHook>,
     /// Queued native screenshot destination + optional `[x, y, w, h]` logical crop region.
     pub pending_screenshot: Option<(PathBuf, Option<[i32; 4]>)>,
+    /// Queued `zwlr_screencopy_frame_v1` frames awaiting GPU frame capture (OBS / portals / grim).
+    pub pending_screencopy_frames: Vec<crate::wayland::screencopy::PendingScreencopyFrame>,
     /// Signals `neon-shell` to open the GNOME-style interactive screenshot overlay.
     pub pending_screenshot_ui: bool,
     /// Signals `neon-shell` to open the OS-level right-click context menu at `(x, y)`.
@@ -235,6 +237,7 @@ impl NeonState {
         let output_manager_state = OutputManagerState::new_with_xdg_output::<Self>(&display_handle);
         let data_device_state = DataDeviceState::new::<Self>(&display_handle);
         let data_control_state = DataControlState::new::<Self, _>(&display_handle, None, |_| true);
+        crate::wayland::screencopy::register_screencopy_global(&display_handle);
 
         let mut seat_state = SeatState::new();
         let mut seat = seat_state.new_wl_seat(&display_handle, "neon-seat-0");
@@ -303,6 +306,7 @@ impl NeonState {
             last_frame_time_us: 0,
             vt_switch_hook: None,
             pending_screenshot: None,
+            pending_screencopy_frames: Vec::new(),
             pending_screenshot_ui: false,
             pending_context_menu: None,
         }

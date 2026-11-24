@@ -1,287 +1,265 @@
-//! Authentic macOS Sequoia × GNOME 47 Boxed-List GTK4 CSS Theme for `neon-settings`.
-//!
-//! Supports Neon Light and Neon Dark, NEON DE sidebar branding, circular accent color swatches,
-//! visual style preview cards, wallpaper thumbnail tiles, capability badges, search highlights,
-//! and clean hairline boxed lists.
+//! Authentic macOS System Settings GTK4 CSS theme for `neon-settings`.
+//! Features vibrant macOS traffic lights, colorful 20x20 rounded sidebar icon badges,
+//! calm neutral graphite action buttons, compact grouped cards, and zero-redundancy CSS caching.
 
-use gtk4::{CssProvider, STYLE_PROVIDER_PRIORITY_APPLICATION, gdk::Display};
+use std::cell::RefCell;
+
+use gtk4::{CssProvider, STYLE_PROVIDER_PRIORITY_APPLICATION, gdk};
 use neon_config::ThemeMode;
 
+/// Holds the active GTK4 CSS provider for live Light/Dark/Accent updates without redundant reloads.
 pub struct SettingsTheme {
     provider: CssProvider,
+    last_state: RefCell<Option<(ThemeMode, String)>>,
 }
 
 impl SettingsTheme {
-    pub fn init(mode: ThemeMode, accent: &str) -> Self {
+    pub fn install(theme: ThemeMode, accent: &str) -> Self {
         let provider = CssProvider::new();
-        apply_settings_icon_theme(mode);
-        provider.load_from_string(&build_css(mode, accent));
-        if let Some(display) = Display::default() {
+        let instance = Self {
+            provider,
+            last_state: RefCell::new(None),
+        };
+        instance.update(theme, accent);
+        if let Some(display) = gdk::Display::default() {
             gtk4::style_context_add_provider_for_display(
                 &display,
-                &provider,
+                &instance.provider,
                 STYLE_PROVIDER_PRIORITY_APPLICATION,
             );
         }
-        Self { provider }
+        instance
     }
 
-    pub fn update(&self, mode: ThemeMode, accent: &str) {
-        apply_settings_icon_theme(mode);
-        self.provider.load_from_string(&build_css(mode, accent));
-    }
-}
+    pub fn update(&self, theme: ThemeMode, accent: &str) {
+        let key = (theme, accent.to_string());
+        if self.last_state.borrow().as_ref() == Some(&key) {
+            return;
+        }
+        *self.last_state.borrow_mut() = Some(key);
 
-fn apply_settings_icon_theme(mode: ThemeMode) {
-    if let Some(settings) = gtk4::Settings::default() {
-        let light = mode == ThemeMode::NeonLight;
-        settings.set_gtk_icon_theme_name(Some(if light {
-            "WhiteSur-light"
-        } else {
-            "WhiteSur-dark"
-        }));
-        settings.set_gtk_application_prefer_dark_theme(!light);
+        let light = theme == ThemeMode::NeonLight;
+        if let Some(settings) = gtk4::Settings::default() {
+            settings.set_gtk_application_prefer_dark_theme(!light);
+        }
+        let css = build_css(light, accent);
+        self.provider.load_from_string(&css);
     }
 }
 
-fn build_css(mode: ThemeMode, accent: &str) -> String {
-    let light = mode == ThemeMode::NeonLight;
+fn build_css(light: bool, accent_hex: &str) -> String {
+    let accent = if accent_hex.starts_with('#') && accent_hex.len() == 7 {
+        accent_hex
+    } else {
+        "#0A84FF"
+    };
+
     let (
         win_bg,
         sidebar_bg,
         card_bg,
+        card_border,
+        row_sep,
+        sidebar_border,
         fg,
         muted,
-        border,
         row_hover,
-        _row_selected_bg,
+        search_bg,
+        btn_bg,
+        btn_hover,
+        btn_active,
+        btn_border,
+        btn_top_hl,
         seg_track,
         seg_active,
         trough_bg,
+        switch_off,
         card_shadow,
     ) = if light {
         (
-            "#FAFAFA",
-            "#F0F0F2",
+            "#F5F5F7",
+            "#EAEAEF",
             "#FFFFFF",
+            "rgba(0, 0, 0, 0.08)",
+            "rgba(0, 0, 0, 0.06)",
+            "rgba(0, 0, 0, 0.10)",
             "#1D1D1F",
             "#6E6E73",
-            "rgba(0, 0, 0, 0.08)",
-            "rgba(0, 0, 0, 0.04)",
-            "rgba(0, 0, 0, 0.09)",
+            "rgba(0, 0, 0, 0.05)",
             "rgba(0, 0, 0, 0.06)",
             "#FFFFFF",
-            "rgba(0, 0, 0, 0.12)",
-            "0 1px 2px rgba(0, 0, 0, 0.06)",
+            "#F0F0F3",
+            "#E5E5EA",
+            "rgba(0, 0, 0, 0.14)",
+            "rgba(255, 255, 255, 0.90)",
+            "rgba(0, 0, 0, 0.06)",
+            "#FFFFFF",
+            "rgba(0, 0, 0, 0.14)",
+            "rgba(0, 0, 0, 0.16)",
+            "0 1px 2px rgba(0, 0, 0, 0.04)",
         )
     } else {
         (
-            "#1C1C20",
-            "#242429",
-            "#2A2A30",
+            "#222225",
+            "#2B2B30",
+            "#2B2B2F",
+            "rgba(255, 255, 255, 0.075)",
+            "rgba(255, 255, 255, 0.06)",
+            "rgba(255, 255, 255, 0.09)",
             "#F5F5F7",
-            "#9A9AA3",
+            "#98989F",
+            "rgba(255, 255, 255, 0.06)",
             "rgba(255, 255, 255, 0.08)",
-            "rgba(255, 255, 255, 0.05)",
-            "rgba(255, 255, 255, 0.12)",
+            "#44444A",
+            "#505057",
+            "#3A3A40",
+            "rgba(255, 255, 255, 0.11)",
+            "rgba(255, 255, 255, 0.16)",
             "rgba(255, 255, 255, 0.07)",
-            "#3A3A44",
-            "rgba(255, 255, 255, 0.14)",
-            "0 1px 3px rgba(0, 0, 0, 0.28)",
+            "#48484F",
+            "rgba(255, 255, 255, 0.16)",
+            "rgba(255, 255, 255, 0.18)",
+            "0 1px 3px rgba(0, 0, 0, 0.18)",
         )
     };
 
     format!(
         r#"
-* {{
-    font-family: "Inter", "Adwaita Sans", "Cantarell", sans-serif;
-}}
-
 window.neon-settings-window {{
     background-color: {win_bg};
     color: {fg};
+    font-family: "Inter", "SF Pro Text", "Adwaita Sans", "Ubuntu", sans-serif;
+    font-size: 13px;
 }}
 
-/* ===================== SPLIT HEADERBAR (macOS x GNOME) ===================== */
-
-.settings-split-header {{
-    min-height: 48px;
-    background-color: {win_bg};
-}}
-
-.settings-sidebar-header {{
-    background-color: {sidebar_bg};
-    border-right: 1px solid {border};
-    padding: 0 10px;
-    min-height: 48px;
-}}
-
-.settings-content-header {{
-    background-color: {win_bg};
-    border-bottom: 1px solid {border};
-    padding: 0 14px;
-    min-height: 48px;
-}}
-
-.settings-header-title {{
-    font-size: 14px;
-    font-weight: 700;
-    color: {fg};
-}}
-
-button.settings-header-icon-btn,
-menubutton.settings-header-icon-btn > button {{
-    background-image: none;
-    background-color: transparent;
-    border: none;
-    box-shadow: none;
-    border-radius: 999px;
-    min-width: 30px;
-    min-height: 30px;
-    padding: 0;
-    color: {fg};
-    transition: background-color 140ms ease;
-}}
-
-button.settings-header-icon-btn:hover,
-menubutton.settings-header-icon-btn > button:hover {{
-    background-color: {row_hover};
-}}
-
-button.settings-header-icon-btn:disabled {{
-    opacity: 0.35;
-}}
-
-.macos-traffic-lights {{
-    margin-left: 4px;
-}}
-
-button.macos-tl-btn {{
-    background-image: none;
-    border-radius: 999px;
-    min-width: 13px;
-    min-height: 13px;
-    padding: 0;
-    margin: 0;
-    font-size: 9px;
-    font-weight: 800;
-    color: transparent;
-    box-shadow: inset 0 0 0 0.75px rgba(0, 0, 0, 0.22);
-    border: none;
-    transition: background-color 120ms ease, color 120ms ease;
-}}
-
-button.macos-tl-close {{ background-color: #FF5F57; }}
-button.macos-tl-min {{ background-color: #FEBC2E; }}
-button.macos-tl-max {{ background-color: #28C840; }}
-
-window:backdrop button.macos-tl-btn {{
-    background-color: rgba(135, 137, 145, 0.45);
-}}
-
-.macos-traffic-lights:hover button.macos-tl-close {{
-    background-color: #FF5F57;
-    color: rgba(77, 0, 0, 0.85);
-}}
-
-.macos-traffic-lights:hover button.macos-tl-min {{
-    background-color: #FEBC2E;
-    color: rgba(110, 62, 0, 0.85);
-}}
-
-.macos-traffic-lights:hover button.macos-tl-max {{
-    background-color: #28C840;
-    color: rgba(0, 72, 12, 0.85);
-}}
-
-/* ===================== SIDEBAR BRANDING & NAVIGATION ===================== */
+/* ===================== SIDEBAR (macOS System Settings) ===================== */
 
 .settings-sidebar {{
     background-color: {sidebar_bg};
-    border-right: 1px solid {border};
-    padding: 8px 10px 10px 10px;
+    border-right: 1px solid {sidebar_border};
+    padding: 0 10px 10px 10px;
 }}
 
-.neon-brand-card {{
-    padding: 6px 8px 10px 8px;
+.settings-sidebar-top {{
+    padding: 12px 6px 10px 6px;
 }}
 
-.neon-brand-emblem {{
-    background-image: linear-gradient(135deg, {accent} 0%, #6366F1 100%);
-    color: #FFFFFF;
-    border-radius: 9px;
-    min-width: 30px;
-    min-height: 30px;
-    font-size: 13px;
-    font-weight: 800;
-    box-shadow: 0 2px 8px alpha({accent}, 0.35);
-}}
-
-.neon-brand-title {{
-    font-size: 13px;
-    font-weight: 700;
-    color: {fg};
-}}
-
-.neon-brand-sub {{
-    font-size: 11px;
-    color: {muted};
-}}
-
-.settings-search {{
-    background-color: {card_bg};
-    color: {fg};
-    border: 1px solid {border};
-    border-radius: 10px;
-    padding: 3px 10px;
-    margin-bottom: 8px;
-}}
-
-list.settings-nav-list,
-list.settings-nav-list row {{
-    background-color: transparent;
+/* Crisp macOS traffic lights */
+button.mac-dot {{
     background-image: none;
+    border-radius: 999px;
+    min-width: 12px;
+    min-height: 12px;
+    padding: 0;
+    margin: 0;
+    border: 1px solid rgba(0, 0, 0, 0.22);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.25);
+}}
+
+button.mac-dot-close {{ background-color: #FF5F57; }}
+button.mac-dot-close:hover {{ background-color: #FF453A; }}
+button.mac-dot-min {{ background-color: #FEBC2E; }}
+button.mac-dot-min:hover {{ background-color: #FFB000; }}
+button.mac-dot-max {{ background-color: #28C840; }}
+button.mac-dot-max:hover {{ background-color: #20B838; }}
+
+window.neon-settings-window:backdrop button.mac-dot {{
+    background-color: alpha({muted}, 0.35);
+    border-color: transparent;
     box-shadow: none;
 }}
 
-list.settings-nav-list row.settings-nav-row {{
-    border-radius: 10px;
-    padding: 7px 10px;
+/* Compact macOS Sidebar Search */
+entry.settings-search,
+searchbar,
+searchentry.settings-search {{
+    background-color: {search_bg};
+    color: {fg};
+    border: 1px solid {card_border};
+    border-radius: 7px;
+    padding: 2px 8px;
+    min-height: 28px;
+    margin: 2px 2px 10px 2px;
+    font-size: 12.5px;
+    box-shadow: none;
+}}
+
+searchentry.settings-search:focus-within {{
+    border-color: alpha({accent}, 0.85);
+    box-shadow: 0 0 0 2px alpha({accent}, 0.24);
+}}
+
+.settings-nav-list {{
+    background-color: transparent;
+}}
+
+.settings-nav-row {{
+    border-radius: 6px;
+    padding: 5px 8px;
     margin: 1px 0;
     color: {fg};
     font-size: 13px;
     font-weight: 500;
-    transition: background-color 120ms ease;
+    min-height: 26px;
 }}
 
-list.settings-nav-list row.settings-nav-row:hover {{
+.settings-nav-row:hover {{
     background-color: {row_hover};
 }}
 
-list.settings-nav-list row.settings-nav-row:selected {{
-    background-color: alpha({accent}, 0.18);
-    color: {fg};
+.settings-nav-row:selected {{
+    background-color: #0A68D8;
+    color: #FFFFFF;
     font-weight: 600;
 }}
 
+.settings-nav-row:selected label {{
+    color: #FFFFFF;
+}}
+
+/* Colorful macOS 20x20 rounded-square sidebar icon badges */
+.nav-badge {{
+    border-radius: 5px;
+    min-width: 20px;
+    min-height: 20px;
+    color: #FFFFFF;
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.24), 0 1px 2px rgba(0, 0, 0, 0.18);
+}}
+
+.nav-badge image {{
+    color: #FFFFFF;
+    -gtk-icon-size: 12px;
+}}
+
+.nav-badge-blue   {{ background-color: #0A84FF; }}
+.nav-badge-indigo {{ background-color: #5E5CE6; }}
+.nav-badge-violet {{ background-color: #AF52DE; }}
+.nav-badge-sky    {{ background-color: #32ADE6; }}
+.nav-badge-teal   {{ background-color: #30B0C7; }}
+.nav-badge-pink   {{ background-color: #FF2D55; }}
+.nav-badge-green  {{ background-color: #30D158; }}
+.nav-badge-orange {{ background-color: #FF9F0A; }}
+.nav-badge-red    {{ background-color: #FF453A; }}
+.nav-badge-gray   {{ background-color: #636366; }}
+.nav-badge-slate  {{ background-color: #555760; }}
+
 .settings-sidebar-sep {{
-    background-color: {border};
+    background-color: {sidebar_border};
     min-height: 1px;
-    margin: 6px 8px;
+    margin: 6px 6px;
 }}
 
 button.settings-about-footer-btn {{
     background-image: none;
     background-color: transparent;
-    border: 1px solid transparent;
+    border: none;
     box-shadow: none;
-    border-radius: 10px;
-    padding: 8px 10px;
-    margin-top: 6px;
+    border-radius: 6px;
+    padding: 5px 8px;
+    margin-top: 2px;
     color: {fg};
     font-size: 13px;
-    font-weight: 600;
-    transition: background-color 120ms ease;
+    font-weight: 500;
 }}
 
 button.settings-about-footer-btn:hover {{
@@ -289,221 +267,213 @@ button.settings-about-footer-btn:hover {{
 }}
 
 button.settings-about-footer-btn.active {{
-    background-color: alpha({accent}, 0.18);
-    border-color: alpha({accent}, 0.35);
+    background-color: #0A68D8;
+    color: #FFFFFF;
+    font-weight: 600;
 }}
 
-/* ===================== PAGE HEADER, CLAMP & BOXED CARDS ===================== */
-
-.settings-content-clamp {{
-    padding: 18px 28px 32px 28px;
+button.settings-about-footer-btn.active label {{
+    color: #FFFFFF;
 }}
 
-.settings-page-title {{
-    font-size: 22px;
+/* ===================== CONTENT HEADER (< > Title) ===================== */
+
+.settings-content-header {{
+    background-color: {win_bg};
+    padding: 10px 18px 8px 14px;
+    min-height: 36px;
+}}
+
+button.nav-chevron-btn {{
+    background-image: none;
+    background-color: transparent;
+    color: {fg};
+    border: none;
+    box-shadow: none;
+    border-radius: 6px;
+    min-width: 26px;
+    min-height: 26px;
+    padding: 0;
+}}
+
+button.nav-chevron-btn:hover:not(:disabled) {{
+    background-color: {row_hover};
+}}
+
+button.nav-chevron-btn:disabled {{
+    opacity: 0.30;
+}}
+
+.settings-header-title {{
+    font-size: 14.5px;
     font-weight: 700;
     color: {fg};
+    margin-left: 6px;
 }}
 
-.settings-page-desc {{
-    font-size: 13px;
-    color: {muted};
-    margin-bottom: 10px;
+/* ===================== CONTENT CLAMP, SECTIONS & BOXED CARDS ===================== */
+
+.settings-content-clamp {{
+    padding: 6px 22px 24px 22px;
 }}
 
 .settings-section-title {{
-    font-size: 13px;
+    font-size: 12.5px;
     font-weight: 700;
     color: {fg};
     margin-top: 12px;
-    margin-bottom: 7px;
+    margin-bottom: 6px;
+    margin-left: 4px;
 }}
 
 .settings-card {{
     background-color: {card_bg};
-    border: 1px solid {border};
-    border-radius: 14px;
-    padding: 4px 0;
-    margin-bottom: 14px;
+    border: 1px solid {card_border};
+    border-radius: 10px;
+    padding: 2px 0;
+    margin-bottom: 10px;
     box-shadow: {card_shadow};
 }}
 
 .settings-row {{
-    padding: 11px 16px;
-}}
-
-.settings-row-highlighted {{
-    background-color: alpha({accent}, 0.14);
-    border-radius: 10px;
+    padding: 9px 14px;
+    min-height: 26px;
 }}
 
 .settings-row-sep {{
-    background-color: {border};
+    background-color: {row_sep};
     min-height: 1px;
-    margin: 0 16px;
+    margin: 0 14px;
 }}
 
 .settings-row-title {{
-    font-size: 14px;
+    font-size: 13px;
     font-weight: 500;
     color: {fg};
 }}
 
 .settings-row-desc {{
-    font-size: 12px;
+    font-size: 11.5px;
     color: {muted};
 }}
 
-/* ===================== CAPABILITY & STATUS BADGES ===================== */
+/* ===================== STATUS BADGES ===================== */
 
 .settings-badge {{
     background-color: {seg_track};
-    color: {fg};
+    color: {muted};
     border-radius: 999px;
-    padding: 3px 10px;
+    padding: 2px 9px;
     font-size: 11px;
     font-weight: 600;
 }}
 
 .settings-badge.ok {{
-    background-color: alpha(#10B981, 0.18);
-    color: #10B981;
+    background-color: alpha(#30D158, 0.16);
+    color: #30D158;
 }}
 
 .settings-badge.partial {{
-    background-color: alpha(#F59E0B, 0.18);
-    color: #F59E0B;
-}}
-
-.settings-badge.elevated {{
-    background-color: alpha(#38BDF8, 0.18);
-    color: #38BDF8;
+    background-color: alpha(#FF9F0A, 0.16);
+    color: #FF9F0A;
 }}
 
 .settings-badge.unavailable {{
-    background-color: alpha(#94A3B8, 0.18);
+    background-color: alpha(#98989F, 0.16);
     color: {muted};
 }}
 
-.settings-badge.unsupported {{
-    background-color: alpha(#EF4444, 0.14);
-    color: #F87171;
-}}
+/* ===================== NEUTRAL macOS BUTTONS (NO LOUD BLUE!) ===================== */
 
-/* ===================== GLOBAL SEARCH RESULTS ===================== */
-
-button.search-hit-btn {{
+button.settings-action-btn,
+button.settings-secondary-btn {{
     background-image: none;
-    background-color: transparent;
-    border: none;
-    box-shadow: none;
-    border-radius: 10px;
-    padding: 10px 14px;
+    background-color: {btn_bg};
     color: {fg};
+    border: 1px solid {btn_border};
+    border-top-color: {btn_top_hl};
+    border-radius: 6px;
+    padding: 4px 12px;
+    min-height: 24px;
+    font-size: 12.5px;
+    font-weight: 500;
+    box-shadow: 0 1px 1px rgba(0, 0, 0, 0.14);
 }}
 
-button.search-hit-btn:hover {{
-    background-color: {row_hover};
+button.settings-action-btn:hover,
+button.settings-secondary-btn:hover {{
+    background-color: {btn_hover};
 }}
 
-/* ===================== VISUAL STYLE CARDS ===================== */
+button.settings-action-btn:active,
+button.settings-secondary-btn:active {{
+    background-color: {btn_active};
+}}
 
-button.style-preview-btn {{
+button.settings-destructive-btn {{
     background-image: none;
-    background-color: transparent;
-    border: none;
+    background-color: alpha(#FF453A, 0.16);
+    color: #FF6961;
+    border: 1px solid alpha(#FF453A, 0.30);
+    border-radius: 6px;
+    padding: 4px 12px;
+    min-height: 24px;
+    font-size: 12.5px;
+    font-weight: 600;
     box-shadow: none;
-    padding: 4px;
-    border-radius: 14px;
 }}
 
-.style-preview-frame {{
-    border-radius: 12px;
-    min-width: 152px;
-    min-height: 98px;
-    border: 3px solid transparent;
-    padding: 10px;
-    transition: border-color 140ms ease;
+button.settings-destructive-btn:hover {{
+    background-color: #D93025;
+    color: #FFFFFF;
+    border-color: #D93025;
 }}
 
-button.style-preview-btn.active .style-preview-frame {{
-    border-color: {accent};
-}}
+/* ===================== SWITCHES, DROPDOWNS, SEGMENTED & SLIDERS ===================== */
 
-.style-preview-light-bg {{
-    background-image: linear-gradient(135deg, #3B82F6 0%, #60A5FA 45%, #1D4ED8 100%);
-}}
-
-.style-preview-dark-bg {{
-    background-image: linear-gradient(135deg, #0F172A 0%, #1E3A8A 50%, #172554 100%);
-}}
-
-.style-preview-auto-bg {{
-    background-image: linear-gradient(135deg, #60A5FA 0%, #3B82F6 48%, #0F172A 52%, #1E293B 100%);
-}}
-
-.style-mini-win-light {{
-    background-color: #FFFFFF;
-    border-radius: 7px;
-    min-width: 82px;
-    min-height: 52px;
-    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.26);
-}}
-
-.style-mini-win-dark {{
-    background-color: #1F2229;
-    border: 1px solid rgba(255, 255, 255, 0.12);
-    border-radius: 7px;
-    min-width: 82px;
-    min-height: 52px;
-    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.40);
-}}
-
-/* ===================== ACCENT SWATCHES & WALLPAPERS ===================== */
-
-button.accent-circle {{
-    background-image: none;
+switch {{
+    background-color: {switch_off};
+    border: 1px solid {card_border};
     border-radius: 999px;
-    min-width: 28px;
-    min-height: 28px;
-    padding: 0;
-    border: 2px solid transparent;
-    box-shadow: inset 0 1px 2px rgba(255, 255, 255, 0.25);
+    min-width: 38px;
+    min-height: 21px;
+    padding: 1px;
 }}
 
-button.accent-circle.active {{
-    border: 3px solid {fg};
+switch:checked {{
+    background-color: {accent};
+    border-color: transparent;
 }}
 
-button.accent-blue {{ background-color: #0A84FF; }}
-button.accent-cyan {{ background-color: #38BDF8; }}
-button.accent-violet {{ background-color: #8B5CF6; }}
-button.accent-emerald {{ background-color: #10B981; }}
-button.accent-amber {{ background-color: #F59E0B; }}
-button.accent-rose {{ background-color: #F43F5E; }}
-button.accent-pink {{ background-color: #EC4899; }}
+switch > slider {{
+    background-color: #FFFFFF;
+    border-radius: 999px;
+    min-width: 17px;
+    min-height: 17px;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.32);
+}}
 
-button.wp-thumb-btn {{
+dropdown > button {{
     background-image: none;
-    background-color: transparent;
-    border: 3px solid transparent;
-    box-shadow: none;
-    border-radius: 12px;
-    padding: 2px;
-    transition: border-color 140ms ease;
+    background-color: {btn_bg};
+    color: {fg};
+    border: 1px solid {btn_border};
+    border-radius: 6px;
+    padding: 3px 10px;
+    min-height: 24px;
+    font-size: 12.5px;
+    box-shadow: 0 1px 1px rgba(0, 0, 0, 0.12);
 }}
 
-button.wp-thumb-btn:hover {{ border-color: {border}; }}
-button.wp-thumb-btn.active {{ border-color: {accent}; }}
-
-.wp-thumb-pic {{ border-radius: 9px; }}
-
-/* ===================== BUTTONS, SEGMENTED CONTROLS & SLIDERS ===================== */
+dropdown > button:hover {{
+    background-color: {btn_hover};
+}}
 
 .settings-seg-track {{
     background-color: {seg_track};
-    border-radius: 10px;
-    padding: 3px;
+    border: 1px solid {card_border};
+    border-radius: 7px;
+    padding: 2px;
 }}
 
 button.settings-seg-btn {{
@@ -511,56 +481,24 @@ button.settings-seg-btn {{
     background-color: transparent;
     border: none;
     box-shadow: none;
-    border-radius: 8px;
-    padding: 6px 14px;
-    font-size: 13px;
-    font-weight: 600;
+    border-radius: 5px;
+    padding: 4px 11px;
+    font-size: 12px;
+    font-weight: 500;
     color: {muted};
 }}
 
 button.settings-seg-btn.active {{
     background-color: {seg_active};
     color: {fg};
-    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.15);
-}}
-
-button.settings-action-btn {{
-    background-image: none;
-    background-color: {accent};
-    color: #FFFFFF;
-    border: none;
-    border-radius: 10px;
-    padding: 7px 15px;
-    font-size: 13px;
     font-weight: 600;
-}}
-
-button.settings-secondary-btn {{
-    background-image: none;
-    background-color: {seg_track};
-    color: {fg};
-    border: 1px solid {border};
-    border-radius: 10px;
-    padding: 7px 14px;
-    font-size: 13px;
-    font-weight: 600;
-}}
-
-button.settings-destructive-btn {{
-    background-image: none;
-    background-color: #DC2626;
-    color: #FFFFFF;
-    border: none;
-    border-radius: 10px;
-    padding: 7px 15px;
-    font-size: 13px;
-    font-weight: 600;
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.18);
 }}
 
 scale.settings-scale trough {{
     background-color: {trough_bg};
     border-radius: 999px;
-    min-height: 6px;
+    min-height: 4px;
 }}
 
 scale.settings-scale highlight {{
@@ -569,72 +507,183 @@ scale.settings-scale highlight {{
 }}
 
 scale.settings-scale slider {{
-    background-color: #FFFFFF;
-    border: 1px solid rgba(0, 0, 0, 0.16);
+    background-color: #E5E5EA;
+    border: 1px solid rgba(0, 0, 0, 0.25);
     border-radius: 999px;
-    min-width: 18px;
-    min-height: 18px;
+    min-width: 15px;
+    min-height: 15px;
     margin: -6px 0;
-    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.25);
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.35);
 }}
 
-/* ===================== STATUS BAR & POPOVERS ===================== */
+scale.settings-scale value {{
+    font-size: 11.5px;
+    color: {muted};
+}}
+
+/* ===================== APPEARANCE PREVIEWS, ACCENTS & WALLPAPERS ===================== */
+
+button.style-preview-btn {{
+    background-image: none;
+    background-color: transparent;
+    border: none;
+    box-shadow: none;
+    padding: 4px;
+    border-radius: 10px;
+}}
+
+.style-preview-frame {{
+    border-radius: 9px;
+    min-width: 120px;
+    min-height: 74px;
+    border: 2.5px solid transparent;
+    padding: 8px;
+}}
+
+button.style-preview-btn.active .style-preview-frame {{
+    border-color: {accent};
+}}
+
+.style-preview-light-bg {{
+    background-image: linear-gradient(135deg, #60A5FA 0%, #3B82F6 50%, #2563EB 100%);
+}}
+
+.style-preview-dark-bg {{
+    background-image: linear-gradient(135deg, #1E1B4B 0%, #1E3A8A 55%, #0F172A 100%);
+}}
+
+.style-preview-auto-bg {{
+    background-image: linear-gradient(135deg, #60A5FA 0%, #3B82F6 49%, #1E293B 51%, #0F172A 100%);
+}}
+
+.style-mini-win-light {{
+    background-color: #FFFFFF;
+    border-radius: 5px;
+    min-width: 64px;
+    min-height: 40px;
+    box-shadow: 0 3px 8px rgba(0, 0, 0, 0.24);
+}}
+
+.style-mini-win-dark {{
+    background-color: #242428;
+    border: 1px solid rgba(255, 255, 255, 0.14);
+    border-radius: 5px;
+    min-width: 64px;
+    min-height: 40px;
+    box-shadow: 0 3px 8px rgba(0, 0, 0, 0.36);
+}}
+
+button.accent-circle {{
+    background-image: none;
+    border-radius: 999px;
+    min-width: 22px;
+    min-height: 22px;
+    padding: 0;
+    border: 2px solid transparent;
+    box-shadow: inset 0 1px 1px rgba(255, 255, 255, 0.25);
+}}
+
+button.accent-circle.active {{
+    border: 2.5px solid {fg};
+}}
+
+button.accent-blue    {{ background-color: #0A84FF; }}
+button.accent-cyan    {{ background-color: #38BDF8; }}
+button.accent-violet  {{ background-color: #AF52DE; }}
+button.accent-emerald {{ background-color: #30D158; }}
+button.accent-amber   {{ background-color: #FF9F0A; }}
+button.accent-rose    {{ background-color: #FF375F; }}
+button.accent-pink    {{ background-color: #EC4899; }}
+
+button.wp-thumb-btn {{
+    background-image: none;
+    background-color: {seg_track};
+    border: 2.5px solid transparent;
+    box-shadow: none;
+    border-radius: 9px;
+    padding: 2px;
+}}
+
+button.wp-thumb-btn:hover {{
+    border-color: {btn_border};
+}}
+
+button.wp-thumb-btn.active {{
+    border-color: {accent};
+}}
+
+.wp-thumb-pic {{
+    border-radius: 6px;
+}}
+
+.wp-placeholder {{
+    background-color: {seg_track};
+    border-radius: 6px;
+}}
+
+/* ===================== SEARCH HITS, KEYCAPS, MONITOR CANVAS & TOAST ===================== */
+
+button.search-hit-btn {{
+    background-image: none;
+    background-color: transparent;
+    border: none;
+    box-shadow: none;
+    border-radius: 8px;
+    padding: 8px 12px;
+    color: {fg};
+}}
+
+button.search-hit-btn:hover {{
+    background-color: {row_hover};
+}}
 
 .settings-status-bar {{
-    padding: 7px 16px;
-    border-top: 1px solid {border};
+    padding: 5px 14px;
+    border-top: 1px solid {card_border};
     background-color: {sidebar_bg};
-    font-size: 12px;
+    font-size: 11.5px;
     color: {muted};
 }}
 
 .settings-status-bar.status-ok {{
-    color: #10B981;
+    color: #30D158;
 }}
 
 .settings-status-bar.status-error {{
-    color: #EF4444;
+    color: #FF6961;
 }}
 
 popover > contents {{
     background-color: {card_bg};
     color: {fg};
-    border: 1px solid {border};
-    border-radius: 12px;
-    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.22);
-}}
-
-button.settings-menu-item {{
-    background-image: none;
-    background-color: transparent;
-    color: {fg};
-    border: none;
-    box-shadow: none;
-    border-radius: 8px;
-    padding: 7px 12px;
-    font-size: 13px;
-    font-weight: 500;
-}}
-
-button.settings-menu-item:hover {{
-    background-color: {row_hover};
+    border: 1px solid {card_border};
+    border-radius: 9px;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.28);
 }}
 
 .monitor-canvas {{
     background-color: {seg_track};
-    border: 1px solid {border};
-    border-radius: 12px;
+    border: 1px solid {card_border};
+    border-radius: 8px;
 }}
 
 .kbd-pill {{
-    background-color: {seg_track};
-    border: 1px solid {border};
-    border-radius: 7px;
-    padding: 3px 9px;
+    background-color: {btn_bg};
+    border: 1px solid {btn_border};
+    border-radius: 5px;
+    padding: 2px 8px;
     font-family: monospace;
-    font-size: 12px;
-    font-weight: 700;
+    font-size: 11.5px;
+    font-weight: 600;
     color: {fg};
+}}
+
+.neon-brand-emblem {{
+    background-image: linear-gradient(135deg, #0A84FF 0%, #5E5CE6 100%);
+    color: #FFFFFF;
+    border-radius: 11px;
+    font-size: 20px;
+    font-weight: 800;
 }}
 "#
     )

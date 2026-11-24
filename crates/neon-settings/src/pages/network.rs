@@ -1,6 +1,5 @@
-//! 5.8 Network settings: live NetworkManager D-Bus status, async Wi-Fi scanning,
-//! secure password dialog (passwords NEVER stored in plain-text config), saved profiles,
-//! Ethernet/VPN overview, IPv4/Gateway/DNS details, and Proxy/Hotspot status.
+//! Wi-Fi & Network settings: live NetworkManager status, async Wi-Fi scanning,
+//! secure password dialog, active IPv4/DNS details, and saved connections.
 
 use std::rc::Rc;
 
@@ -13,11 +12,10 @@ use neon_system::network::{
 };
 
 use crate::{
-    metadata::CapabilityStatus,
     state::SettingsController,
     ui::{
-        append_rows, boxed_card, capability_row, info_row, page_shell, run_async, section_heading,
-        setting_row, status_badge,
+        append_rows, boxed_card, info_row, page_shell, run_async, section_heading, setting_row,
+        status_badge,
     },
 };
 
@@ -29,54 +27,29 @@ struct NetworkSnapshotData {
 }
 
 pub fn build_page(ctrl: Rc<SettingsController>) -> ScrolledWindow {
-    let (scroller, page) = page_shell(
-        "Network",
-        "Manage Wi-Fi networks, Ethernet and VPN profiles, IP/DNS details, and NetworkManager settings.",
-        None,
-        &ctrl,
-    );
+    let (scroller, page) = page_shell();
 
-    let dynamic_root = GtkBox::new(Orientation::Vertical, 4);
+    let dynamic_root = GtkBox::new(Orientation::Vertical, 2);
     page.append(&dynamic_root);
 
-    let load_state = {
-        let ctrl_c = Rc::clone(&ctrl);
-        let root = dynamic_root.clone();
-        Rc::new(move |rescan: bool| {
-            while let Some(child) = root.first_child() {
-                root.remove(&child);
-            }
-            let loading_card = boxed_card();
-            let spin = Spinner::new();
-            spin.start();
-            loading_card.append(&setting_row(
-                if rescan {
-                    "Scanning Wi-Fi Networks…"
-                } else {
-                    "Querying NetworkManager…"
-                },
-                "Fetching live interfaces, access points, and IPv4 details off the UI thread.",
-                &spin,
-            ));
-            root.append(&loading_card);
+    let loading_card = boxed_card();
+    let spin = Spinner::new();
+    spin.start();
+    loading_card.append(&setting_row("Loading Network…", "", &spin));
+    dynamic_root.append(&loading_card);
 
-            let ctrl_done = Rc::clone(&ctrl_c);
-            let root_done = root.clone();
-            run_async(
-                move || NetworkSnapshotData {
-                    status: network::query_network_status(),
-                    aps: network::list_wifi_networks(rescan),
-                    saved: network::list_saved_connections(),
-                    details: network::query_network_details(),
-                },
-                move |data| {
-                    render_network_data(&root_done, Rc::clone(&ctrl_done), data);
-                },
-            );
-        })
-    };
+    let ctrl_done = Rc::clone(&ctrl);
+    let root_done = dynamic_root.clone();
+    run_async(
+        || NetworkSnapshotData {
+            status: network::query_network_status(),
+            aps: network::list_wifi_networks(false),
+            saved: network::list_saved_connections(),
+            details: network::query_network_details(),
+        },
+        move |data| render_network_data(&root_done, ctrl_done, data),
+    );
 
-    load_state(false);
     scroller
 }
 
@@ -85,8 +58,8 @@ fn render_network_data(root: &GtkBox, ctrl: Rc<SettingsController>, data: Networ
         root.remove(&child);
     }
 
-    // ── Radio & Status ───────────────────────────────────────────────────────
-    root.append(&section_heading("Wi-Fi & Connectivity"));
+    // ── Wi-Fi & Status ───────────────────────────────────────────────────────
+    root.append(&section_heading("Wi-Fi"));
     let radio_card = boxed_card();
 
     let wifi_sw = Switch::new();
@@ -102,9 +75,9 @@ fn render_network_data(root: &GtkBox, ctrl: Rc<SettingsController>, data: Networ
                 move |res| match res {
                     Ok(()) => {
                         ctrl_res.set_status_ok(if active {
-                            "Enabled Wi-Fi radio"
+                            "Wi-Fi enabled"
                         } else {
-                            "Disabled Wi-Fi radio"
+                            "Wi-Fi disabled"
                         });
                         ctrl_res.rebuild_page("network");
                     }
@@ -115,7 +88,7 @@ fn render_network_data(root: &GtkBox, ctrl: Rc<SettingsController>, data: Networ
         });
     }
 
-    let scan_btn = Button::with_label("Scan Wi-Fi");
+    let scan_btn = Button::with_label("Scan");
     scan_btn.add_css_class("settings-secondary-btn");
     scan_btn.set_sensitive(data.status.available && data.status.wifi_enabled);
     {
@@ -141,7 +114,7 @@ fn render_network_data(root: &GtkBox, ctrl: Rc<SettingsController>, data: Networ
     }
 
     let status_badge_w = if !data.status.available {
-        status_badge("NetworkManager Offline", "unavailable")
+        status_badge("Offline", "unavailable")
     } else if data.status.connectivity.is_connected() {
         status_badge(&data.status.panel_label(), "ok")
     } else {
@@ -151,34 +124,22 @@ fn render_network_data(root: &GtkBox, ctrl: Rc<SettingsController>, data: Networ
     append_rows(
         &radio_card,
         vec![
-            setting_row(
-                "NetworkManager Service",
-                "org.freedesktop.NetworkManager system D-Bus daemon.",
-                &status_badge_w,
-            ),
-            setting_row(
-                "Wi-Fi Radio",
-                "Enable or disable wireless networking hardware.",
-                &wifi_sw,
-            ),
-            setting_row(
-                "Available Access Points",
-                "Trigger an active wireless scan for nearby SSIDs.",
-                &scan_btn,
-            ),
+            setting_row("Status", "", &status_badge_w),
+            setting_row("Wi-Fi", "", &wifi_sw),
+            setting_row("Nearby Networks", "Refresh wireless access points.", &scan_btn),
         ],
     );
     root.append(&radio_card);
 
     // ── Available Wi-Fi Networks ─────────────────────────────────────────────
     if data.status.wifi_enabled {
-        root.append(&section_heading("Available Wi-Fi Networks"));
+        root.append(&section_heading("Available Networks"));
         let wifi_card = boxed_card();
         if data.aps.is_empty() {
             wifi_card.append(&info_row(
-                "No Wi-Fi Networks Visible",
-                "Click Scan Wi-Fi above to refresh nearby access points.",
-                "0 found",
+                "No Networks Found",
+                "Click Scan above to search for nearby Wi-Fi.",
+                "—",
             ));
         } else {
             let mut rows = Vec::new();
@@ -203,7 +164,7 @@ fn render_network_data(root: &GtkBox, ctrl: Rc<SettingsController>, data: Networ
                             move || network::set_connection_active(&s, false),
                             move |res| match res {
                                 Ok(()) => {
-                                    ctrl_done.set_status_ok("Disconnected Wi-Fi network");
+                                    ctrl_done.set_status_ok("Disconnected");
                                     ctrl_done.rebuild_page("network");
                                 }
                                 Err(e) => ctrl_done.set_status_err(&format!("Disconnect failed: {e}")),
@@ -241,7 +202,7 @@ fn render_network_data(root: &GtkBox, ctrl: Rc<SettingsController>, data: Networ
                 rows.push(setting_row(
                     &ap.ssid,
                     &format!(
-                        "{} • Security: {}",
+                        "{} • {}",
                         if ap.in_use { "Connected" } else { "Available" },
                         ap.security
                     ),
@@ -253,56 +214,44 @@ fn render_network_data(root: &GtkBox, ctrl: Rc<SettingsController>, data: Networ
         root.append(&wifi_card);
     }
 
-    // ── Active IPv4 / DNS / MAC Details ──────────────────────────────────────
-    root.append(&section_heading("Active Interfaces, IP & DNS"));
-    let details_card = boxed_card();
-    if data.details.is_empty() {
-        details_card.append(&info_row(
-            "No Active IPv4 Leases",
-            "Connect to Ethernet or Wi-Fi to inspect IP address, gateway, and DNS.",
-            "Offline",
-        ));
-    } else {
+    // ── Active IPv4 / DNS Details ────────────────────────────────────────────
+    if !data.details.is_empty() {
+        root.append(&section_heading("Active Interfaces"));
+        let details_card = boxed_card();
         let mut rows = Vec::new();
         for d in data.details {
             let dns_str = if d.dns_servers.is_empty() {
-                "Auto / DHCP".to_string()
+                "Auto".to_string()
             } else {
                 d.dns_servers.join(", ")
             };
             rows.push(info_row(
                 &format!("{}  ({})", d.device, d.ip4_address),
                 &format!(
-                    "Gateway: {} • DNS: {} • MAC: {}",
+                    "Gateway: {} • DNS: {}",
                     if d.gateway.is_empty() { "—" } else { &d.gateway },
-                    dns_str,
-                    if d.mac_address.is_empty() { "—" } else { &d.mac_address }
+                    dns_str
                 ),
                 "Active",
             ));
         }
         append_rows(&details_card, rows);
+        root.append(&details_card);
     }
-    root.append(&details_card);
 
-    // ── Saved Connections (Wi-Fi, Ethernet, VPN) ─────────────────────────────
-    root.append(&section_heading("Saved Connections (Ethernet, Wi-Fi & VPN)"));
-    let saved_card = boxed_card();
-    if data.saved.is_empty() {
-        saved_card.append(&info_row(
-            "No Saved Network Profiles",
-            "NetworkManager connection profiles will appear here.",
-            "—",
-        ));
-    } else {
+    // ── Saved Connections (hide loopback / internal profiles) ────────────────
+    let saved: Vec<SavedConnection> = data
+        .saved
+        .into_iter()
+        .filter(|c| c.conn_type != "loopback" && c.name != "lo")
+        .collect();
+    if !saved.is_empty() {
+        root.append(&section_heading("Saved Connections"));
+        let saved_card = boxed_card();
         let mut rows = Vec::new();
-        for conn in data.saved.into_iter().take(12) {
+        for conn in saved.into_iter().take(12) {
             let btn = Button::with_label(if conn.active { "Disconnect" } else { "Connect" });
-            btn.add_css_class(if conn.active {
-                "settings-secondary-btn"
-            } else {
-                "settings-action-btn"
-            });
+            btn.add_css_class("settings-secondary-btn");
             let ctrl_c = Rc::clone(&ctrl);
             let name = conn.name.clone();
             let target_up = !conn.active;
@@ -314,20 +263,20 @@ fn render_network_data(root: &GtkBox, ctrl: Rc<SettingsController>, data: Networ
                     move |res| match res {
                         Ok(()) => {
                             ctrl_done.set_status_ok(if target_up {
-                                "Activated connection"
+                                "Connected"
                             } else {
-                                "Deactivated connection"
+                                "Disconnected"
                             });
                             ctrl_done.rebuild_page("network");
                         }
-                        Err(e) => ctrl_done.set_status_err(&format!("Connection action failed: {e}")),
+                        Err(e) => ctrl_done.set_status_err(&format!("Action failed: {e}")),
                     },
                 );
             });
             rows.push(setting_row(
                 &conn.name,
                 &format!(
-                    "Type: {} • Device: {}",
+                    "{} • {}",
                     conn.conn_type,
                     if conn.active { &conn.device } else { "Inactive" }
                 ),
@@ -335,28 +284,8 @@ fn render_network_data(root: &GtkBox, ctrl: Rc<SettingsController>, data: Networ
             ));
         }
         append_rows(&saved_card, rows);
+        root.append(&saved_card);
     }
-    root.append(&saved_card);
-
-    // ── Proxy & Hotspot Capabilities ─────────────────────────────────────────
-    root.append(&section_heading("Advanced Networking"));
-    let adv_card = boxed_card();
-    append_rows(
-        &adv_card,
-        vec![
-            capability_row(
-                "System HTTP/SOCKS Proxy",
-                "Uses standard environment/gsettings proxy variables; manual GUI editor planned.",
-                CapabilityStatus::PartiallyImplemented,
-            ),
-            capability_row(
-                "Wi-Fi Hotspot Sharing",
-                "Requires AP-capable wireless hardware and NetworkManager shared mode.",
-                CapabilityStatus::PartiallyImplemented,
-            ),
-        ],
-    );
-    root.append(&adv_card);
 }
 
 fn open_wifi_password_dialog(ctrl: Rc<SettingsController>, ssid: String) {
@@ -365,7 +294,7 @@ fn open_wifi_password_dialog(ctrl: Rc<SettingsController>, ssid: String) {
         .modal(true)
         .resizable(false)
         .title(&format!("Connect to {ssid}"))
-        .default_width(390)
+        .default_width(370)
         .build();
     dialog.add_css_class("neon-settings-window");
 
@@ -376,7 +305,7 @@ fn open_wifi_password_dialog(ctrl: Rc<SettingsController>, ssid: String) {
     vbox.set_margin_end(20);
 
     let msg = Label::new(Some(&format!(
-        "Enter the Wi-Fi password for \"{ssid}\". Passwords are passed directly to NetworkManager and never saved in NEON DE config files."
+        "Enter the Wi-Fi password for \"{ssid}\"."
     )));
     msg.add_css_class("settings-row-desc");
     msg.set_halign(Align::Start);
@@ -385,7 +314,7 @@ fn open_wifi_password_dialog(ctrl: Rc<SettingsController>, ssid: String) {
     let pw_entry = PasswordEntry::new();
     pw_entry.set_show_peek_icon(true);
 
-    let actions = GtkBox::new(Orientation::Horizontal, 10);
+    let actions = GtkBox::new(Orientation::Horizontal, 8);
     actions.set_halign(Align::End);
     let cancel_btn = Button::with_label("Cancel");
     cancel_btn.add_css_class("settings-secondary-btn");
@@ -407,13 +336,15 @@ fn open_wifi_password_dialog(ctrl: Rc<SettingsController>, ssid: String) {
             let ctrl_done = Rc::clone(&ctrl_c);
             let ssid_run = ssid.clone();
             run_async(
-                move || network::connect_wifi(&ssid_run, if pw.is_empty() { None } else { Some(&pw) }),
+                move || {
+                    network::connect_wifi(&ssid_run, if pw.is_empty() { None } else { Some(&pw) })
+                },
                 move |res| match res {
                     Ok(()) => {
-                        ctrl_done.set_status_ok("Connected to Wi-Fi network");
+                        ctrl_done.set_status_ok("Connected to Wi-Fi");
                         ctrl_done.rebuild_page("network");
                     }
-                    Err(e) => ctrl_done.set_status_err(&format!("Wi-Fi connection failed: {e}")),
+                    Err(e) => ctrl_done.set_status_err(&format!("Connection failed: {e}")),
                 },
             );
         });

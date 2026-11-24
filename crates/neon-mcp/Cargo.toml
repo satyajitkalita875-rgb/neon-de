@@ -1,0 +1,26 @@
+[package]
+name = "neon-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Model Context Protocol (MCP) stdio control server for NEON DE"
+
+[[bin]]
+name = "neon-mcp"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
+neon-config = { workspace = true }
+neon-ipc = { workspace = true }
+neon-system = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

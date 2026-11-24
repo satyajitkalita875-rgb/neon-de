@@ -1693,6 +1693,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "neon-mcp"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "neon-config",
+ "neon-ipc",
+ "neon-system",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "neon-output"
 version = "0.1.0"
 dependencies = [

@@ -1,24 +1,25 @@
-//! 5.14 Applications & Default Apps: real XDG MIME default app handlers
-//! (Web Browser, Email, File Manager, Terminal, Media Player) via `xdg-mime`,
-//! searchable installed XDG applications list, and quick Add-to-Startup integration.
+//! Applications settings: Default Apps (XDG MIME), Login Items (XDG Autostart toggles),
+//! and searchable installed applications browser.
 
 use std::rc::Rc;
 
 use gtk4::{
     Align, Box as GtkBox, Button, DropDown, Orientation, ScrolledWindow, SearchEntry, Spinner,
-    StringList, prelude::*,
+    StringList, Switch, glib, prelude::*,
 };
-use neon_system::apps::{self, InstalledApp};
+use neon_system::apps::{self, AutostartEntry, InstalledApp};
 
 use crate::{
     state::SettingsController,
     ui::{
-        append_rows, boxed_card, page_shell, run_async, section_heading, setting_row, status_badge,
+        append_rows, boxed_card, info_row, page_shell, run_async, section_heading, setting_row,
+        status_badge,
     },
 };
 
 struct AppsData {
     installed: Vec<InstalledApp>,
+    autostart: Vec<AutostartEntry>,
     default_browser: Option<String>,
     default_mail: Option<String>,
     default_files: Option<String>,
@@ -27,24 +28,15 @@ struct AppsData {
 }
 
 pub fn build_page(ctrl: Rc<SettingsController>) -> ScrolledWindow {
-    let (scroller, page) = page_shell(
-        "Applications & Default Apps",
-        "Set system-wide XDG MIME default applications and inspect installed desktop apps.",
-        None,
-        &ctrl,
-    );
+    let (scroller, page) = page_shell();
 
-    let root = GtkBox::new(Orientation::Vertical, 4);
+    let root = GtkBox::new(Orientation::Vertical, 2);
     page.append(&root);
 
     let load_card = boxed_card();
     let spin = Spinner::new();
     spin.start();
-    load_card.append(&setting_row(
-        "Scanning XDG Desktop Entries…",
-        "Discovering installed applications and default MIME handlers.",
-        &spin,
-    ));
+    load_card.append(&setting_row("Loading Applications…", "", &spin));
     root.append(&load_card);
 
     let ctrl_done = Rc::clone(&ctrl);
@@ -52,6 +44,7 @@ pub fn build_page(ctrl: Rc<SettingsController>) -> ScrolledWindow {
     run_async(
         || AppsData {
             installed: apps::discover_installed_apps(),
+            autostart: apps::list_autostart_entries(),
             default_browser: apps::query_default_mime_app("x-scheme-handler/https"),
             default_mail: apps::query_default_mime_app("x-scheme-handler/mailto"),
             default_files: apps::query_default_mime_app("inode/directory"),
@@ -69,50 +62,45 @@ fn render_apps(root: &GtkBox, ctrl: Rc<SettingsController>, data: AppsData) {
         root.remove(&child);
     }
 
-    // ── Default Applications (XDG MIME) ──────────────────────────────────────
-    root.append(&section_heading("Default Applications (XDG MIME)"));
+    // ── Default Applications ─────────────────────────────────────────────────
+    root.append(&section_heading("Default Applications"));
     let def_card = boxed_card();
 
     let mut def_rows = Vec::new();
-    let mime_roles: &[(&str, &str, &[&str], &Option<String>, &[&str])] = &[
+    let mime_roles: &[(&str, &[&str], &Option<String>, &[&str])] = &[
         (
             "Web Browser",
-            "Handles http:// and https:// links.",
             &["x-scheme-handler/http", "x-scheme-handler/https", "text/html"],
             &data.default_browser,
             &["WebBrowser", "Network"],
         ),
         (
-            "Email Client",
-            "Handles mailto: links.",
+            "Email",
             &["x-scheme-handler/mailto"],
             &data.default_mail,
             &["Email", "Office"],
         ),
         (
             "File Manager",
-            "Opens folders and local directories (inode/directory).",
             &["inode/directory"],
             &data.default_files,
             &["FileManager", "System"],
         ),
         (
-            "Terminal Emulator",
-            "Default terminal handler for x-scheme-handler/terminal.",
+            "Terminal",
             &["x-scheme-handler/terminal"],
             &data.default_terminal,
             &["TerminalEmulator"],
         ),
         (
             "Media Player",
-            "Default player for video/mp4 and audio/mpeg files.",
             &["video/mp4", "video/x-matroska", "audio/mpeg"],
             &data.default_media,
             &["AudioVideo", "Player", "Video"],
         ),
     ];
 
-    for (title, subtitle, mimes, current_id, cat_hints) in mime_roles {
+    for (title, mimes, current_id, cat_hints) in mime_roles {
         let mut candidates: Vec<&InstalledApp> = data
             .installed
             .iter()
@@ -131,8 +119,8 @@ fn render_apps(root: &GtkBox, ctrl: Rc<SettingsController>, data: AppsData) {
         if candidates.is_empty() {
             def_rows.push(setting_row(
                 title,
-                subtitle,
-                &status_badge("No handler installed", "unavailable"),
+                "",
+                &status_badge("None installed", "unavailable"),
             ));
             continue;
         }
@@ -160,41 +148,77 @@ fn render_apps(root: &GtkBox, ctrl: Rc<SettingsController>, data: AppsData) {
                     move || apps::set_default_mime_app(&desktop_id, &m),
                     move |res| match res {
                         Ok(()) => ctrl_done.set_status_ok(&format!("Updated default {role}")),
-                        Err(e) => ctrl_done.set_status_err(&format!("Failed setting default: {e}")),
+                        Err(e) => ctrl_done.set_status_err(&format!("Failed: {e}")),
                     },
                 );
             }
         });
-        def_rows.push(setting_row(title, subtitle, &dd));
+        def_rows.push(setting_row(title, "", &dd));
     }
-
-    let autostart_nav_btn = Button::with_label("Manage Autostart Apps →");
-    autostart_nav_btn.add_css_class("settings-secondary-btn");
-    {
-        let ctrl_c = Rc::clone(&ctrl);
-        autostart_nav_btn.connect_clicked(move |_| ctrl_c.navigate_to("startup", None));
-    }
-    def_rows.push(setting_row(
-        "Startup Applications",
-        "Manage XDG autostart entries launched when signing into NEON DE.",
-        &autostart_nav_btn,
-    ));
 
     append_rows(&def_card, def_rows);
     root.append(&def_card);
 
-    // ── Installed Applications Browser ───────────────────────────────────────
+    // ── Open at Login (XDG Autostart) ────────────────────────────────────────
+    root.append(&section_heading(&format!(
+        "Open at Login ({})",
+        data.autostart.len()
+    )));
+    let auto_card = boxed_card();
+    if data.autostart.is_empty() {
+        auto_card.append(&info_row(
+            "No Login Items",
+            "Use Add to Login below on any installed application.",
+            "—",
+        ));
+    } else {
+        let mut rows = Vec::new();
+        for item in data.autostart.into_iter().take(20) {
+            let sw = Switch::new();
+            sw.set_active(item.enabled);
+            sw.set_valign(Align::Center);
+            let ctrl_c = Rc::clone(&ctrl);
+            let file_name = item.file_name.clone();
+            let app_name = item.name.clone();
+            sw.connect_state_set(move |_, active| {
+                let ctrl_done = Rc::clone(&ctrl_c);
+                let f = file_name.clone();
+                let n = app_name.clone();
+                run_async(
+                    move || apps::set_autostart_enabled(&f, active),
+                    move |res| match res {
+                        Ok(()) => ctrl_done.set_status_ok(&format!(
+                            "{} {n} at login",
+                            if active { "Enabled" } else { "Disabled" }
+                        )),
+                        Err(e) => ctrl_done.set_status_err(&format!("Autostart error: {e}")),
+                    },
+                );
+                glib::Propagation::Proceed
+            });
+            let sub = format!(
+                "{} • {}",
+                if item.user_owned { "User" } else { "System" },
+                item.exec
+            );
+            rows.push(setting_row(&item.name, &sub, &sw));
+        }
+        append_rows(&auto_card, rows);
+    }
+    root.append(&auto_card);
+
+    // ── Installed Applications ───────────────────────────────────────────────
     root.append(&section_heading(&format!(
         "Installed Applications ({})",
         data.installed.len()
     )));
 
     let search = SearchEntry::new();
-    search.set_placeholder_text(Some("Filter installed desktop applications…"));
-    search.set_margin_bottom(8);
+    search.add_css_class("settings-search");
+    search.set_placeholder_text(Some("Filter applications…"));
     root.append(&search);
 
-    let apps_box = GtkBox::new(Orientation::Vertical, 4);
+    let apps_box = GtkBox::new(Orientation::Vertical, 2);
     root.append(&apps_box);
 
     let installed_rc = Rc::new(data.installed);
@@ -218,37 +242,32 @@ fn render_apps(root: &GtkBox, ctrl: Rc<SettingsController>, data: AppsData) {
                             .as_deref()
                             .is_some_and(|c| c.to_ascii_lowercase().contains(&q))
                 })
-                .take(40)
+                .take(30)
                 .collect();
 
             if filtered.is_empty() {
-                card.append(&setting_row(
-                    "No Matching Applications",
-                    "Try a different application name or desktop ID.",
-                    &status_badge("0 matches", ""),
-                ));
+                card.append(&info_row("No Matching Applications", "", "0"));
             } else {
                 let mut rows = Vec::new();
                 for app in filtered {
-                    let add_btn = Button::with_label("Add to Startup");
+                    let add_btn = Button::with_label("Add to Login");
                     add_btn.add_css_class("settings-secondary-btn");
                     let ctrl_a = Rc::clone(&ctrl_c);
                     let app_clone = app.clone();
                     add_btn.connect_clicked(move |_| {
                         match apps::add_user_autostart(&app_clone) {
-                            Ok(()) => ctrl_a.set_status_ok(&format!(
-                                "Added {} to ~/.config/autostart",
-                                app_clone.name
-                            )),
+                            Ok(()) => {
+                                ctrl_a.set_status_ok(&format!("Added {} to Login Items", app_clone.name));
+                                ctrl_a.rebuild_page("applications");
+                            }
                             Err(e) => ctrl_a.set_status_err(&format!("Autostart error: {e}")),
                         }
                     });
-                    let sub = format!(
-                        "{} • {}",
-                        app.desktop_id,
-                        app.comment.as_deref().unwrap_or(&app.exec)
-                    );
-                    rows.push(setting_row(&app.name, &sub, &add_btn));
+                    let sub = app
+                        .comment
+                        .as_deref()
+                        .unwrap_or(&app.desktop_id);
+                    rows.push(setting_row(&app.name, sub, &add_btn));
                 }
                 append_rows(&card, rows);
             }

@@ -1,59 +1,56 @@
-//! 5.22 About NEON DE: identity header, version & build info, real hardware specs
-//! (OS, hostname, kernel, CPU, GPUs, memory, displays, uptime), live compositor diagnostics
-//! (`GetDiagnostics`), and Configuration Export / Import / Reset All Defaults.
+//! About NEON DE: async hardware overview, live compositor telemetry, and
+//! configuration Export / Import / Reset All Defaults.
 
 use std::rc::Rc;
 
-use gtk4::{Align, Box as GtkBox, Button, Label, Orientation, ScrolledWindow, gio, prelude::*};
+use gtk4::{Align, Box as GtkBox, Button, Label, Orientation, ScrolledWindow, Spinner, gio, prelude::*};
 use neon_config::{CURRENT_SCHEMA_VERSION, NeonConfig, load_or_default, save_atomic};
+use neon_ipc::{DiagnosticsInfo, OutputInfo};
 
 use crate::{
-    state::SettingsController,
-    system_info::collect_hardware_summary,
+    state::{SettingsController, fetch_diagnostics_sync, fetch_outputs_sync},
+    system_info::{HardwareSummary, collect_hardware_summary},
     ui::{
-        append_rows, boxed_card, confirm_action_dialog, info_row, page_shell, section_heading,
-        setting_row, status_badge,
+        append_rows, boxed_card, confirm_action_dialog, info_row, page_shell, run_async,
+        section_heading, setting_row, status_badge,
     },
 };
 
+struct AboutData {
+    hw: HardwareSummary,
+    outputs: Vec<OutputInfo>,
+    diag: Option<DiagnosticsInfo>,
+}
+
 pub fn build_page(ctrl: Rc<SettingsController>) -> ScrolledWindow {
-    let (scroller, page) = page_shell(
-        "About NEON DE",
-        "Desktop environment identity, real hardware overview, live Wayland compositor diagnostics, and configuration backup.",
-        None,
-        &ctrl,
-    );
+    let (scroller, page) = page_shell();
 
-    let hw = collect_hardware_summary();
-    let outputs = ctrl.fetch_outputs();
-    let diag = ctrl.fetch_diagnostics();
-
-    // ── NEON DE Identity Banner ──────────────────────────────────────────────
+    // Instant identity hero card
     let hero_card = boxed_card();
-    let hero = GtkBox::new(Orientation::Horizontal, 16);
-    hero.set_margin_top(16);
-    hero.set_margin_bottom(16);
-    hero.set_margin_start(18);
-    hero.set_margin_end(18);
+    let hero = GtkBox::new(Orientation::Horizontal, 14);
+    hero.set_margin_top(14);
+    hero.set_margin_bottom(14);
+    hero.set_margin_start(16);
+    hero.set_margin_end(16);
     hero.set_valign(Align::Center);
 
     let emblem = Label::new(Some("N"));
     emblem.add_css_class("neon-brand-emblem");
-    emblem.set_size_request(52, 52);
+    emblem.set_size_request(44, 44);
     emblem.set_halign(Align::Center);
     emblem.set_valign(Align::Center);
 
-    let hero_text = GtkBox::new(Orientation::Vertical, 3);
+    let hero_text = GtkBox::new(Orientation::Vertical, 2);
     hero_text.set_hexpand(true);
     let name_lbl = Label::new(Some(&format!(
         "NEON Desktop Environment {}",
         env!("CARGO_PKG_VERSION")
     )));
-    name_lbl.add_css_class("settings-section-title");
+    name_lbl.add_css_class("settings-row-title");
     name_lbl.set_halign(Align::Start);
 
     let sub_lbl = Label::new(Some(&format!(
-        "Wayland Compositor (Smithay 0.7) • GTK4 Shell & Settings • Config Schema v{CURRENT_SCHEMA_VERSION} • MIT OR Apache-2.0"
+        "Wayland Compositor (Smithay) • GTK4 Shell • Schema v{CURRENT_SCHEMA_VERSION}"
     )));
     sub_lbl.add_css_class("settings-row-desc");
     sub_lbl.set_halign(Align::Start);
@@ -66,21 +63,58 @@ pub fn build_page(ctrl: Rc<SettingsController>) -> ScrolledWindow {
     hero_card.append(&hero);
     page.append(&hero_card);
 
-    // ── Hardware & Operating System ──────────────────────────────────────────
-    page.append(&section_heading("Hardware & Operating System"));
+    let root = GtkBox::new(Orientation::Vertical, 2);
+    page.append(&root);
+
+    let load_card = boxed_card();
+    let spin = Spinner::new();
+    spin.start();
+    load_card.append(&setting_row("Loading System Details…", "", &spin));
+    root.append(&load_card);
+
+    let socket = ctrl.ipc_socket.clone();
+    let ctrl_done = Rc::clone(&ctrl);
+    let root_done = root.clone();
+    run_async(
+        move || AboutData {
+            hw: collect_hardware_summary(),
+            outputs: fetch_outputs_sync(&socket),
+            diag: fetch_diagnostics_sync(&socket),
+        },
+        move |data| render_about(&root_done, ctrl_done, data),
+    );
+
+    scroller
+}
+
+fn render_about(root: &GtkBox, ctrl: Rc<SettingsController>, data: AboutData) {
+    while let Some(child) = root.first_child() {
+        root.remove(&child);
+    }
+
+    // ── Hardware & OS ────────────────────────────────────────────────────────
+    root.append(&section_heading("Hardware"));
     let hw_card = boxed_card();
 
-    let gpu_text = if hw.gpu_models.is_empty() {
-        "Detected by DRM/KMS".to_string()
+    let gpu_text = if data.hw.gpu_models.is_empty() {
+        "DRM/KMS GPU".to_string()
     } else {
-        hw.gpu_models.join(" + ")
+        data.hw.gpu_models.join(" + ")
     };
-    let disp_summary = if outputs.is_empty() {
+    let disp_summary = if data.outputs.is_empty() {
         "Compositor offline".to_string()
     } else {
-        outputs
+        data.outputs
             .iter()
-            .map(|o| format!("{} ({}×{} @ {:.0}Hz)", o.name, o.width, o.height, o.refresh_mhz as f64 / 1000.0))
+            .map(|o| {
+                format!(
+                    "{} ({}×{} @ {:.0} Hz)",
+                    o.name,
+                    o.width,
+                    o.height,
+                    o.refresh_mhz as f64 / 1000.0
+                )
+            })
             .collect::<Vec<_>>()
             .join(", ")
     };
@@ -88,42 +122,46 @@ pub fn build_page(ctrl: Rc<SettingsController>) -> ScrolledWindow {
     append_rows(
         &hw_card,
         vec![
-            info_row("Operating System", "Host Linux distribution.", &hw.os_name),
-            info_row("Device Hostname", "Local machine hostname.", &hw.hostname),
-            info_row("Linux Kernel", "Active kernel release and architecture.", &format!("{} ({})", hw.kernel, hw.architecture)),
-            info_row("Processor (CPU)", "Detected from /proc/cpuinfo.", &hw.cpu_model),
-            info_row("Graphics (GPU)", "Detected PCI display controllers.", &gpu_text),
-            info_row("Memory (RAM)", "Used / total system memory from /proc/meminfo.", &hw.memory_gib),
-            info_row("Connected Displays", "Active outputs reported by neon-compositor.", &disp_summary),
-            info_row("System Uptime", "Time elapsed since boot.", &hw.uptime),
+            info_row("OS", "", &data.hw.os_name),
+            info_row("Hostname", "", &data.hw.hostname),
+            info_row(
+                "Kernel",
+                "",
+                &format!("{} ({})", data.hw.kernel, data.hw.architecture),
+            ),
+            info_row("Processor", "", &data.hw.cpu_model),
+            info_row("Graphics", "", &gpu_text),
+            info_row("Memory", "", &data.hw.memory_gib),
+            info_row("Displays", "", &disp_summary),
+            info_row("Uptime", "", &data.hw.uptime),
         ],
     );
-    page.append(&hw_card);
+    root.append(&hw_card);
 
-    // ── Live Compositor Diagnostics ──────────────────────────────────────────
-    page.append(&section_heading("Live Compositor Telemetry"));
+    // ── Live Compositor Telemetry ────────────────────────────────────────────
+    root.append(&section_heading("Compositor"));
     let diag_card = boxed_card();
 
-    if let Some(d) = diag {
+    if let Some(d) = data.diag {
         append_rows(
             &diag_card,
             vec![
                 setting_row(
-                    "Compositor Backend",
-                    &format!("Uptime: {}s • Safe Mode: {}", d.uptime_secs, if d.safe_mode { "Yes" } else { "No" }),
+                    "Backend",
+                    &format!("Uptime: {}s", d.uptime_secs),
                     &status_badge(&d.backend, "ok"),
                 ),
                 info_row(
-                    "Frame Timing & Idle Skips",
-                    "VBlank-synchronized DRM/EGL rendering telemetry.",
+                    "Frames",
+                    "",
                     &format!(
-                        "{} rendered • {} idle skipped • last frame {} µs",
-                        d.frames_rendered, d.idle_frames_skipped, d.last_frame_time_us
+                        "{} rendered • last {} µs",
+                        d.frames_rendered, d.last_frame_time_us
                     ),
                 ),
                 info_row(
-                    "Active Scene Counts",
-                    "Live toplevel windows, workspaces, and outputs.",
+                    "Session",
+                    "",
                     &format!(
                         "{} windows • {} workspaces • {} outputs",
                         d.window_count, d.workspace_count, d.output_count
@@ -134,17 +172,17 @@ pub fn build_page(ctrl: Rc<SettingsController>) -> ScrolledWindow {
     } else {
         diag_card.append(&setting_row(
             "Compositor IPC",
-            &format!("Socket: {}", ctrl.ipc_socket.display()),
+            "",
             &status_badge("Offline", "unavailable"),
         ));
     }
-    page.append(&diag_card);
+    root.append(&diag_card);
 
-    // ── Configuration Backup, Import & Full Reset ────────────────────────────
-    page.append(&section_heading("Configuration Backup & Recovery"));
+    // ── Configuration Backup & Reset ─────────────────────────────────────────
+    root.append(&section_heading("Configuration"));
     let cfg_card = boxed_card();
 
-    let export_btn = Button::with_label("Export Config…");
+    let export_btn = Button::with_label("Export…");
     export_btn.add_css_class("settings-secondary-btn");
     {
         let ctrl_c = Rc::clone(&ctrl);
@@ -162,7 +200,7 @@ pub fn build_page(ctrl: Rc<SettingsController>) -> ScrolledWindow {
                     let cfg = ctrl_inner.config.borrow().clone();
                     match save_atomic(&path, &cfg) {
                         Ok(()) => ctrl_inner.set_status_ok(&format!(
-                            "Exported configuration to {}",
+                            "Exported to {}",
                             path.display()
                         )),
                         Err(e) => ctrl_inner.set_status_err(&format!("Export failed: {e}")),
@@ -172,7 +210,7 @@ pub fn build_page(ctrl: Rc<SettingsController>) -> ScrolledWindow {
         });
     }
 
-    let import_btn = Button::with_label("Import Config…");
+    let import_btn = Button::with_label("Import…");
     import_btn.add_css_class("settings-secondary-btn");
     {
         let ctrl_c = Rc::clone(&ctrl);
@@ -188,22 +226,15 @@ pub fn build_page(ctrl: Rc<SettingsController>) -> ScrolledWindow {
                 {
                     let imported = load_or_default(&path);
                     *ctrl_inner.config.borrow_mut() = imported;
-                    let cfg = ctrl_inner.config.borrow().clone();
-                    if let Err(e) = save_atomic(&ctrl_inner.config_path, &cfg) {
-                        ctrl_inner.set_status_err(&format!("Import save failed: {e}"));
-                        return;
-                    }
+                    ctrl_inner.persist_silent();
                     ctrl_inner.push_full_config_live();
-                    ctrl_inner.set_status_ok(&format!(
-                        "Imported configuration from {} and applied live",
-                        path.display()
-                    ));
+                    ctrl_inner.set_status_ok("Imported configuration and applied live");
                 }
             });
         });
     }
 
-    let reset_all_btn = Button::with_label("Reset All Defaults");
+    let reset_all_btn = Button::with_label("Reset All…");
     reset_all_btn.add_css_class("settings-destructive-btn");
     {
         let ctrl_c = Rc::clone(&ctrl);
@@ -211,25 +242,21 @@ pub fn build_page(ctrl: Rc<SettingsController>) -> ScrolledWindow {
             let ctrl_inner = Rc::clone(&ctrl_c);
             confirm_action_dialog(
                 &ctrl_c.window,
-                "Reset All NEON DE Settings?",
-                "This restores every NEON DE desktop preference (Appearance, Dock, Windows, Effects, Shortcuts, and Input) back to factory defaults.",
-                "Reset Everything",
+                "Reset All Settings?",
+                "This restores every NEON DE desktop preference back to factory defaults.",
+                "Reset All",
                 true,
                 move || {
                     *ctrl_inner.config.borrow_mut() = NeonConfig::default();
-                    let cfg = ctrl_inner.config.borrow().clone();
-                    if let Err(e) = save_atomic(&ctrl_inner.config_path, &cfg) {
-                        ctrl_inner.set_status_err(&format!("Reset failed: {e}"));
-                        return;
-                    }
+                    ctrl_inner.persist_silent();
                     ctrl_inner.push_full_config_live();
-                    ctrl_inner.set_status_ok("Restored all NEON DE settings to factory defaults");
+                    ctrl_inner.set_status_ok("Restored factory defaults");
                 },
             );
         });
     }
 
-    let cfg_actions = GtkBox::new(Orientation::Horizontal, 8);
+    let cfg_actions = GtkBox::new(Orientation::Horizontal, 6);
     cfg_actions.set_valign(Align::Center);
     cfg_actions.append(&export_btn);
     cfg_actions.append(&import_btn);
@@ -238,19 +265,9 @@ pub fn build_page(ctrl: Rc<SettingsController>) -> ScrolledWindow {
     append_rows(
         &cfg_card,
         vec![
-            info_row(
-                "Configuration File",
-                "Atomic TOML storage with automatic corrupt-file backup.",
-                &ctrl.config_path.display().to_string(),
-            ),
-            setting_row(
-                "Backup, Restore & Factory Reset",
-                "Export your setup as TOML, import a backup, or restore defaults.",
-                &cfg_actions,
-            ),
+            info_row("Config File", "", &ctrl.config_path.display().to_string()),
+            setting_row("Backup & Reset", "", &cfg_actions),
         ],
     );
-    page.append(&cfg_card);
-
-    scroller
+    root.append(&cfg_card);
 }

@@ -17,9 +17,10 @@ use anyhow::{Context, Result, bail};
 use neon_ipc::default_socket_path;
 use neon_renderer::{
     BlurSettings, FALLBACK_CLEAR_COLOR, LOCK_CURTAIN_COLOR, NeonRenderElement, NeonRenderer,
-    screenshot::capture_output_to_png,
+    screenshot::{capture_output_rgba, capture_output_to_png},
 };
 use smithay::{
+    reexports::wayland_server::Resource,
     backend::{
         allocator::{
             Fourcc,
@@ -639,6 +640,92 @@ fn render_all_drm_outputs(rt: &mut DrmRuntime, state: &mut NeonState) {
         ) {
             Ok(()) => state.notify_screenshot_saved(shot_path),
             Err(err) => warn!(%err, "Failed to capture DRM screenshot"),
+        }
+    }
+
+    // Fulfill queued zwlr_screencopy_frame_v1 requests (OBS Studio / xdg-desktop-portal-wlr / grim).
+    if !state.pending_screencopy_frames.is_empty() {
+        let frames = std::mem::take(&mut state.pending_screencopy_frames);
+        let now_dur: Duration = now.into();
+        let or_popups: Vec<_> = state
+            .override_redirect_windows
+            .iter()
+            .filter_map(|w| {
+                let loc = state
+                    .space
+                    .element_location(w)
+                    .or_else(|| w.x11_surface().map(|s| s.geometry().loc))?;
+                Some((w, loc))
+            })
+            .collect();
+
+        for pending in frames {
+            if !pending.frame.is_alive() {
+                continue;
+            }
+            let target_crtc = crtcs
+                .iter()
+                .copied()
+                .find(|c| {
+                    rt.outputs
+                        .get(c)
+                        .is_some_and(|a| a.output.name() == pending.output_name)
+                })
+                .or_else(|| crtcs.first().copied());
+
+            let Some(crtc_h) = target_crtc else {
+                pending.frame.failed();
+                continue;
+            };
+            let Some(active) = rt.outputs.get_mut(&crtc_h) else {
+                pending.frame.failed();
+                continue;
+            };
+
+            let extra_top = if pending.overlay_cursor {
+                active
+                    .neon_renderer
+                    .sync_cursor_config(&cursor_theme, cursor_size);
+                let scale_f = active.output.current_scale().fractional_scale();
+                let output_origin = active.output.current_location();
+                active.neon_renderer.cursor_elements(
+                    &mut rt.renderer,
+                    pointer_loc,
+                    output_origin,
+                    scale_f,
+                    &state.cursor_status,
+                )
+            } else {
+                Vec::new()
+            };
+
+            let lock_surface = if is_locked {
+                state.lock_state.surface_for_output(&active.output.name())
+            } else {
+                None
+            };
+
+            if let Err(err) = capture_output_rgba(
+                &mut rt.renderer,
+                &mut active.neon_renderer,
+                &active.output,
+                &state.scene,
+                blur,
+                is_locked,
+                lock_surface,
+                &or_popups,
+                extra_top,
+                |id| state.managed_windows.get(&id),
+                |rgba, w, h| {
+                    crate::wayland::screencopy::complete_screencopy_frame(
+                        &pending, rgba, w, h, now_dur,
+                    );
+                    Ok(())
+                },
+            ) {
+                warn!(%err, "Failed to capture zwlr_screencopy_frame_v1 on DRM");
+                pending.frame.failed();
+            }
         }
     }
 

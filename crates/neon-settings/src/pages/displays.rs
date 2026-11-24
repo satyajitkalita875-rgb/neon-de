@@ -1,36 +1,62 @@
-//! 5.2 Displays settings: live monitor detection, spatial arrangement preview,
-//! fractional scaling, orientation, primary monitor, Night Light, HDR capability status,
-//! and mandatory 15-second confirmation countdown with automatic revert on timeout!
+//! Displays settings: async live monitor detection, spatial arrangement preview,
+//! real Display Brightness via systemd-logind, fractional scaling, rotation, primary
+//! display selection, and 15-second safe revert countdown.
 
 use std::rc::Rc;
 
 use gtk4::{
-    Align, Button, DrawingArea, DropDown, Label, ScrolledWindow, StringList, Switch, glib,
-    prelude::*,
+    Align, Box as GtkBox, Button, DrawingArea, DropDown, Orientation, Scale, ScrolledWindow,
+    Spinner, StringList, Switch, prelude::*,
 };
 use neon_ipc::{IpcRequest, OutputInfo};
+use neon_system::power;
 
 use crate::{
-    metadata::CapabilityStatus,
-    state::SettingsController,
+    state::{SettingsController, fetch_outputs_sync},
     ui::{
-        append_rows, boxed_card, capability_row, display_confirm_countdown_dialog, info_row,
-        page_shell, section_heading, setting_row, slider_row, status_badge, toggle_row,
+        append_rows, boxed_card, display_confirm_countdown_dialog, info_row, page_shell, run_async,
+        section_heading, setting_row, status_badge,
     },
 };
 
+struct DisplaysData {
+    outputs: Vec<OutputInfo>,
+    brightness: Option<u32>,
+}
+
 pub fn build_page(ctrl: Rc<SettingsController>) -> ScrolledWindow {
-    let (scroller, page) = page_shell(
-        "Displays",
-        "Inspect connected monitors, arrange scaling and orientation with automatic revert protection, and tune Night Light.",
-        Some("displays"),
-        &ctrl,
+    let (scroller, page) = page_shell();
+
+    let root = GtkBox::new(Orientation::Vertical, 2);
+    page.append(&root);
+
+    let load_card = boxed_card();
+    let spin = Spinner::new();
+    spin.start();
+    load_card.append(&setting_row("Detecting Displays…", "", &spin));
+    root.append(&load_card);
+
+    let socket = ctrl.ipc_socket.clone();
+    let ctrl_done = Rc::clone(&ctrl);
+    let root_done = root.clone();
+    run_async(
+        move || DisplaysData {
+            outputs: fetch_outputs_sync(&socket),
+            brightness: power::read_backlight_percent(),
+        },
+        move |data| render_displays(&root_done, ctrl_done, data),
     );
 
-    let outputs = ctrl.fetch_outputs();
+    scroller
+}
 
-    // ── Monitor Arrangement Preview ──────────────────────────────────────────
-    page.append(&section_heading("Monitor Arrangement"));
+fn render_displays(root: &GtkBox, ctrl: Rc<SettingsController>, data: DisplaysData) {
+    while let Some(child) = root.first_child() {
+        root.remove(&child);
+    }
+
+    // ── Arrangement Preview ──────────────────────────────────────────────────
+    root.append(&section_heading("Arrangement"));
     let layout_card = boxed_card();
 
     let refresh_btn = Button::with_label("Detect Displays");
@@ -39,37 +65,65 @@ pub fn build_page(ctrl: Rc<SettingsController>) -> ScrolledWindow {
         let ctrl_c = Rc::clone(&ctrl);
         refresh_btn.connect_clicked(move |_| {
             ctrl_c.rebuild_page("displays");
-            ctrl_c.set_status_info("Refreshed connected compositor outputs");
+            ctrl_c.set_status_info("Refreshed displays");
         });
     }
 
-    if outputs.is_empty() {
+    if data.outputs.is_empty() {
         layout_card.append(&setting_row(
-            "No Active Compositor Outputs Detected",
-            "Run neon-settings inside a live NEON DE session to query and configure DRM/KMS outputs.",
+            "No Active Displays Reported",
+            "Connect to a live NEON DE compositor session to configure outputs.",
             &refresh_btn,
         ));
     } else {
-        let canvas = build_arrangement_canvas(outputs.clone());
-        canvas.set_margin_top(12);
-        canvas.set_margin_bottom(8);
-        canvas.set_margin_start(16);
-        canvas.set_margin_end(16);
+        let canvas = build_arrangement_canvas(data.outputs.clone());
+        canvas.set_margin_top(10);
+        canvas.set_margin_bottom(6);
+        canvas.set_margin_start(14);
+        canvas.set_margin_end(14);
         layout_card.append(&canvas);
         layout_card.append(&setting_row(
-            &format!("{} Connected Monitor{}", outputs.len(), if outputs.len() == 1 { "" } else { "s" }),
-            "Logical positions and resolutions reported live by neon-compositor.",
+            &format!(
+                "{} Connected Display{}",
+                data.outputs.len(),
+                if data.outputs.len() == 1 { "" } else { "s" }
+            ),
+            "Live DRM/KMS outputs reported by neon-compositor.",
             &refresh_btn,
         ));
     }
-    page.append(&layout_card);
+    root.append(&layout_card);
 
-    // ── Per-Monitor Configuration ────────────────────────────────────────────
-    if !outputs.is_empty() {
-        page.append(&section_heading("Per-Monitor Configuration"));
+    // ── Display Brightness (Real logind backlight control) ───────────────────
+    if let Some(pct) = data.brightness {
+        root.append(&section_heading("Brightness"));
+        let br_card = boxed_card();
+        let scale = Scale::with_range(Orientation::Horizontal, 5.0, 100.0, 1.0);
+        scale.add_css_class("settings-scale");
+        scale.set_width_request(210);
+        scale.set_draw_value(true);
+        scale.set_digits(0);
+        scale.set_value(f64::from(pct.clamp(5, 100)));
+        scale.connect_value_changed(|s| {
+            let v = s.value().round() as u32;
+            std::thread::spawn(move || {
+                let _ = power::set_backlight_percent(v);
+            });
+        });
+        br_card.append(&setting_row(
+            "Display Brightness",
+            "Built-in backlight controlled via systemd-logind.",
+            &scale,
+        ));
+        root.append(&br_card);
     }
 
-    for out in &outputs {
+    // ── Per-Monitor Configuration ────────────────────────────────────────────
+    if !data.outputs.is_empty() {
+        root.append(&section_heading("Monitors"));
+    }
+
+    for out in &data.outputs {
         let card = boxed_card();
         let refresh_hz = out.refresh_mhz as f64 / 1000.0;
         let header_badge = if out.primary {
@@ -100,10 +154,10 @@ pub fn build_page(ctrl: Rc<SettingsController>) -> ScrolledWindow {
         let transforms = ["normal", "90", "180", "270"];
         let rot_dd = DropDown::new(
             Some(StringList::new(&[
-                "Landscape (0°)",
-                "Portrait (90°)",
-                "Landscape Flipped (180°)",
-                "Portrait Flipped (270°)",
+                "Standard (0°)",
+                "90°",
+                "180°",
+                "270°",
             ])),
             gtk4::Expression::NONE,
         );
@@ -119,7 +173,7 @@ pub fn build_page(ctrl: Rc<SettingsController>) -> ScrolledWindow {
         primary_sw.set_active(out.primary);
         primary_sw.set_valign(Align::Center);
 
-        let apply_btn = Button::with_label("Apply & Verify");
+        let apply_btn = Button::with_label("Apply Changes");
         apply_btn.add_css_class("settings-action-btn");
         {
             let ctrl_c = Rc::clone(&ctrl);
@@ -159,9 +213,7 @@ pub fn build_page(ctrl: Rc<SettingsController>) -> ScrolledWindow {
                             &ctrl_c.window,
                             15,
                             move || {
-                                ctrl_keep.set_status_ok(&format!(
-                                    "Confirmed display configuration for {name_keep}"
-                                ));
+                                ctrl_keep.set_status_ok(&format!("Saved display {name_keep}"));
                                 ctrl_keep.rebuild_page("displays");
                             },
                             move || {
@@ -174,10 +226,7 @@ pub fn build_page(ctrl: Rc<SettingsController>) -> ScrolledWindow {
                                     transform: Some(prev_for_revert.transform.clone()),
                                 };
                                 let _ = ctrl_rev.send_ipc(revert_req);
-                                ctrl_rev.set_status_info(&format!(
-                                    "Reverted {} to previous safe display settings",
-                                    prev_for_revert.name
-                                ));
+                                ctrl_rev.set_status_info("Reverted display settings");
                                 ctrl_rev.rebuild_page("displays");
                             },
                         );
@@ -201,123 +250,32 @@ pub fn build_page(ctrl: Rc<SettingsController>) -> ScrolledWindow {
                     &header_badge,
                 ),
                 info_row(
-                    "Active Mode & Refresh Rate",
-                    "Native DRM/KMS mode reported by the compositor.",
+                    "Resolution & Refresh Rate",
+                    "",
                     &format!("{}×{} ({:.2} Hz)", out.width, out.height, refresh_hz),
                 ),
-                setting_row(
-                    "Fractional Display Scaling",
-                    "Adjust UI scale for HiDPI clarity.",
-                    &scale_dd,
-                ),
-                setting_row(
-                    "Screen Orientation",
-                    "Rotate output transform.",
-                    &rot_dd,
-                ),
+                setting_row("Display Scaling", "", &scale_dd),
+                setting_row("Rotation", "", &rot_dd),
                 setting_row(
                     "Primary Display",
-                    "Shows the main top panel and floating dock.",
+                    "Shows the top bar and dock.",
                     &primary_sw,
                 ),
                 setting_row(
-                    "Apply Monitor Configuration",
-                    "Applies live with a 15-second confirmation countdown and automatic safe revert.",
+                    "Apply Configuration",
+                    "Includes 15-second automatic revert protection.",
                     &apply_btn,
                 ),
             ],
         );
-        page.append(&card);
+        root.append(&card);
     }
-
-    // ── Multi-Monitor & Color Controls ───────────────────────────────────────
-    page.append(&section_heading("Multi-Monitor & Night Light"));
-    let prefs_card = boxed_card();
-
-    let night_light = ctrl.config.borrow().displays.night_light_enabled;
-    let color_temp = f64::from(ctrl.config.borrow().displays.color_temperature_k);
-    let mirror = ctrl.config.borrow().displays.mirror_displays;
-    let per_mon_ws = ctrl.config.borrow().displays.per_monitor_workspaces;
-
-    append_rows(
-        &prefs_card,
-        vec![
-            toggle_row(
-                "Mirror Displays",
-                "Duplicate primary desktop across secondary displays when multiple monitors are attached.",
-                mirror,
-                {
-                    let ctrl_c = Rc::clone(&ctrl);
-                    move |active| {
-                        ctrl_c.config.borrow_mut().displays.mirror_displays = active;
-                        ctrl_c.persist_and_sync(None, "Updated display mirror preference");
-                    }
-                },
-            ),
-            toggle_row(
-                "Independent Workspaces per Monitor",
-                "Switch workspaces separately on each connected display.",
-                per_mon_ws,
-                {
-                    let ctrl_c = Rc::clone(&ctrl);
-                    move |active| {
-                        ctrl_c.config.borrow_mut().displays.per_monitor_workspaces = active;
-                        ctrl_c.config.borrow_mut().desktop.per_monitor_workspaces = active;
-                        ctrl_c.persist_and_sync(None, "Updated per-monitor workspace mode");
-                    }
-                },
-            ),
-            toggle_row(
-                "Night Light (Warm Color Shift)",
-                "Reduces blue light emission at night. Saved in config; live DRM gamma LUT hooks are in progress.",
-                night_light,
-                {
-                    let ctrl_c = Rc::clone(&ctrl);
-                    move |active| {
-                        ctrl_c.config.borrow_mut().displays.night_light_enabled = active;
-                        ctrl_c.persist_and_sync(None, "Updated Night Light preference");
-                    }
-                },
-            ),
-            slider_row(
-                "Color Temperature (K)",
-                "Lower Kelvin produces warmer amber tones (1700K–6500K).",
-                1700.0,
-                6500.0,
-                100.0,
-                color_temp,
-                0,
-                {
-                    let ctrl_c = Rc::clone(&ctrl);
-                    move |val| {
-                        ctrl_c.config.borrow_mut().displays.color_temperature_k = val.round() as u32;
-                        ctrl_c.persist_and_sync(
-                            None,
-                            &format!("Night Light temperature set to {:.0}K", val),
-                        );
-                    }
-                },
-            ),
-            capability_row(
-                "High Dynamic Range (HDR)",
-                "Requires Wayland color-management protocol and 10-bit DRM HDR metadata support.",
-                CapabilityStatus::Unsupported(
-                    "Not yet supported by neon-renderer (standard SDR 8-bit pipeline active).",
-                ),
-            ),
-        ],
-    );
-    page.append(&prefs_card);
-
-    // Unused import guard for glib/Label
-    let _ = (glib::Propagation::Proceed, Label::new(None));
-    scroller
 }
 
 fn build_arrangement_canvas(outputs: Vec<OutputInfo>) -> DrawingArea {
     let area = DrawingArea::new();
     area.add_css_class("monitor-canvas");
-    area.set_content_height(136);
+    area.set_content_height(116);
     area.set_hexpand(true);
 
     area.set_draw_func(move |_, cr, width, height| {
@@ -339,7 +297,7 @@ fn build_arrangement_canvas(outputs: Vec<OutputInfo>) -> DrawingArea {
 
         let span_x = (max_x - min_x).max(1.0);
         let span_y = (max_y - min_y).max(1.0);
-        let pad = 20.0;
+        let pad = 16.0;
         let scale = ((w - pad * 2.0) / span_x).min((h - pad * 2.0) / span_y);
         let offset_x = (w - span_x * scale) * 0.5;
         let offset_y = (h - span_y * scale) * 0.5;
@@ -351,28 +309,28 @@ fn build_arrangement_canvas(outputs: Vec<OutputInfo>) -> DrawingArea {
             let rh = (out.height as f64 * scale).max(32.0);
 
             if out.primary {
-                cr.set_source_rgba(0.22, 0.74, 0.97, 0.28);
+                cr.set_source_rgba(0.04, 0.52, 1.0, 0.24);
             } else {
-                cr.set_source_rgba(0.55, 0.58, 0.68, 0.25);
+                cr.set_source_rgba(0.55, 0.58, 0.68, 0.22);
             }
             cr.rectangle(rx, ry, rw, rh);
             let _ = cr.fill();
 
             if out.primary {
-                cr.set_source_rgba(0.22, 0.74, 0.97, 0.95);
+                cr.set_source_rgba(0.04, 0.52, 1.0, 0.90);
             } else {
-                cr.set_source_rgba(0.65, 0.68, 0.75, 0.75);
+                cr.set_source_rgba(0.65, 0.68, 0.75, 0.70);
             }
-            cr.set_line_width(2.0);
+            cr.set_line_width(1.5);
             cr.rectangle(rx, ry, rw, rh);
             let _ = cr.stroke();
 
-            cr.set_source_rgba(0.92, 0.94, 0.98, 0.95);
-            cr.set_font_size(11.5);
-            cr.move_to(rx + 8.0, ry + 18.0);
+            cr.set_source_rgba(0.95, 0.96, 0.98, 0.95);
+            cr.set_font_size(11.0);
+            cr.move_to(rx + 8.0, ry + 17.0);
             let _ = cr.show_text(&out.name);
-            cr.set_font_size(10.0);
-            cr.move_to(rx + 8.0, ry + 33.0);
+            cr.set_font_size(9.5);
+            cr.move_to(rx + 8.0, ry + 31.0);
             let _ = cr.show_text(&format!("{}×{}", out.width, out.height));
         }
     });

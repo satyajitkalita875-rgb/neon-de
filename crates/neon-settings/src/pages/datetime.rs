@@ -1,5 +1,5 @@
-//! 5.19 Date, Time & Language: `org.freedesktop.timedate1` NTP sync toggle,
-//! searchable IANA timezone selector, 12h/24h & date formatting, and system locale inspection.
+//! Date & Time settings: systemd-timedated NTP synchronization, searchable IANA
+//! timezone selector, and active system locale info.
 
 use std::rc::Rc;
 
@@ -10,11 +10,10 @@ use gtk4::{
 use neon_system::datetime::{self, DateTimeLocaleStatus};
 
 use crate::{
-    metadata::CapabilityStatus,
     state::SettingsController,
     ui::{
-        append_rows, boxed_card, capability_row, info_row, page_shell, run_async, section_heading,
-        setting_row, status_badge, toggle_row,
+        append_rows, boxed_card, info_row, page_shell, run_async, section_heading, setting_row,
+        status_badge,
     },
 };
 
@@ -24,24 +23,15 @@ struct DateTimeData {
 }
 
 pub fn build_page(ctrl: Rc<SettingsController>) -> ScrolledWindow {
-    let (scroller, page) = page_shell(
-        "Date, Time & Language",
-        "Manage automatic network time (NTP), IANA timezone, clock formatting, and system locales.",
-        None,
-        &ctrl,
-    );
+    let (scroller, page) = page_shell();
 
-    let root = GtkBox::new(Orientation::Vertical, 4);
+    let root = GtkBox::new(Orientation::Vertical, 2);
     page.append(&root);
 
     let load_card = boxed_card();
     let spin = Spinner::new();
     spin.start();
-    load_card.append(&setting_row(
-        "Querying systemd-timedated & Locale…",
-        "Reading active timezone, NTP synchronization, and installed locales.",
-        &spin,
-    ));
+    load_card.append(&setting_row("Loading Date & Time…", "", &spin));
     root.append(&load_card);
 
     let ctrl_done = Rc::clone(&ctrl);
@@ -63,7 +53,7 @@ fn render_datetime(root: &GtkBox, ctrl: Rc<SettingsController>, data: DateTimeDa
     }
 
     // ── Date, Time & NTP ─────────────────────────────────────────────────────
-    root.append(&section_heading("Date, Time & Synchronization"));
+    root.append(&section_heading("Clock & Sync"));
     let time_card = boxed_card();
 
     let ntp_sw = Switch::new();
@@ -79,9 +69,9 @@ fn render_datetime(root: &GtkBox, ctrl: Rc<SettingsController>, data: DateTimeDa
                 move |res| match res {
                     Ok(()) => {
                         ctrl_done.set_status_ok(if active {
-                            "Enabled automatic network time (NTP)"
+                            "Automatic time enabled"
                         } else {
-                            "Disabled automatic network time (NTP)"
+                            "Automatic time disabled"
                         });
                         ctrl_done.rebuild_page("datetime");
                     }
@@ -100,50 +90,20 @@ fn render_datetime(root: &GtkBox, ctrl: Rc<SettingsController>, data: DateTimeDa
         status_badge("Manual", "")
     };
 
-    let panel_cfg = ctrl.config.borrow().panel.clone();
-
     append_rows(
         &time_card,
         vec![
             info_row(
-                "Current Local Time",
-                &format!("Timezone: {}", data.status.timezone),
+                "Current Time",
+                &data.status.timezone,
                 &data.status.local_time_display,
             ),
             setting_row(
-                "Automatic Date & Time (NTP)",
-                "Synchronize system clock via systemd-timedated (polkit-gated).",
+                "Set Time Automatically (NTP)",
+                "Synchronize clock via systemd-timedated.",
                 &ntp_sw,
             ),
-            setting_row(
-                "NTP Synchronization Status",
-                "org.freedesktop.timedate1.NTPSynchronized property.",
-                &sync_badge,
-            ),
-            toggle_row(
-                "24-Hour Clock",
-                "Display 24-hour time format on the NEON DE top panel.",
-                panel_cfg.clock_24h,
-                {
-                    let ctrl_c = Rc::clone(&ctrl);
-                    move |v| {
-                        ctrl_c.config.borrow_mut().panel.clock_24h = v;
-                        ctrl_c.persist_and_sync(None, "Updated 24-hour clock format");
-                    }
-                },
-            ),
-            toggle_row(
-                "Show Date in Panel Clock",
-                "Include weekday and calendar date beside the time.",
-                panel_cfg.show_date,
-                {
-                    let ctrl_c = Rc::clone(&ctrl);
-                    move |v| {
-                        ctrl_c.config.borrow_mut().panel.show_date = v;
-                        ctrl_c.persist_and_sync(None, "Updated panel date visibility");
-                    }
-                },
-            ),
+            setting_row("Sync Status", "", &sync_badge),
         ],
     );
     root.append(&time_card);
@@ -153,11 +113,12 @@ fn render_datetime(root: &GtkBox, ctrl: Rc<SettingsController>, data: DateTimeDa
     let tz_card = boxed_card();
 
     let tz_filter = SearchEntry::new();
-    tz_filter.set_placeholder_text(Some("Filter timezones (e.g. Asia/Kolkata, Europe/London)…"));
+    tz_filter.add_css_class("settings-search");
+    tz_filter.set_placeholder_text(Some("Search timezone (e.g. Asia/Kolkata, Europe/London)…"));
     tz_filter.set_margin_top(10);
-    tz_filter.set_margin_bottom(6);
-    tz_filter.set_margin_start(16);
-    tz_filter.set_margin_end(16);
+    tz_filter.set_margin_bottom(4);
+    tz_filter.set_margin_start(14);
+    tz_filter.set_margin_end(14);
     tz_card.append(&tz_filter);
 
     let tz_picker_holder = GtkBox::new(Orientation::Vertical, 0);
@@ -194,7 +155,7 @@ fn render_datetime(root: &GtkBox, ctrl: Rc<SettingsController>, data: DateTimeDa
             dd.set_valign(Align::Center);
             dd.set_selected(init_idx);
 
-            let apply_btn = Button::with_label("Apply Timezone");
+            let apply_btn = Button::with_label("Apply");
             apply_btn.add_css_class("settings-action-btn");
             apply_btn.set_sensitive(timedated_ok);
             {
@@ -209,7 +170,7 @@ fn render_datetime(root: &GtkBox, ctrl: Rc<SettingsController>, data: DateTimeDa
                             move || datetime::set_timezone(&tz),
                             move |res| match res {
                                 Ok(()) => {
-                                    ctrl_done.set_status_ok(&format!("Timezone set to {tz_label}"));
+                                    ctrl_done.set_status_ok(&format!("Timezone: {tz_label}"));
                                     ctrl_done.rebuild_page("datetime");
                                 }
                                 Err(e) => ctrl_done.set_status_err(&e),
@@ -223,11 +184,7 @@ fn render_datetime(root: &GtkBox, ctrl: Rc<SettingsController>, data: DateTimeDa
             right.set_valign(Align::Center);
             right.append(&dd);
             right.append(&apply_btn);
-            holder.append(&setting_row(
-                "System Timezone",
-                &format!("Active: {cur_tz}"),
-                &right,
-            ));
+            holder.append(&setting_row("Timezone", &format!("Current: {cur_tz}"), &right));
         })
     };
 
@@ -238,46 +195,9 @@ fn render_datetime(root: &GtkBox, ctrl: Rc<SettingsController>, data: DateTimeDa
     }
     root.append(&tz_card);
 
-    // ── Language & Regional Formats ──────────────────────────────────────────
-    root.append(&section_heading("Language & Regional Formats"));
+    // ── Region / Locale ──────────────────────────────────────────────────────
+    root.append(&section_heading("Region"));
     let lang_card = boxed_card();
-
-    let installed_preview = if data.status.available_locales.is_empty() {
-        "System default".to_string()
-    } else {
-        let preview: Vec<&str> = data
-            .status
-            .available_locales
-            .iter()
-            .take(6)
-            .map(String::as_str)
-            .collect();
-        format!(
-            "{} ({} total)",
-            preview.join(", "),
-            data.status.available_locales.len()
-        )
-    };
-
-    append_rows(
-        &lang_card,
-        vec![
-            info_row(
-                "Active System Locale",
-                "Reported by systemd-localed / LANG environment.",
-                &data.status.system_locale,
-            ),
-            info_row(
-                "Installed Locales",
-                "Available UTF-8 locales discovered via `locale -a`.",
-                &installed_preview,
-            ),
-            capability_row(
-                "System-Wide Locale Change",
-                "Changing `/etc/locale.conf` via `localectl set-locale` requires administrator authorization and a fresh session login.",
-                CapabilityStatus::RequiresElevation,
-            ),
-        ],
-    );
+    lang_card.append(&info_row("System Locale", "", &data.status.system_locale));
     root.append(&lang_card);
 }

@@ -46,6 +46,8 @@ pub fn query_portal_status() -> PortalStatus {
 pub fn neon_portal_config_template() -> &'static str {
     "[preferred]\n\
      default=gtk\n\
+     org.freedesktop.impl.portal.ScreenCast=wlr\n\
+     org.freedesktop.impl.portal.Screenshot=wlr\n\
      org.freedesktop.impl.portal.Secret=gnome-keyring\n\
      org.freedesktop.impl.portal.FileChooser=gtk\n\
      org.freedesktop.impl.portal.Settings=gtk\n"

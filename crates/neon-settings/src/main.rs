@@ -1,5 +1,5 @@
-//! Entrypoint for `neon-settings` — NEON DE's complete macOS-inspired GTK4 Settings
-//! application with real Linux D-Bus/PipeWire/XDG/IPC integration across 22 categories.
+//! Entrypoint for `neon-settings` — clean macOS System Settings–style GTK4 application
+//! for NEON DE, exposing only genuine, live-working desktop settings with instant startup.
 
 mod metadata;
 mod navigation;
@@ -12,148 +12,168 @@ use std::{cell::RefCell, collections::HashMap, path::PathBuf, rc::Rc};
 
 use clap::Parser;
 use gtk4::{
-    Align, Application, ApplicationWindow, Box as GtkBox, Button, CenterBox, EventControllerKey,
-    Image, Label, ListBox, ListBoxRow, MenuButton, Orientation, PolicyType, Popover,
-    ScrolledWindow, SearchEntry, SelectionMode, Separator, Stack, StackTransitionType,
-    WindowHandle, gdk, gio, glib, prelude::*,
+    Align, Application, ApplicationWindow, Box as GtkBox, Button, EventControllerKey, Image, Label,
+    ListBox, ListBoxRow, Orientation, PolicyType, ScrolledWindow, SearchEntry, SelectionMode,
+    Separator, Stack, StackTransitionType, WindowHandle, gdk, glib, prelude::*,
 };
-use neon_config::{ThemeMode, default_config_path, load_or_default};
+use neon_config::{default_config_path, load_or_default};
 use neon_ipc::default_socket_path;
-use tracing::info;
-use tracing_subscriber::EnvFilter;
 
 use crate::{
     metadata::search_settings,
     navigation::{ABOUT_CATEGORY, CategoryDef, NavigationHistory, SIDEBAR_CATEGORIES, find_category},
-    state::{SettingsController, build_appearance_request},
+    state::{SettingsController, apply_system_cursor, apply_window_button_layout},
     ui::{
-        boxed_card, capability_badge, row_separator, section_heading, style::SettingsTheme,
+        boxed_card, row_separator, section_heading,
+        style::SettingsTheme,
     },
 };
 
 #[derive(Debug, Parser)]
 #[command(name = "neon-settings", version, about)]
-struct Cli {
-    /// Explicit path to `neon-compositor`'s IPC Unix socket.
-    #[arg(long)]
-    ipc_socket: Option<PathBuf>,
-
-    /// Explicit path to `neon-de/config.toml`.
-    #[arg(long)]
-    config: Option<PathBuf>,
-
-    /// Optional initial settings page to open (e.g. `appearance`, `displays`, `shortcuts`).
+struct Args {
+    /// Open directly to a specific settings category (e.g. appearance, displays, network, sound).
     #[arg(long)]
     page: Option<String>,
+    /// Override the NEON DE config file path.
+    #[arg(long)]
+    config: Option<PathBuf>,
+    /// Override the neon-compositor IPC socket path.
+    #[arg(long)]
+    ipc_socket: Option<PathBuf>,
 }
 
-const SIDEBAR_WIDTH: i32 = 258;
+fn build_nav_badge(icon_name: &str, badge_class: &str) -> GtkBox {
+    let badge = GtkBox::new(Orientation::Horizontal, 0);
+    badge.add_css_class("nav-badge");
+    badge.add_css_class(badge_class);
+    badge.set_size_request(20, 20);
+    badge.set_halign(Align::Start);
+    badge.set_valign(Align::Center);
+    badge.set_hexpand(false);
+    badge.set_vexpand(false);
 
-fn resolve_ipc_socket(override_path: Option<PathBuf>) -> PathBuf {
-    if let Some(p) = override_path {
-        return p;
-    }
-    if let Some(env_p) = std::env::var_os("NEON_IPC_SOCKET") {
-        return PathBuf::from(env_p);
-    }
-    let wl = std::env::var("WAYLAND_DISPLAY").unwrap_or_else(|_| "wayland-0".into());
-    default_socket_path(&wl)
+    let icon = Image::from_icon_name(icon_name);
+    icon.set_pixel_size(12);
+    icon.set_halign(Align::Center);
+    icon.set_valign(Align::Center);
+    icon.set_margin_start(4);
+    icon.set_margin_end(4);
+    badge.append(&icon);
+    badge
 }
 
 fn main() {
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("neon_settings=info,neon_config=info"));
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "neon_settings=info".into()),
+        )
+        .init();
 
-    let cli = Cli::parse();
-    let config_path = cli.config.unwrap_or_else(default_config_path);
-    let ipc_socket = resolve_ipc_socket(cli.ipc_socket);
-    let cli_page = cli.page;
-
-    info!(
-        config = %config_path.display(),
-        ipc = %ipc_socket.display(),
-        "Launching NEON DE Settings"
-    );
+    let args = Args::parse();
+    let config_path = args.config.unwrap_or_else(default_config_path);
+    let ipc_socket = args.ipc_socket.unwrap_or_else(|| {
+        std::env::var_os("NEON_IPC_SOCKET")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                let wd = std::env::var("WAYLAND_DISPLAY").unwrap_or_else(|_| "wayland-0".into());
+                default_socket_path(&wd)
+            })
+    });
+    let initial_page_arg = args.page;
 
     let app = Application::builder()
         .application_id("org.neonde.settings")
-        .flags(gio::ApplicationFlags::NON_UNIQUE)
         .build();
 
     app.connect_activate(move |app| {
-        let loaded = load_or_default(&config_path);
-        let initial_page = cli_page
-            .clone()
-            .filter(|p| find_category(p).is_some())
-            .or_else(|| {
-                let saved = loaded.session.last_settings_page.clone();
-                find_category(&saved).map(|c| c.id.to_string())
-            })
+        if let Some(existing) = app.active_window() {
+            existing.present();
+            return;
+        }
+
+        let cfg = load_or_default(&config_path);
+        let initial_page = initial_page_arg
+            .as_deref()
+            .and_then(find_category)
+            .or_else(|| find_category(&cfg.session.last_settings_page))
+            .map(|c| c.id.to_string())
             .unwrap_or_else(|| "appearance".to_string());
 
-        let theme = SettingsTheme::init(loaded.appearance.theme, &loaded.appearance.accent_color);
+        let theme = SettingsTheme::install(cfg.appearance.theme, &cfg.appearance.accent_color);
+        apply_system_cursor(&cfg.appearance.cursor_theme, cfg.appearance.cursor_size);
+        apply_window_button_layout(cfg.windows.button_layout);
 
         let window = ApplicationWindow::builder()
             .application(app)
-            .title("NEON DE Settings")
-            .default_width(1040)
-            .default_height(720)
+            .title("Settings")
+            .default_width(820)
+            .default_height(580)
+            .decorated(false)
             .build();
         window.add_css_class("neon-settings-window");
 
-        let status_label = Label::new(Some("Connected to NEON DE configuration & system services"));
-        status_label.set_halign(Align::Start);
+        // Auto-hiding transient feedback toast (hidden by default — zero permanent green bar)
         let status_bar = GtkBox::new(Orientation::Horizontal, 8);
         status_bar.add_css_class("settings-status-bar");
+        status_bar.set_visible(false);
+        let status_label = Label::new(None);
+        status_label.set_halign(Align::Start);
+        status_label.set_hexpand(true);
+        status_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
         status_bar.append(&status_label);
 
-        let ctrl = Rc::new(SettingsController {
-            config_path: config_path.clone(),
-            ipc_socket: ipc_socket.clone(),
-            config: RefCell::new(loaded),
+        let ctrl = Rc::new(SettingsController::new(
+            config_path.clone(),
+            ipc_socket.clone(),
+            cfg,
             theme,
-            status_label: status_label.clone(),
-            status_bar: status_bar.clone(),
-            window: window.clone(),
-            navigate_cb: RefCell::new(None),
-            rebuild_page_cb: RefCell::new(None),
-        });
+            status_label.clone(),
+            status_bar.clone(),
+            window.clone(),
+        ));
 
-        // ── Split Headerbar ──────────────────────────────────────────────────
-        let split_header = GtkBox::new(Orientation::Horizontal, 0);
-        split_header.add_css_class("settings-split-header");
+        // ── Unified macOS Split Window (Sidebar | Content Pane) ──────────────
+        let split = GtkBox::new(Orientation::Horizontal, 0);
+        split.set_hexpand(true);
+        split.set_vexpand(true);
 
-        let sidebar_header = CenterBox::new();
-        sidebar_header.add_css_class("settings-sidebar-header");
-        sidebar_header.set_width_request(SIDEBAR_WIDTH);
+        // ── Left Sidebar (Traffic Lights + Search + Compact Colored Icon List) ─
+        let sidebar = GtkBox::new(Orientation::Vertical, 0);
+        sidebar.add_css_class("settings-sidebar");
+        sidebar.set_width_request(222);
+        // Explicitly stop hexpand propagation from row labels so the sidebar never steals width.
+        sidebar.set_hexpand(false);
 
-        let traffic_lights = GtkBox::new(Orientation::Horizontal, 8);
-        traffic_lights.add_css_class("macos-traffic-lights");
-        traffic_lights.set_valign(Align::Center);
+        // Draggable sidebar top with crisp macOS traffic lights
+        let sidebar_handle = WindowHandle::new();
+        let traffic_row = GtkBox::new(Orientation::Horizontal, 8);
+        traffic_row.add_css_class("settings-sidebar-top");
+        traffic_row.set_valign(Align::Center);
 
-        let close_btn = Button::with_label("×");
-        close_btn.add_css_class("macos-tl-btn");
-        close_btn.add_css_class("macos-tl-close");
+        let close_btn = Button::new();
+        close_btn.add_css_class("mac-dot");
+        close_btn.add_css_class("mac-dot-close");
         close_btn.set_tooltip_text(Some("Close"));
         {
             let win = window.clone();
             close_btn.connect_clicked(move |_| win.close());
         }
 
-        let min_btn = Button::with_label("−");
-        min_btn.add_css_class("macos-tl-btn");
-        min_btn.add_css_class("macos-tl-min");
+        let min_btn = Button::new();
+        min_btn.add_css_class("mac-dot");
+        min_btn.add_css_class("mac-dot-min");
         min_btn.set_tooltip_text(Some("Minimize"));
         {
             let win = window.clone();
             min_btn.connect_clicked(move |_| win.minimize());
         }
 
-        let max_btn = Button::with_label("+");
-        max_btn.add_css_class("macos-tl-btn");
-        max_btn.add_css_class("macos-tl-max");
-        max_btn.set_tooltip_text(Some("Maximize / Restore"));
+        let max_btn = Button::new();
+        max_btn.add_css_class("mac-dot");
+        max_btn.add_css_class("mac-dot-max");
+        max_btn.set_tooltip_text(Some("Zoom"));
         {
             let win = window.clone();
             max_btn.connect_clicked(move |_| {
@@ -165,103 +185,16 @@ fn main() {
             });
         }
 
-        traffic_lights.append(&close_btn);
-        traffic_lights.append(&min_btn);
-        traffic_lights.append(&max_btn);
-        sidebar_header.set_start_widget(Some(&traffic_lights));
+        traffic_row.append(&close_btn);
+        traffic_row.append(&min_btn);
+        traffic_row.append(&max_btn);
+        sidebar_handle.set_child(Some(&traffic_row));
+        sidebar.append(&sidebar_handle);
 
-        let sidebar_title = Label::new(Some("Settings"));
-        sidebar_title.add_css_class("settings-header-title");
-        sidebar_header.set_center_widget(Some(&sidebar_title));
-
-        let menu_btn = MenuButton::new();
-        menu_btn.add_css_class("settings-header-icon-btn");
-        menu_btn.set_icon_name("open-menu-symbolic");
-        menu_btn.set_tooltip_text(Some("Quick Actions"));
-
-        let menu_box = GtkBox::new(Orientation::Vertical, 4);
-        menu_box.set_margin_top(6);
-        menu_box.set_margin_bottom(6);
-        menu_box.set_margin_start(6);
-        menu_box.set_margin_end(6);
-
-        let toggle_theme_btn = Button::with_label("Toggle Light / Dark Style");
-        toggle_theme_btn.add_css_class("settings-menu-item");
-        let sync_btn = Button::with_label("Sync Full Config to Compositor");
-        sync_btn.add_css_class("settings-menu-item");
-        let shortcuts_menu_btn = Button::with_label("Keyboard Shortcuts");
-        shortcuts_menu_btn.add_css_class("settings-menu-item");
-        let about_menu_btn = Button::with_label("About NEON DE");
-        about_menu_btn.add_css_class("settings-menu-item");
-        menu_box.append(&toggle_theme_btn);
-        menu_box.append(&sync_btn);
-        menu_box.append(&shortcuts_menu_btn);
-        menu_box.append(&about_menu_btn);
-
-        let popover = Popover::new();
-        popover.set_child(Some(&menu_box));
-        menu_btn.set_popover(Some(&popover));
-        sidebar_header.set_end_widget(Some(&menu_btn));
-
-        // Content header: Back button + active category title
-        let content_header = CenterBox::new();
-        content_header.add_css_class("settings-content-header");
-        content_header.set_hexpand(true);
-
-        let back_btn = Button::new();
-        back_btn.add_css_class("settings-header-icon-btn");
-        back_btn.set_tooltip_text(Some("Back (Alt+Left)"));
-        let back_icon = Image::from_icon_name("go-previous-symbolic");
-        back_icon.set_pixel_size(16);
-        back_btn.set_child(Some(&back_icon));
-        back_btn.set_sensitive(false);
-        content_header.set_start_widget(Some(&back_btn));
-
-        let page_title_label = Label::new(Some("Appearance"));
-        page_title_label.add_css_class("settings-header-title");
-        content_header.set_center_widget(Some(&page_title_label));
-
-        split_header.append(&sidebar_header);
-        split_header.append(&content_header);
-
-        let titlebar_handle = WindowHandle::new();
-        titlebar_handle.set_child(Some(&split_header));
-        window.set_titlebar(Some(&titlebar_handle));
-
-        // ── Main Two-Panel Layout ────────────────────────────────────────────
-        let outer = GtkBox::new(Orientation::Vertical, 0);
-        let split = GtkBox::new(Orientation::Horizontal, 0);
-        split.set_vexpand(true);
-
-        let sidebar = GtkBox::new(Orientation::Vertical, 4);
-        sidebar.add_css_class("settings-sidebar");
-        sidebar.set_width_request(SIDEBAR_WIDTH);
-
-        // NEON DE Brand Header
-        let brand_row = GtkBox::new(Orientation::Horizontal, 10);
-        brand_row.add_css_class("neon-brand-card");
-        brand_row.set_valign(Align::Center);
-        let emblem = Label::new(Some("N"));
-        emblem.add_css_class("neon-brand-emblem");
-        emblem.set_halign(Align::Center);
-        emblem.set_valign(Align::Center);
-        let brand_text = GtkBox::new(Orientation::Vertical, 1);
-        let brand_name = Label::new(Some("NEON DE"));
-        brand_name.add_css_class("neon-brand-title");
-        brand_name.set_halign(Align::Start);
-        let brand_sub = Label::new(Some("System Settings"));
-        brand_sub.add_css_class("neon-brand-sub");
-        brand_sub.set_halign(Align::Start);
-        brand_text.append(&brand_name);
-        brand_text.append(&brand_sub);
-        brand_row.append(&emblem);
-        brand_row.append(&brand_text);
-        sidebar.append(&brand_row);
-
-        // Persistent Search Field
+        // Compact macOS Search Field directly under traffic lights
         let search = SearchEntry::new();
         search.add_css_class("settings-search");
-        search.set_placeholder_text(Some("Search settings (Ctrl+F)"));
+        search.set_placeholder_text(Some("Search"));
         sidebar.append(&search);
 
         // Scrollable Category List
@@ -296,13 +229,15 @@ fn main() {
             }
             last_group = Some(cat.group);
 
-            let row_box = GtkBox::new(Orientation::Horizontal, 10);
-            let icon = Image::from_icon_name(cat.icon);
-            icon.set_pixel_size(16);
+            let row_box = GtkBox::new(Orientation::Horizontal, 9);
+            row_box.set_valign(Align::Center);
+            row_box.set_halign(Align::Fill);
+            let badge = build_nav_badge(cat.icon, cat.badge_class);
             let lbl = Label::new(Some(cat.title));
             lbl.set_halign(Align::Start);
+            lbl.set_hexpand(true);
             lbl.set_ellipsize(gtk4::pango::EllipsizeMode::End);
-            row_box.append(&icon);
+            row_box.append(&badge);
             row_box.append(&lbl);
 
             let row = ListBoxRow::new();
@@ -316,37 +251,70 @@ fn main() {
         nav_scroll.set_child(Some(&nav_list));
         sidebar.append(&nav_scroll);
 
-        // Pinned "About NEON DE" button at the bottom of the sidebar
+        // Pinned "About NEON DE" button at sidebar bottom
         let about_sep = Separator::new(Orientation::Horizontal);
         about_sep.add_css_class("settings-sidebar-sep");
         sidebar.append(&about_sep);
 
         let about_footer_btn = Button::new();
         about_footer_btn.add_css_class("settings-about-footer-btn");
-        let about_row = GtkBox::new(Orientation::Horizontal, 10);
-        let about_icon = Image::from_icon_name(ABOUT_CATEGORY.icon);
-        about_icon.set_pixel_size(16);
+        about_footer_btn.set_vexpand(false);
+        about_footer_btn.set_valign(Align::End);
+        let about_row = GtkBox::new(Orientation::Horizontal, 9);
+        about_row.set_valign(Align::Center);
+        about_row.set_halign(Align::Fill);
+        let about_badge = build_nav_badge(ABOUT_CATEGORY.icon, ABOUT_CATEGORY.badge_class);
         let about_lbl = Label::new(Some(ABOUT_CATEGORY.title));
         about_lbl.set_halign(Align::Start);
-        about_row.append(&about_icon);
+        about_lbl.set_hexpand(true);
+        about_row.append(&about_badge);
         about_row.append(&about_lbl);
         about_footer_btn.set_child(Some(&about_row));
         sidebar.append(&about_footer_btn);
 
-        // ── Main Content Stack (Lazy-Built Pages + Search Results View) ──────
+        // ── Right Content Pane (< > Title Header + Stack + Auto-Hiding Toast) ─
+        let content_pane = GtkBox::new(Orientation::Vertical, 0);
+        content_pane.set_hexpand(true);
+        content_pane.set_vexpand(true);
+
+        let content_handle = WindowHandle::new();
+        let content_header = GtkBox::new(Orientation::Horizontal, 2);
+        content_header.add_css_class("settings-content-header");
+        content_header.set_valign(Align::Center);
+
+        let back_btn = Button::from_icon_name("go-previous-symbolic");
+        back_btn.add_css_class("nav-chevron-btn");
+        back_btn.set_sensitive(false);
+        back_btn.set_tooltip_text(Some("Back (Alt+Left)"));
+
+        let fwd_btn = Button::from_icon_name("go-next-symbolic");
+        fwd_btn.add_css_class("nav-chevron-btn");
+        fwd_btn.set_sensitive(false);
+        fwd_btn.set_tooltip_text(Some("Forward (Alt+Right)"));
+
+        let page_title_label = Label::new(Some("Appearance"));
+        page_title_label.add_css_class("settings-header-title");
+        page_title_label.set_halign(Align::Start);
+        page_title_label.set_hexpand(true);
+
+        content_header.append(&back_btn);
+        content_header.append(&fwd_btn);
+        content_header.append(&page_title_label);
+        content_handle.set_child(Some(&content_header));
+        content_pane.append(&content_handle);
+
         let stack = Stack::new();
         stack.set_transition_type(StackTransitionType::Crossfade);
-        stack.set_transition_duration(120);
+        stack.set_transition_duration(90);
         stack.set_hexpand(true);
         stack.set_vexpand(true);
 
         // Search results page
         let search_results_outer = GtkBox::new(Orientation::Vertical, 0);
-        search_results_outer.set_halign(Align::Center);
         search_results_outer.set_hexpand(true);
-        let search_results_col = GtkBox::new(Orientation::Vertical, 6);
+        let search_results_col = GtkBox::new(Orientation::Vertical, 4);
         search_results_col.add_css_class("settings-content-clamp");
-        search_results_col.set_width_request(620);
+        search_results_col.set_hexpand(true);
         search_results_outer.append(&search_results_col);
         let search_results_scroll = ScrolledWindow::builder()
             .hscrollbar_policy(PolicyType::Never)
@@ -357,14 +325,16 @@ fn main() {
             .build();
         stack.add_named(&search_results_scroll, Some("__search__"));
 
+        content_pane.append(&stack);
+        content_pane.append(&status_bar);
+
         let built_pages: Rc<RefCell<HashMap<String, ScrolledWindow>>> =
             Rc::new(RefCell::new(HashMap::new()));
         let history = Rc::new(RefCell::new(NavigationHistory::default()));
         let active_page_id = Rc::new(RefCell::new(String::new()));
         let suppress_nav_signal = Rc::new(RefCell::new(false));
-
-        // Central navigation routine (lazy-builds pages, updates history, saves last page)
         let nav_rows_rc = Rc::new(nav_rows);
+
         let navigate_core: Rc<dyn Fn(&str, bool, Option<&str>)> = {
             let ctrl = Rc::clone(&ctrl);
             let stack = stack.clone();
@@ -375,6 +345,7 @@ fn main() {
             let built_pages = Rc::clone(&built_pages);
             let history = Rc::clone(&history);
             let back_btn = back_btn.clone();
+            let fwd_btn = fwd_btn.clone();
             let active_id = Rc::clone(&active_page_id);
             let suppress = Rc::clone(&suppress_nav_signal);
 
@@ -384,7 +355,6 @@ fn main() {
                 };
                 let id = cat.id;
 
-                // Lazy-build page on first visit
                 if !built_pages.borrow().contains_key(id) {
                     let widget = pages::build_page(id, Rc::clone(&ctrl));
                     stack.add_named(&widget, Some(id));
@@ -399,8 +369,8 @@ fn main() {
                     history.borrow_mut().visit(id);
                 }
                 back_btn.set_sensitive(history.borrow().can_go_back());
+                fwd_btn.set_sensitive(history.borrow().can_go_forward());
 
-                // Sync sidebar active state without re-triggering signal
                 *suppress.borrow_mut() = true;
                 if id == ABOUT_CATEGORY.id {
                     nav_list.unselect_all();
@@ -413,19 +383,17 @@ fn main() {
                 }
                 *suppress.borrow_mut() = false;
 
-                // Persist last opened page quietly
                 if ctrl.config.borrow().session.last_settings_page != id {
                     ctrl.config.borrow_mut().session.last_settings_page = id.to_string();
                     ctrl.persist_silent();
                 }
 
                 if let Some(setting_name) = highlight {
-                    ctrl.set_status_info(&format!("Opened {} → {setting_name}", cat.title));
+                    ctrl.set_status_info(&format!("{} → {setting_name}", cat.title));
                 }
             })
         };
 
-        // Wire programmatic navigate & rebuild callbacks into SettingsController
         {
             let nav_fn = Rc::clone(&navigate_core);
             let search_c = search.clone();
@@ -458,7 +426,7 @@ fn main() {
             }));
         }
 
-        // Sidebar selection handler
+        // Sidebar selection
         {
             let nav_fn = Rc::clone(&navigate_core);
             let suppress = Rc::clone(&suppress_nav_signal);
@@ -477,7 +445,7 @@ fn main() {
             });
         }
 
-        // Pinned About NEON DE click handler
+        // About footer click
         {
             let nav_fn = Rc::clone(&navigate_core);
             let search_c = search.clone();
@@ -489,11 +457,12 @@ fn main() {
             });
         }
 
-        // Back button handler
+        // Back & Forward buttons
         {
             let history_c = Rc::clone(&history);
             let nav_fn = Rc::clone(&navigate_core);
             let back_c = back_btn.clone();
+            let fwd_c = fwd_btn.clone();
             let search_c = search.clone();
             back_btn.connect_clicked(move |_| {
                 if !search_c.text().is_empty() {
@@ -504,16 +473,36 @@ fn main() {
                     nav_fn(&prev, false, None);
                 }
                 back_c.set_sensitive(history_c.borrow().can_go_back());
+                fwd_c.set_sensitive(history_c.borrow().can_go_forward());
+            });
+        }
+        {
+            let history_c = Rc::clone(&history);
+            let nav_fn = Rc::clone(&navigate_core);
+            let back_c = back_btn.clone();
+            let fwd_c = fwd_btn.clone();
+            let search_c = search.clone();
+            fwd_btn.connect_clicked(move |_| {
+                if !search_c.text().is_empty() {
+                    search_c.set_text("");
+                    return;
+                }
+                if let Some(next) = history_c.borrow_mut().go_forward() {
+                    nav_fn(&next, false, None);
+                }
+                back_c.set_sensitive(history_c.borrow().can_go_back());
+                fwd_c.set_sensitive(history_c.borrow().can_go_forward());
             });
         }
 
-        // Keyboard shortcuts: Ctrl+F (focus search), Escape (clear search), Alt+Left (Back)
+        // Keyboard shortcuts: Ctrl+F, Escape, Alt+Left, Alt+Right
         {
             let key_ctrl = EventControllerKey::new();
             let entry = search.clone();
             let history_c = Rc::clone(&history);
             let nav_fn = Rc::clone(&navigate_core);
             let back_c = back_btn.clone();
+            let fwd_c = fwd_btn.clone();
             key_ctrl.connect_key_pressed(move |_, key, _, mods| {
                 if mods.contains(gdk::ModifierType::CONTROL_MASK)
                     && matches!(key, gdk::Key::f | gdk::Key::F)
@@ -529,6 +518,15 @@ fn main() {
                     if let Some(prev) = history_c.borrow_mut().go_back() {
                         nav_fn(&prev, false, None);
                         back_c.set_sensitive(history_c.borrow().can_go_back());
+                        fwd_c.set_sensitive(history_c.borrow().can_go_forward());
+                        return glib::Propagation::Stop;
+                    }
+                }
+                if mods.contains(gdk::ModifierType::ALT_MASK) && key == gdk::Key::Right {
+                    if let Some(next) = history_c.borrow_mut().go_forward() {
+                        nav_fn(&next, false, None);
+                        back_c.set_sensitive(history_c.borrow().can_go_back());
+                        fwd_c.set_sensitive(history_c.borrow().can_go_forward());
                         return glib::Propagation::Stop;
                     }
                 }
@@ -537,7 +535,7 @@ fn main() {
             window.add_controller(key_ctrl);
         }
 
-        // Global search (filters sidebar AND displays direct setting-level hits in main pane)
+        // Global Search
         {
             let nav_rows_c = Rc::clone(&nav_rows_rc);
             let sep_rows_c = sep_rows.clone();
@@ -563,7 +561,6 @@ fn main() {
                     sep.set_visible(q.is_empty());
                 }
 
-                // Clear previous search result widgets
                 while let Some(child) = results_col.first_child() {
                     results_col.remove(&child);
                 }
@@ -590,50 +587,46 @@ fn main() {
                 let card = boxed_card();
                 if hits.is_empty() {
                     let empty = Label::new(Some(
-                        "No matching settings found. Try keywords like blur, wi-fi, scaling, shortcuts, battery, or timezone.",
+                        "No matching settings found. Try wifi, wallpaper, blur, brightness, sound, or battery.",
                     ));
                     empty.add_css_class("settings-row-desc");
-                    empty.set_margin_top(16);
-                    empty.set_margin_bottom(16);
-                    empty.set_margin_start(16);
-                    empty.set_margin_end(16);
+                    empty.set_margin_top(14);
+                    empty.set_margin_bottom(14);
+                    empty.set_margin_start(14);
+                    empty.set_margin_end(14);
                     empty.set_wrap(true);
                     card.append(&empty);
                 } else {
-                    for (idx, hit) in hits.iter().take(24).enumerate() {
+                    for (idx, hit) in hits.iter().take(20).enumerate() {
                         if idx > 0 {
                             card.append(&row_separator());
                         }
                         let btn = Button::new();
                         btn.add_css_class("search-hit-btn");
 
-                        let row = GtkBox::new(Orientation::Horizontal, 12);
+                        let row = GtkBox::new(Orientation::Horizontal, 10);
                         row.set_valign(Align::Center);
                         let text = GtkBox::new(Orientation::Vertical, 2);
                         text.set_hexpand(true);
 
-                        let title_row = GtkBox::new(Orientation::Horizontal, 8);
                         let name_lbl = Label::new(Some(hit.setting.name));
                         name_lbl.add_css_class("settings-row-title");
                         name_lbl.set_halign(Align::Start);
-                        let cat_pill = Label::new(Some(hit.setting.category_title));
-                        cat_pill.add_css_class("settings-badge");
-                        title_row.append(&name_lbl);
-                        title_row.append(&cat_pill);
 
-                        let desc_lbl = Label::new(Some(&format!(
-                            "{}  •  {}",
-                            hit.setting.description, hit.setting.service
-                        )));
+                        let desc_lbl = Label::new(Some(hit.setting.description));
                         desc_lbl.add_css_class("settings-row-desc");
                         desc_lbl.set_halign(Align::Start);
                         desc_lbl.set_wrap(true);
 
-                        text.append(&title_row);
+                        text.append(&name_lbl);
                         text.append(&desc_lbl);
 
+                        let cat_pill = Label::new(Some(hit.setting.category_title));
+                        cat_pill.add_css_class("settings-badge");
+                        cat_pill.set_valign(Align::Center);
+
                         row.append(&text);
-                        row.append(&capability_badge(hit.setting.capability));
+                        row.append(&cat_pill);
                         btn.set_child(Some(&row));
 
                         let nav_click = Rc::clone(&nav_fn);
@@ -652,69 +645,17 @@ fn main() {
             });
         }
 
-        // Quick-menu actions
-        {
-            let ctrl_c = Rc::clone(&ctrl);
-            let pop = popover.clone();
-            toggle_theme_btn.connect_clicked(move |_| {
-                pop.popdown();
-                let next = {
-                    let mut cfg = ctrl_c.config.borrow_mut();
-                    let next = if cfg.appearance.theme == ThemeMode::NeonLight {
-                        ThemeMode::NeonDark
-                    } else {
-                        ThemeMode::NeonLight
-                    };
-                    cfg.appearance.theme = next;
-                    next
-                };
-                let req = build_appearance_request(&ctrl_c.config.borrow());
-                ctrl_c.persist_and_sync(
-                    Some(req),
-                    if next == ThemeMode::NeonLight {
-                        "Switched to Neon Light"
-                    } else {
-                        "Switched to Neon Dark"
-                    },
-                );
-            });
-        }
-        {
-            let ctrl_c = Rc::clone(&ctrl);
-            let pop = popover.clone();
-            sync_btn.connect_clicked(move |_| {
-                pop.popdown();
-                ctrl_c.push_full_config_live();
-                ctrl_c.set_status_ok("Synchronized full configuration to live compositor");
-            });
-        }
-        {
-            let nav_fn = Rc::clone(&navigate_core);
-            let pop = popover.clone();
-            shortcuts_menu_btn.connect_clicked(move |_| {
-                pop.popdown();
-                nav_fn("shortcuts", true, None);
-            });
-        }
-        {
-            let nav_fn = Rc::clone(&navigate_core);
-            let pop = popover.clone();
-            about_menu_btn.connect_clicked(move |_| {
-                pop.popdown();
-                nav_fn(ABOUT_CATEGORY.id, true, None);
-            });
-        }
-
-        // Open initial page lazily
-        navigate_core(&initial_page, true, None);
-
         split.append(&sidebar);
-        split.append(&stack);
-        outer.append(&split);
-        outer.append(&status_bar);
+        split.append(&content_pane);
+        window.set_child(Some(&split));
 
-        window.set_child(Some(&outer));
+        // Present the window IMMEDIATELY, then build the initial page on the first frame
+        // so opening Settings from the Dock or App Drawer feels instantaneous!
         window.present();
+        let nav_init = Rc::clone(&navigate_core);
+        glib::idle_add_local_once(move || {
+            nav_init(&initial_page, true, None);
+        });
     });
 
     app.run_with_args::<&str>(&[]);

@@ -1,39 +1,30 @@
-//! 5.12 Power & Battery settings: UPower battery status/health/charging state,
-//! PowerProfilesDaemon selector (Power Saver / Balanced / Performance), screen dimming/blanking,
-//! suspend timeout, lid-close & power-button actions, and low-battery alerts.
+//! Battery & Power settings: live UPower battery level & health, PowerProfilesDaemon
+//! mode selector, and real systemd-logind / compositor session power actions.
 
 use std::rc::Rc;
 
 use gtk4::{Align, Box as GtkBox, Button, Orientation, ProgressBar, ScrolledWindow, Spinner, prelude::*};
+use neon_ipc::IpcRequest;
 use neon_system::power::{self, PowerStatus};
 
 use crate::{
     state::SettingsController,
     ui::{
-        append_rows, boxed_card, dropdown_row, info_row, page_shell, run_async, section_heading,
-        setting_row, status_badge, toggle_row,
+        append_rows, boxed_card, confirm_action_dialog, info_row, page_shell, run_async,
+        section_heading, setting_row, status_badge,
     },
 };
 
 pub fn build_page(ctrl: Rc<SettingsController>) -> ScrolledWindow {
-    let (scroller, page) = page_shell(
-        "Power & Battery",
-        "Monitor battery charge and health via UPower, switch system power profiles, and configure sleep timeouts.",
-        Some("power"),
-        &ctrl,
-    );
+    let (scroller, page) = page_shell();
 
-    let root = GtkBox::new(Orientation::Vertical, 4);
+    let root = GtkBox::new(Orientation::Vertical, 2);
     page.append(&root);
 
     let load_card = boxed_card();
     let spin = Spinner::new();
     spin.start();
-    load_card.append(&setting_row(
-        "Querying UPower & PowerProfiles…",
-        "Reading battery state and thermal/power profiles over D-Bus.",
-        &spin,
-    ));
+    load_card.append(&setting_row("Checking Power & Battery…", "", &spin));
     root.append(&load_card);
 
     let ctrl_done = Rc::clone(&ctrl);
@@ -50,8 +41,8 @@ fn render_power(root: &GtkBox, ctrl: Rc<SettingsController>, status: PowerStatus
         root.remove(&child);
     }
 
-    // ── Battery Status ───────────────────────────────────────────────────────
-    root.append(&section_heading("Battery & Energy"));
+    // ── Battery & Power Mode ─────────────────────────────────────────────────
+    root.append(&section_heading("Battery & Performance"));
     let bat_card = boxed_card();
 
     let mut bat_rows = Vec::new();
@@ -59,40 +50,39 @@ fn render_power(root: &GtkBox, ctrl: Rc<SettingsController>, status: PowerStatus
         let pct = status.battery_percentage.clamp(0.0, 100.0);
         let bar = ProgressBar::new();
         bar.set_fraction(pct / 100.0);
-        bar.set_width_request(180);
+        bar.set_width_request(165);
         bar.set_valign(Align::Center);
         bar.set_show_text(true);
         bar.set_text(Some(&format!("{pct:.0}%")));
 
         bat_rows.push(setting_row(
             "Battery Level",
-            &format!("Status: {}", status.battery_state.label()),
+            status.battery_state.label(),
             &bar,
         ));
         if let Some(health) = status.battery_health_percent {
             bat_rows.push(info_row(
-                "Battery Health (Capacity)",
-                "Current full-charge capacity compared to factory design capacity.",
+                "Battery Health",
+                "Maximum capacity relative to factory design.",
                 &format!("{health:.0}%"),
             ));
         }
     } else {
         bat_rows.push(setting_row(
-            "Power Supply",
-            "Running on AC mains power (no internal battery reported by UPower).",
+            "Power Source",
+            "Running on AC power.",
             &status_badge("AC Power", "ok"),
         ));
     }
 
-    // Power Profiles selector
     if !status.available_profiles.is_empty() {
-        let seg = GtkBox::new(Orientation::Horizontal, 4);
+        let seg = GtkBox::new(Orientation::Horizontal, 3);
         seg.add_css_class("settings-seg-track");
         seg.set_valign(Align::Center);
 
         for prof in &status.available_profiles {
             let label = match prof.as_str() {
-                "power-saver" => "Power Saver",
+                "power-saver" => "Low Power",
                 "balanced" => "Balanced",
                 "performance" => "Performance",
                 other => other,
@@ -113,10 +103,10 @@ fn render_power(root: &GtkBox, ctrl: Rc<SettingsController>, status: PowerStatus
                     move || power::set_power_profile(&p),
                     move |res| match res {
                         Ok(()) => {
-                            ctrl_done.set_status_ok(&format!("Switched power mode to {lbl}"));
+                            ctrl_done.set_status_ok(&format!("Power mode: {lbl}"));
                             ctrl_done.rebuild_page("power");
                         }
-                        Err(e) => ctrl_done.set_status_err(&format!("Power profile failed: {e}")),
+                        Err(e) => ctrl_done.set_status_err(&format!("Power mode failed: {e}")),
                     },
                 );
             });
@@ -125,158 +115,150 @@ fn render_power(root: &GtkBox, ctrl: Rc<SettingsController>, status: PowerStatus
 
         bat_rows.push(setting_row(
             "Power Mode",
-            "Live org.freedesktop.UPower.PowerProfiles hardware profile.",
+            "Active hardware performance profile.",
             &seg,
-        ));
-    } else {
-        bat_rows.push(setting_row(
-            "Power Profiles Daemon",
-            "power-profiles-daemon is not active on this system.",
-            &status_badge("Unavailable", "unavailable"),
         ));
     }
 
     append_rows(&bat_card, bat_rows);
     root.append(&bat_card);
 
-    // ── Screen & Suspend Timeouts ────────────────────────────────────────────
-    root.append(&section_heading("Screen Blank, Suspend & Hardware Buttons"));
-    let pwr_cfg = ctrl.config.borrow().power.clone();
-    let timeout_card = boxed_card();
+    // ── Session & System Power Controls ──────────────────────────────────────
+    root.append(&section_heading("Session & Power"));
+    let act_card = boxed_card();
 
-    let dim_opts: [u32; 5] = [0, 60, 180, 300, 600];
-    let dim_idx = dim_opts
-        .iter()
-        .position(|v| *v == pwr_cfg.screen_dim_seconds)
-        .unwrap_or(2) as u32;
+    let lock_btn = Button::with_label("Lock Screen");
+    lock_btn.add_css_class("settings-secondary-btn");
+    {
+        let ctrl_c = Rc::clone(&ctrl);
+        lock_btn.connect_clicked(move |_| {
+            let socket = ctrl_c.ipc_socket.clone();
+            let ctrl_done = Rc::clone(&ctrl_c);
+            run_async(
+                move || crate::state::send_ipc_socket(&socket, IpcRequest::LockSession),
+                move |res| match res {
+                    Ok(_) => ctrl_done.set_status_ok("Session locked"),
+                    Err(e) => ctrl_done.set_status_err(&format!("Lock failed: {e}")),
+                },
+            );
+        });
+    }
 
-    let blank_opts: [u32; 6] = [0, 180, 300, 600, 900, 1800];
-    let blank_idx = blank_opts
-        .iter()
-        .position(|v| *v == pwr_cfg.screen_blank_seconds)
-        .unwrap_or(3) as u32;
+    let sleep_btn = Button::with_label("Sleep");
+    sleep_btn.add_css_class("settings-secondary-btn");
+    sleep_btn.set_sensitive(status.can_suspend);
+    {
+        let ctrl_c = Rc::clone(&ctrl);
+        sleep_btn.connect_clicked(move |_| {
+            let ctrl_done = Rc::clone(&ctrl_c);
+            run_async(
+                || power::invoke_logind_action("Suspend"),
+                move |res| {
+                    if let Err(e) = res {
+                        ctrl_done.set_status_err(&format!("Sleep failed: {e}"));
+                    }
+                },
+            );
+        });
+    }
 
-    let susp_opts: [u32; 6] = [0, 600, 900, 1800, 3600, 7200];
-    let susp_idx = susp_opts
-        .iter()
-        .position(|v| *v == pwr_cfg.suspend_timeout_seconds)
-        .unwrap_or(3) as u32;
+    let logout_btn = Button::with_label("Log Out…");
+    logout_btn.add_css_class("settings-secondary-btn");
+    {
+        let ctrl_c = Rc::clone(&ctrl);
+        logout_btn.connect_clicked(move |_| {
+            let ctrl_inner = Rc::clone(&ctrl_c);
+            confirm_action_dialog(
+                &ctrl_c.window,
+                "Log Out of NEON DE?",
+                "All open applications in this session will be closed.",
+                "Log Out",
+                false,
+                move || {
+                    let ctrl_done = Rc::clone(&ctrl_inner);
+                    run_async(power::terminate_current_session, move |res| {
+                        if let Err(e) = res {
+                            ctrl_done.set_status_err(&format!("Log out failed: {e}"));
+                        }
+                    });
+                },
+            );
+        });
+    }
 
-    let actions = ["suspend", "lock", "poweroff", "nothing"];
-    let action_labels = ["Suspend", "Lock Screen", "Shut Down", "Do Nothing"];
-    let lid_idx = actions
-        .iter()
-        .position(|a| *a == pwr_cfg.lid_close_action.as_str())
-        .unwrap_or(0) as u32;
-    let btn_idx = actions
-        .iter()
-        .position(|a| *a == pwr_cfg.power_button_action.as_str())
-        .unwrap_or(0) as u32;
+    let restart_btn = Button::with_label("Restart…");
+    restart_btn.add_css_class("settings-secondary-btn");
+    restart_btn.set_sensitive(status.can_reboot);
+    {
+        let ctrl_c = Rc::clone(&ctrl);
+        restart_btn.connect_clicked(move |_| {
+            let ctrl_inner = Rc::clone(&ctrl_c);
+            confirm_action_dialog(
+                &ctrl_c.window,
+                "Restart Computer?",
+                "Your computer will restart immediately via systemd-logind.",
+                "Restart",
+                true,
+                move || {
+                    let ctrl_done = Rc::clone(&ctrl_inner);
+                    run_async(
+                        || power::invoke_logind_action("Reboot"),
+                        move |res| {
+                            if let Err(e) = res {
+                                ctrl_done.set_status_err(&format!("Restart failed: {e}"));
+                            }
+                        },
+                    );
+                },
+            );
+        });
+    }
+
+    let shutdown_btn = Button::with_label("Shut Down…");
+    shutdown_btn.add_css_class("settings-destructive-btn");
+    shutdown_btn.set_sensitive(status.can_power_off);
+    {
+        let ctrl_c = Rc::clone(&ctrl);
+        shutdown_btn.connect_clicked(move |_| {
+            let ctrl_inner = Rc::clone(&ctrl_c);
+            confirm_action_dialog(
+                &ctrl_c.window,
+                "Shut Down Computer?",
+                "Your computer will power off immediately via systemd-logind.",
+                "Shut Down",
+                true,
+                move || {
+                    let ctrl_done = Rc::clone(&ctrl_inner);
+                    run_async(
+                        || power::invoke_logind_action("PowerOff"),
+                        move |res| {
+                            if let Err(e) = res {
+                                ctrl_done.set_status_err(&format!("Shut down failed: {e}"));
+                            }
+                        },
+                    );
+                },
+            );
+        });
+    }
+
+    let session_btns = GtkBox::new(Orientation::Horizontal, 6);
+    session_btns.set_valign(Align::Center);
+    session_btns.append(&lock_btn);
+    session_btns.append(&sleep_btn);
+    session_btns.append(&logout_btn);
+
+    let power_btns = GtkBox::new(Orientation::Horizontal, 6);
+    power_btns.set_valign(Align::Center);
+    power_btns.append(&restart_btn);
+    power_btns.append(&shutdown_btn);
 
     append_rows(
-        &timeout_card,
+        &act_card,
         vec![
-            dropdown_row(
-                "Dim Screen When Inactive",
-                "Lower backlight brightness after inactivity.",
-                &["Never", "1 minute", "3 minutes", "5 minutes", "10 minutes"],
-                dim_idx,
-                {
-                    let ctrl_c = Rc::clone(&ctrl);
-                    move |idx| {
-                        let secs = dim_opts.get(idx as usize).copied().unwrap_or(180);
-                        ctrl_c.config.borrow_mut().power.screen_dim_seconds = secs;
-                        ctrl_c.persist_and_sync(None, "Updated screen dimming timeout");
-                    }
-                },
-            ),
-            dropdown_row(
-                "Automatic Screen Blanking",
-                "Turn display off after inactivity.",
-                &[
-                    "Never",
-                    "3 minutes",
-                    "5 minutes",
-                    "10 minutes",
-                    "15 minutes",
-                    "30 minutes",
-                ],
-                blank_idx,
-                {
-                    let ctrl_c = Rc::clone(&ctrl);
-                    move |idx| {
-                        let secs = blank_opts.get(idx as usize).copied().unwrap_or(600);
-                        {
-                            let mut cfg = ctrl_c.config.borrow_mut();
-                            cfg.power.screen_blank_seconds = secs;
-                            cfg.privacy_accessibility.screen_timeout_seconds = secs;
-                        }
-                        ctrl_c.persist_and_sync(None, "Updated screen blanking timeout");
-                    }
-                },
-            ),
-            dropdown_row(
-                "Automatic Suspend",
-                "Put computer to sleep after extended inactivity.",
-                &[
-                    "Never",
-                    "10 minutes",
-                    "15 minutes",
-                    "30 minutes",
-                    "1 hour",
-                    "2 hours",
-                ],
-                susp_idx,
-                {
-                    let ctrl_c = Rc::clone(&ctrl);
-                    move |idx| {
-                        let secs = susp_opts.get(idx as usize).copied().unwrap_or(1800);
-                        ctrl_c.config.borrow_mut().power.suspend_timeout_seconds = secs;
-                        ctrl_c.persist_and_sync(None, "Updated automatic suspend timeout");
-                    }
-                },
-            ),
-            dropdown_row(
-                "When Laptop Lid Is Closed",
-                "System response when closing the lid.",
-                &action_labels,
-                lid_idx,
-                {
-                    let ctrl_c = Rc::clone(&ctrl);
-                    move |idx| {
-                        let act = actions.get(idx as usize).copied().unwrap_or("suspend");
-                        ctrl_c.config.borrow_mut().power.lid_close_action = act.into();
-                        ctrl_c.persist_and_sync(None, "Updated lid-close behavior");
-                    }
-                },
-            ),
-            dropdown_row(
-                "Power Button Behavior",
-                "Action when pressing the physical power button.",
-                &action_labels,
-                btn_idx,
-                {
-                    let ctrl_c = Rc::clone(&ctrl);
-                    move |idx| {
-                        let act = actions.get(idx as usize).copied().unwrap_or("suspend");
-                        ctrl_c.config.borrow_mut().power.power_button_action = act.into();
-                        ctrl_c.persist_and_sync(None, "Updated power button behavior");
-                    }
-                },
-            ),
-            toggle_row(
-                "Low-Battery Notifications",
-                "Warn before battery reaches critical charge levels.",
-                pwr_cfg.low_battery_notifications,
-                {
-                    let ctrl_c = Rc::clone(&ctrl);
-                    move |v| {
-                        ctrl_c.config.borrow_mut().power.low_battery_notifications = v;
-                        ctrl_c.persist_and_sync(None, "Updated low-battery notifications");
-                    }
-                },
-            ),
+            setting_row("Session", "Lock screen, suspend, or sign out.", &session_btns),
+            setting_row("System Power", "Restart or shut down this machine.", &power_btns),
         ],
     );
-    root.append(&timeout_card);
+    root.append(&act_card);
 }

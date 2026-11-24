@@ -5,8 +5,12 @@ use std::{cell::RefCell, path::PathBuf, rc::Rc, time::Duration};
 
 use anyhow::{Context, Result};
 use neon_ipc::default_socket_path;
-use neon_renderer::{BlurSettings, NeonRenderer, screenshot::capture_output_to_png};
+use neon_renderer::{
+    BlurSettings, NeonRenderer,
+    screenshot::{capture_output_rgba, capture_output_to_png},
+};
 use smithay::{
+    reexports::wayland_server::Resource,
     backend::{
         renderer::{ImportDma, gles::GlesRenderer},
         winit::{self, WinitEvent},
@@ -385,6 +389,66 @@ fn render_frame(
                     ) {
                         Ok(()) => state.notify_screenshot_saved(shot_path),
                         Err(err) => warn!(%err, "Failed to capture winit screenshot"),
+                    }
+                }
+                if !state.pending_screencopy_frames.is_empty() {
+                    let frames = std::mem::take(&mut state.pending_screencopy_frames);
+                    let now_dur: Duration = state.clock.now().into();
+                    let or_popups: Vec<_> = state
+                        .override_redirect_windows
+                        .iter()
+                        .filter_map(|w| {
+                            let loc = state
+                                .space
+                                .element_location(w)
+                                .or_else(|| w.x11_surface().map(|s| s.geometry().loc))?;
+                            Some((w, loc))
+                        })
+                        .collect();
+                    let lock_surface = if is_locked {
+                        state.lock_state.surface_for_output(&output.name())
+                    } else {
+                        None
+                    };
+                    let scale_f = output.current_scale().fractional_scale();
+                    let output_origin = output.current_location();
+
+                    for pending in frames {
+                        if !pending.frame.is_alive() {
+                            continue;
+                        }
+                        let extra_top = if pending.overlay_cursor {
+                            neon_renderer.cursor_elements(
+                                renderer,
+                                state.pointer_location,
+                                output_origin,
+                                scale_f,
+                                &state.cursor_status,
+                            )
+                        } else {
+                            Vec::new()
+                        };
+                        if let Err(err) = capture_output_rgba(
+                            renderer,
+                            neon_renderer,
+                            output,
+                            &state.scene,
+                            blur,
+                            is_locked,
+                            lock_surface,
+                            &or_popups,
+                            extra_top,
+                            |id| state.managed_windows.get(&id),
+                            |rgba, w, h| {
+                                crate::wayland::screencopy::complete_screencopy_frame(
+                                    &pending, rgba, w, h, now_dur,
+                                );
+                                Ok(())
+                            },
+                        ) {
+                            warn!(%err, "Failed to capture zwlr_screencopy_frame_v1 on winit");
+                            pending.frame.failed();
+                        }
                     }
                 }
                 let result = if is_locked {

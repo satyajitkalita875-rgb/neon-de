@@ -12,23 +12,24 @@
 
 **NEON DE** is a custom Linux Wayland desktop environment written in **Rust (edition 2024)** using **Smithay 0.7** (DRM/KMS + EGL/Glow + libinput + XWayland) for the compositor and **GTK4 + gtk4-layer-shell** for the shell and settings UI.
 
-### Workspace Crates (14 total)
+### Workspace Crates (15 total)
 | Crate | Role |
 | --- | --- |
 | `crates/neon-compositor` | Wayland compositor (`neon-compositor`) — DRM/KMS & Winit backends, input, IPC server, XDG shell, layer-shell, `zxdg_decoration_manager_v1` SSD titlebars, XWayland, `ext_session_lock_v1` |
 | `crates/neon-renderer` | OpenGL/Glow renderer, shaders, rounded corners, drop shadows, blur, GPU-rendered macOS-style SSD titlebars, cursor rendering, screenshots |
 | `crates/neon-scene` | Retained scene graph with layer ordering and dirty-region tracking |
 | `crates/neon-window-manager` | Window placement, state machine, snapping/tiling geometry, per-app window rules |
-| `crates/neon-workspaces` | Dynamic & fixed virtual workspace management |
+| `crates/neon-workspaces` | Dynamic & pinned multi-desktop (up to 10) workspace management |
 | `crates/neon-output` | Multi-monitor layout, scaling, transform, mirroring, hotplug |
-| `crates/neon-effects` | Animation curves, retargeting, reduced motion |
+| `crates/neon-effects` | Material 3 Expressive spring physics, retargeting, reduced motion |
 | `crates/neon-config` | Versioned (`CURRENT_SCHEMA_VERSION = 2`), clamped, atomic-write TOML config (`~/.config/neon-de/config.toml`) with automatic migration & corrupt-file backup |
 | `crates/neon-ipc` | Authenticated Unix domain socket IPC (`0700` dir, `0600` socket, `SO_PEERCRED` same-UID check, bounded JSON frames, zero arbitrary shell exec) |
-| `crates/neon-system` | Native Linux system adapters: NetworkManager (`zbus`/`nmcli`), BlueZ (`zbus`), PipeWire/WirePlumber (`wpctl`), UPower/PowerProfiles/logind (`zbus`), Notifications v1.2, Polkit, XDG Portals, Storage (`udisksctl`/`lsblk`/`df`/CUPS/SANE), DateTime (`timedate1`/`localectl`), Apps (`xdg-mime`/`.desktop`/autostart), Users (`AccountsService`), Updates (`apt`/`dpkg`) |
-| `crates/neon-shell` | GTK4 + layer-shell desktop UI: top panel, floating dock, wallpaper, overview/launchpad, quick settings, native right-click context menu (`context_menu.rs`) |
+| `crates/neon-system` | Native Linux system adapters: NetworkManager (`zbus`/`nmcli`), BlueZ (`zbus`), PipeWire/WirePlumber (`wpctl`), UPower/PowerProfiles/logind (`zbus`), MPRIS2 (`zbus`), Notifications v1.2, Polkit, XDG Portals, Storage (`udisksctl`/`lsblk`/`df`/CUPS/SANE), DateTime (`timedate1`/`localectl`), Apps (`xdg-mime`/`.desktop`/autostart), Users (`AccountsService`), Updates (`apt`/`dpkg`) |
+| `crates/neon-shell` | GTK4 + layer-shell desktop UI: top panel, floating dock, wallpaper, 60 FPS Launchpad app drawer, Liquid Glass Control Center, Workspaces panel (up to 10 desktops), native right-click context menu |
 | `crates/neon-settings` | Complete macOS-inspired × GNOME × KDE-depth GTK4 Settings app (22 categories, modular architecture, lazy page loading, global search, capability badges) |
 | `crates/neon-lockscreen` | Wayland `ext_session_lock_v1` lock screen |
 | `crates/neon-session` | Session launcher/supervisor (`neon-session`) with crash-loop recovery & XWayland `DISPLAY` export |
+| `crates/neon-mcp` | Spec-compliant MCP stdio JSON-RPC 2.0 control server (`neon-mcp`) with live IPC auto-discovery, 25 typed desktop/system/app control tools, and 3 live resources |
 
 ### Design Philosophy & Hard Constraints
 - **Visual identity**: macOS System Settings polish (two-panel layout, sidebar, cards, traffic-light window controls, Light & Dark modes) + GNOME clarity + KDE depth — with **NEON DE's own branding** (do not copy Apple branding/assets verbatim).
@@ -140,7 +141,7 @@ Refactored `crates/neon-settings` out of the old monolithic `pages.rs` / `pages_
 ## 4. Build, Test & Install State (IMPORTANT GOTCHAS)
 
 ### Test Status
-- `cargo test --workspace` passes **60/60 tests** across all 14 crates (`neon-config`: 5, `neon-system`: 14, `neon-settings`: 5, `neon-compositor`: 9, `neon-window-manager`: 6, `neon-effects`: 5, `neon-workspaces`: 4, `neon-renderer`: 3, `neon-ipc`: 2, `neon-output`: 2, `neon-scene`: 2, `neon-shell`: 2, `neon-session`: 1).
+- `cargo test --workspace` passes **64/64 tests** across all 15 crates (`neon-config`: 5, `neon-system`: 14, `neon-settings`: 5, `neon-compositor`: 9, `neon-window-manager`: 6, `neon-effects`: 5, `neon-workspaces`: 4, `neon-mcp`: 4, `neon-renderer`: 3, `neon-ipc`: 2, `neon-output`: 2, `neon-scene`: 2, `neon-shell`: 2, `neon-session`: 1).
 
 ### Known Cargo `target/` Permission Gotcha
 - Earlier `sudo scripts/install.sh` left root-owned build artifacts inside `target/release/deps/`.

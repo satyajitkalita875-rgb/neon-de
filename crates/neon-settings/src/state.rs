@@ -1,9 +1,16 @@
-//! Shared Settings state controller bridging XDG `neon-config`, live `neon-ipc`,
-//! GTK toolkit synchronization, and UI feedback notifications.
+//! Shared Settings state controller bridging XDG `neon-config`, non-blocking `neon-ipc`,
+//! GTK toolkit synchronization, and auto-hiding transient feedback toasts.
 
-use std::{cell::RefCell, path::PathBuf, process::Command, rc::Rc};
+use std::{
+    cell::RefCell,
+    path::PathBuf,
+    process::Command,
+    rc::Rc,
+    sync::mpsc,
+    time::Duration,
+};
 
-use gtk4::{ApplicationWindow, Box as GtkBox, Label, prelude::*};
+use gtk4::{ApplicationWindow, Box as GtkBox, Label, glib, prelude::*};
 use neon_config::{FocusMode, NeonConfig, ThemeMode, WindowButtonLayout, save_atomic};
 use neon_ipc::{DiagnosticsInfo, IpcClient, IpcPayload, IpcRequest, IpcResult, OutputInfo};
 use tracing::warn;
@@ -12,6 +19,23 @@ use crate::ui::style::SettingsTheme;
 
 type NavCallback = Rc<dyn Fn(&str, Option<&str>)>;
 type RebuildCallback = Rc<dyn Fn(&str)>;
+
+enum WorkerMsg {
+    PersistAndSync {
+        config_path: PathBuf,
+        ipc_socket: PathBuf,
+        cfg: NeonConfig,
+        req: Option<IpcRequest>,
+    },
+    PersistSilent {
+        config_path: PathBuf,
+        cfg: NeonConfig,
+    },
+    PushFull {
+        ipc_socket: PathBuf,
+        reqs: Vec<IpcRequest>,
+    },
+}
 
 /// Central state & IPC controller shared across all Settings pages.
 pub struct SettingsController {
@@ -24,100 +48,130 @@ pub struct SettingsController {
     pub window: ApplicationWindow,
     pub navigate_cb: RefCell<Option<NavCallback>>,
     pub rebuild_page_cb: RefCell<Option<RebuildCallback>>,
+    toast_timer: RefCell<Option<glib::SourceId>>,
+    worker_tx: mpsc::Sender<WorkerMsg>,
 }
 
 impl SettingsController {
-    /// Saves the updated configuration atomically, refreshes theme CSS, and optionally
-    /// sends an immediate live IPC update to `neon-compositor`.
+    pub fn new(
+        config_path: PathBuf,
+        ipc_socket: PathBuf,
+        config: NeonConfig,
+        theme: SettingsTheme,
+        status_label: Label,
+        status_bar: GtkBox,
+        window: ApplicationWindow,
+    ) -> Self {
+        let (tx, rx) = mpsc::channel::<WorkerMsg>();
+        // Single dedicated background thread preserves write & IPC ordering without blocking GTK.
+        std::thread::spawn(move || {
+            while let Ok(msg) = rx.recv() {
+                match msg {
+                    WorkerMsg::PersistAndSync {
+                        config_path,
+                        ipc_socket,
+                        cfg,
+                        req,
+                    } => {
+                        if let Err(err) = save_atomic(&config_path, &cfg) {
+                            warn!(?err, "Failed to persist NEON DE config");
+                        }
+                        if let Some(request) = req {
+                            if let Ok(mut client) = IpcClient::connect(&ipc_socket) {
+                                let _ = client.request(request);
+                            }
+                        }
+                    }
+                    WorkerMsg::PersistSilent { config_path, cfg } => {
+                        if let Err(err) = save_atomic(&config_path, &cfg) {
+                            warn!(?err, "Silent config save failed");
+                        }
+                    }
+                    WorkerMsg::PushFull { ipc_socket, reqs } => {
+                        if let Ok(mut client) = IpcClient::connect(&ipc_socket) {
+                            for req in reqs {
+                                let _ = client.request(req);
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        Self {
+            config_path,
+            ipc_socket,
+            config: RefCell::new(config),
+            theme,
+            status_label,
+            status_bar,
+            window,
+            navigate_cb: RefCell::new(None),
+            rebuild_page_cb: RefCell::new(None),
+            toast_timer: RefCell::new(None),
+            worker_tx: tx,
+        }
+    }
+
+    /// Saves the updated configuration atomically on the background worker, refreshes CSS only
+    /// if theme/accent changed, and sends live IPC updates without stalling the UI thread.
     pub fn persist_and_sync(&self, req: Option<IpcRequest>, note: &str) {
         let cfg = self.config.borrow().clone();
         self.theme
             .update(cfg.appearance.theme, &cfg.appearance.accent_color);
 
-        let saved_ok = match save_atomic(&self.config_path, &cfg) {
-            Ok(()) => true,
-            Err(err) => {
-                warn!(?err, "Failed to persist NEON DE config");
-                self.set_status_err(&format!("Save failed: {err}"));
-                false
-            }
-        };
-
-        if let Some(request) = req {
-            match self.send_ipc(request) {
-                Ok(IpcResult::Ok { .. }) => {
-                    if saved_ok {
-                        self.set_status_ok(&format!("{note} — applied live & saved"));
-                    }
-                }
-                Ok(IpcResult::Err { message, .. }) => {
-                    if saved_ok {
-                        self.set_status_err(&format!("{note} — saved (compositor error: {message})"));
-                    }
-                }
-                Err(err) => {
-                    if saved_ok {
-                        self.set_status_info(&format!(
-                            "{note} — saved (compositor offline: {err})"
-                        ));
-                    }
-                }
-            }
-        } else if saved_ok {
-            self.set_status_ok(&format!("{note} — saved"));
-        }
+        let _ = self.worker_tx.send(WorkerMsg::PersistAndSync {
+            config_path: self.config_path.clone(),
+            ipc_socket: self.ipc_socket.clone(),
+            cfg,
+            req,
+        });
+        self.set_status_ok(note);
     }
 
-    /// Saves configuration quietly (used for UI state such as remembering the last opened page).
+    /// Saves configuration quietly on the background worker (e.g. last opened page).
     pub fn persist_silent(&self) {
         let cfg = self.config.borrow().clone();
-        if let Err(err) = save_atomic(&self.config_path, &cfg) {
-            warn!(?err, "Silent config save failed");
+        let _ = self.worker_tx.send(WorkerMsg::PersistSilent {
+            config_path: self.config_path.clone(),
+            cfg,
+        });
+    }
+
+    fn show_toast(&self, msg: &str, variant: Option<&str>, auto_hide_ms: u64) {
+        self.status_bar.remove_css_class("status-ok");
+        self.status_bar.remove_css_class("status-error");
+        if let Some(cls) = variant {
+            self.status_bar.add_css_class(cls);
         }
+        self.status_label.set_text(msg);
+        self.status_bar.set_visible(true);
+
+        if let Some(prev) = self.toast_timer.borrow_mut().take() {
+            prev.remove();
+        }
+        let bar = self.status_bar.clone();
+        let id = glib::timeout_add_local_once(Duration::from_millis(auto_hide_ms), move || {
+            bar.set_visible(false);
+        });
+        *self.toast_timer.borrow_mut() = Some(id);
     }
 
     pub fn set_status_ok(&self, msg: &str) {
-        self.status_bar.remove_css_class("status-error");
-        self.status_bar.add_css_class("status-ok");
-        self.status_label.set_text(msg);
+        self.show_toast(msg, Some("status-ok"), 2200);
     }
 
     pub fn set_status_err(&self, msg: &str) {
-        self.status_bar.remove_css_class("status-ok");
-        self.status_bar.add_css_class("status-error");
-        self.status_label.set_text(msg);
+        self.show_toast(msg, Some("status-error"), 4000);
     }
 
     pub fn set_status_info(&self, msg: &str) {
-        self.status_bar.remove_css_class("status-ok");
-        self.status_bar.remove_css_class("status-error");
-        self.status_label.set_text(msg);
+        self.show_toast(msg, None, 2200);
     }
 
-    /// Sends a typed IPC request to `neon-compositor`.
+    /// Sends a typed IPC request to `neon-compositor` synchronously (prefer calling inside `run_async`).
     pub fn send_ipc(&self, req: IpcRequest) -> Result<IpcResult, String> {
-        let mut client = IpcClient::connect(&self.ipc_socket).map_err(|e| e.to_string())?;
-        client.request(req).map_err(|e| e.to_string())
-    }
-
-    /// Fetches live logical monitor outputs from `neon-compositor`.
-    pub fn fetch_outputs(&self) -> Vec<OutputInfo> {
-        match self.send_ipc(IpcRequest::GetOutputs) {
-            Ok(IpcResult::Ok {
-                payload: IpcPayload::Outputs { outputs },
-            }) => outputs,
-            _ => Vec::new(),
-        }
-    }
-
-    /// Fetches live frame timing & runtime diagnostics from `neon-compositor`.
-    pub fn fetch_diagnostics(&self) -> Option<DiagnosticsInfo> {
-        match self.send_ipc(IpcRequest::GetDiagnostics) {
-            Ok(IpcResult::Ok {
-                payload: IpcPayload::Diagnostics { diagnostics },
-            }) => Some(diagnostics),
-            _ => None,
-        }
+        send_ipc_socket(&self.ipc_socket, req)
     }
 
     /// Pushes effects, appearance, and window-behavior settings live to `neon-compositor`.
@@ -125,29 +179,41 @@ impl SettingsController {
         let cfg = self.config.borrow().clone();
         self.theme
             .update(cfg.appearance.theme, &cfg.appearance.accent_color);
-        let _ = self.send_ipc(build_effects_request(&cfg));
-        let _ = self.send_ipc(build_appearance_request(&cfg));
-        let _ = self.send_ipc(build_window_behavior_request(&cfg));
+        let reqs = vec![
+            build_effects_request(&cfg),
+            build_appearance_request(&cfg),
+            build_window_behavior_request(&cfg),
+        ];
+        let _ = self.worker_tx.send(WorkerMsg::PushFull {
+            ipc_socket: self.ipc_socket.clone(),
+            reqs,
+        });
     }
 
     /// Resets a single settings category back to defaults, syncs live, and refreshes the page UI.
     pub fn reset_category(&self, category_id: &str) {
-        let changed = self.config.borrow_mut().reset_category(category_id);
+        let changed = match category_id {
+            "dock" => {
+                let mut cfg = self.config.borrow_mut();
+                let a = cfg.reset_category("dock");
+                let b = cfg.reset_category("effects");
+                let c = cfg.reset_category("windows");
+                a || b || c
+            }
+            other => self.config.borrow_mut().reset_category(other),
+        };
         if !changed {
-            self.set_status_info("No configurable defaults to reset for this category");
+            self.set_status_info("Already at default settings");
             return;
         }
-        let cfg = self.config.borrow().clone();
-        if let Err(err) = save_atomic(&self.config_path, &cfg) {
-            self.set_status_err(&format!("Reset save failed: {err}"));
-            return;
-        }
+        self.persist_silent();
         self.push_full_config_live();
         self.rebuild_page(category_id);
-        self.set_status_ok(&format!("Restored defaults for {category_id}"));
+        self.set_status_ok("Restored default settings");
     }
 
     /// Navigates programmatically to any category (optionally focusing a setting id).
+    #[allow(dead_code)]
     pub fn navigate_to(&self, category_id: &str, highlight_setting: Option<&str>) {
         let cb = self.navigate_cb.borrow().clone();
         if let Some(cb) = cb {
@@ -161,6 +227,29 @@ impl SettingsController {
         if let Some(cb) = cb {
             cb(category_id);
         }
+    }
+}
+
+pub fn send_ipc_socket(socket: &std::path::Path, req: IpcRequest) -> Result<IpcResult, String> {
+    let mut client = IpcClient::connect(socket).map_err(|e| e.to_string())?;
+    client.request(req).map_err(|e| e.to_string())
+}
+
+pub fn fetch_outputs_sync(socket: &std::path::Path) -> Vec<OutputInfo> {
+    match send_ipc_socket(socket, IpcRequest::GetOutputs) {
+        Ok(IpcResult::Ok {
+            payload: IpcPayload::Outputs { outputs },
+        }) => outputs,
+        _ => Vec::new(),
+    }
+}
+
+pub fn fetch_diagnostics_sync(socket: &std::path::Path) -> Option<DiagnosticsInfo> {
+    match send_ipc_socket(socket, IpcRequest::GetDiagnostics) {
+        Ok(IpcResult::Ok {
+            payload: IpcPayload::Diagnostics { diagnostics },
+        }) => Some(diagnostics),
+        _ => None,
     }
 }
 
@@ -282,8 +371,7 @@ pub fn apply_toolkit_appearance(
     });
 }
 
-/// Synchronizes window titlebar button layout (macOS left traffic lights vs right controls)
-/// to GTK/gsettings.
+/// Synchronizes window titlebar button layout (macOS left traffic lights vs right controls).
 pub fn apply_window_button_layout(layout: WindowButtonLayout) {
     let val = match layout {
         WindowButtonLayout::LeftTrafficLights => "close,minimize,maximize:",

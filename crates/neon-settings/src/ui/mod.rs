@@ -1,76 +1,31 @@
-//! Reusable macOS × GNOME 47 GTK4 UI building blocks, async task helper,
-//! capability badges, confirmation modals, and display revert countdown dialog.
+//! Reusable macOS-style GTK4 UI building blocks, async task helper,
+//! debounced sliders, confirmation modals, and display revert countdown dialog.
 
 pub mod style;
 
-use std::{cell::Cell, rc::Rc, sync::mpsc, time::Duration};
+use std::{
+    cell::{Cell, RefCell},
+    rc::Rc,
+    sync::mpsc,
+    time::Duration,
+};
 
 use gtk4::{
     Align, ApplicationWindow, Box as GtkBox, Button, DropDown, Label, Orientation, PolicyType,
     Scale, ScrolledWindow, Separator, StringList, Switch, Window, glib, prelude::*,
 };
 
-use crate::{metadata::CapabilityStatus, state::SettingsController};
+use crate::state::SettingsController;
 
-/// Creates a centered clamped scrollable settings page with consistent header
-/// (title, description, and optional per-category Reset button).
-pub fn page_shell(
-    title: &str,
-    description: &str,
-    reset_category: Option<&'static str>,
-    ctrl: &Rc<SettingsController>,
-) -> (ScrolledWindow, GtkBox) {
+/// Creates a clean macOS-style scrollable settings column WITHOUT duplicating the header bar title.
+pub fn page_shell() -> (ScrolledWindow, GtkBox) {
     let outer = GtkBox::new(Orientation::Vertical, 0);
-    outer.set_halign(Align::Center);
+    outer.set_halign(Align::Fill);
     outer.set_hexpand(true);
 
-    let column = GtkBox::new(Orientation::Vertical, 4);
+    let column = GtkBox::new(Orientation::Vertical, 2);
     column.add_css_class("settings-content-clamp");
-    column.set_width_request(620);
-
-    // Page header bar: Title + optional Reset button
-    let header_row = GtkBox::new(Orientation::Horizontal, 12);
-    header_row.set_valign(Align::Center);
-
-    let title_box = GtkBox::new(Orientation::Vertical, 3);
-    title_box.set_hexpand(true);
-
-    let title_lbl = Label::new(Some(title));
-    title_lbl.add_css_class("settings-page-title");
-    title_lbl.set_halign(Align::Start);
-    title_box.append(&title_lbl);
-
-    let desc_lbl = Label::new(Some(description));
-    desc_lbl.add_css_class("settings-page-desc");
-    desc_lbl.set_halign(Align::Start);
-    desc_lbl.set_wrap(true);
-    title_box.append(&desc_lbl);
-
-    header_row.append(&title_box);
-
-    if let Some(cat_id) = reset_category {
-        let reset_btn = Button::with_label("Reset Defaults");
-        reset_btn.add_css_class("settings-secondary-btn");
-        reset_btn.set_valign(Align::Start);
-        let ctrl_c = Rc::clone(ctrl);
-        let title_owned = title.to_string();
-        reset_btn.connect_clicked(move |_| {
-            let ctrl_inner = Rc::clone(&ctrl_c);
-            confirm_action_dialog(
-                &ctrl_c.window,
-                &format!("Reset {title_owned}?"),
-                "This restores all settings in this category to NEON DE defaults.",
-                "Reset Category",
-                true,
-                move || {
-                    ctrl_inner.reset_category(cat_id);
-                },
-            );
-        });
-        header_row.append(&reset_btn);
-    }
-
-    column.append(&header_row);
+    column.set_hexpand(true);
     outer.append(&column);
 
     let scroller = ScrolledWindow::builder()
@@ -81,6 +36,37 @@ pub fn page_shell(
         .child(&outer)
         .build();
     (scroller, column)
+}
+
+/// Optional macOS-style bottom-right "Reset Defaults…" footer button for configurable pages.
+pub fn page_reset_footer(
+    category_id: &'static str,
+    category_title: &str,
+    ctrl: &Rc<SettingsController>,
+) -> GtkBox {
+    let row = GtkBox::new(Orientation::Horizontal, 8);
+    row.set_halign(Align::End);
+    row.set_margin_top(6);
+
+    let reset_btn = Button::with_label("Reset Defaults…");
+    reset_btn.add_css_class("settings-secondary-btn");
+    let ctrl_c = Rc::clone(ctrl);
+    let title_owned = category_title.to_string();
+    reset_btn.connect_clicked(move |_| {
+        let ctrl_inner = Rc::clone(&ctrl_c);
+        confirm_action_dialog(
+            &ctrl_c.window,
+            &format!("Reset {title_owned}?"),
+            "This restores all settings on this page to NEON DE defaults.",
+            "Reset",
+            true,
+            move || {
+                ctrl_inner.reset_category(category_id);
+            },
+        );
+    });
+    row.append(&reset_btn);
+    row
 }
 
 pub fn section_heading(title: &str) -> Label {
@@ -112,11 +98,11 @@ pub fn append_rows(card: &GtkBox, rows: Vec<GtkBox>) {
 }
 
 pub fn setting_row(title: &str, subtitle: &str, control: &impl IsA<gtk4::Widget>) -> GtkBox {
-    let row = GtkBox::new(Orientation::Horizontal, 16);
+    let row = GtkBox::new(Orientation::Horizontal, 14);
     row.add_css_class("settings-row");
     row.set_valign(Align::Center);
 
-    let text = GtkBox::new(Orientation::Vertical, 2);
+    let text = GtkBox::new(Orientation::Vertical, 1);
     text.set_hexpand(true);
     text.set_valign(Align::Center);
 
@@ -149,19 +135,6 @@ pub fn status_badge(text: &str, variant: &str) -> Label {
     badge
 }
 
-pub fn capability_badge(status: CapabilityStatus) -> Label {
-    status_badge(status.badge_label(), status.css_class())
-}
-
-pub fn capability_row(title: &str, subtitle: &str, status: CapabilityStatus) -> GtkBox {
-    let effective_sub = match status {
-        CapabilityStatus::Unsupported(reason) if subtitle.is_empty() => reason.to_string(),
-        CapabilityStatus::Unsupported(reason) => format!("{subtitle} — {reason}"),
-        _ => subtitle.to_string(),
-    };
-    setting_row(title, &effective_sub, &capability_badge(status))
-}
-
 pub fn info_row(title: &str, subtitle: &str, value: &str) -> GtkBox {
     let val = Label::new(Some(value));
     val.add_css_class("settings-row-desc");
@@ -186,6 +159,7 @@ pub fn toggle_row(
     setting_row(title, subtitle, &sw)
 }
 
+/// Smooth macOS slider row with 45ms debounce so dragging never floods disk/IPC on every pixel.
 pub fn slider_row(
     title: &str,
     subtitle: &str,
@@ -198,11 +172,26 @@ pub fn slider_row(
 ) -> GtkBox {
     let scale = Scale::with_range(Orientation::Horizontal, min, max, step);
     scale.add_css_class("settings-scale");
-    scale.set_width_request(190);
+    scale.set_width_request(185);
     scale.set_draw_value(true);
     scale.set_digits(digits);
     scale.set_value(initial.clamp(min, max));
-    scale.connect_value_changed(move |s| on_change(s.value()));
+
+    let cb = Rc::new(on_change);
+    let pending: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
+    scale.connect_value_changed(move |s| {
+        let val = s.value();
+        if let Some(prev) = pending.borrow_mut().take() {
+            prev.remove();
+        }
+        let cb_c = Rc::clone(&cb);
+        let pending_c = Rc::clone(&pending);
+        let id = glib::timeout_add_local_once(Duration::from_millis(45), move || {
+            *pending_c.borrow_mut() = None;
+            cb_c(val);
+        });
+        *pending.borrow_mut() = Some(id);
+    });
     setting_row(title, subtitle, &scale)
 }
 
@@ -220,7 +209,7 @@ pub fn dropdown_row(
     setting_row(title, subtitle, &dd)
 }
 
-/// Runs a blocking system/D-Bus operation on a background thread and delivers
+/// Runs a blocking system/D-Bus/disk operation on a background thread and delivers
 /// the result safely back to the GTK main thread without freezing the UI.
 pub fn run_async<T: Send + 'static>(
     work: impl FnOnce() -> T + Send + 'static,
@@ -231,7 +220,7 @@ pub fn run_async<T: Send + 'static>(
         let _ = tx.send(work());
     });
     let mut callback = Some(on_done);
-    glib::timeout_add_local(Duration::from_millis(35), move || match rx.try_recv() {
+    glib::timeout_add_local(Duration::from_millis(20), move || match rx.try_recv() {
         Ok(result) => {
             if let Some(cb) = callback.take() {
                 cb(result);
@@ -257,15 +246,15 @@ pub fn confirm_action_dialog(
         .modal(true)
         .resizable(false)
         .title(title)
-        .default_width(390)
+        .default_width(370)
         .build();
     dialog.add_css_class("neon-settings-window");
 
-    let vbox = GtkBox::new(Orientation::Vertical, 14);
-    vbox.set_margin_top(20);
-    vbox.set_margin_bottom(20);
-    vbox.set_margin_start(22);
-    vbox.set_margin_end(22);
+    let vbox = GtkBox::new(Orientation::Vertical, 12);
+    vbox.set_margin_top(18);
+    vbox.set_margin_bottom(18);
+    vbox.set_margin_start(20);
+    vbox.set_margin_end(20);
 
     let heading = Label::new(Some(title));
     heading.add_css_class("settings-section-title");
@@ -276,7 +265,7 @@ pub fn confirm_action_dialog(
     msg.set_halign(Align::Start);
     msg.set_wrap(true);
 
-    let actions = GtkBox::new(Orientation::Horizontal, 10);
+    let actions = GtkBox::new(Orientation::Horizontal, 8);
     actions.set_halign(Align::End);
     actions.set_margin_top(6);
 
@@ -293,7 +282,7 @@ pub fn confirm_action_dialog(
     } else {
         "settings-action-btn"
     });
-    let cb = Rc::new(std::cell::RefCell::new(Some(on_confirm)));
+    let cb = Rc::new(RefCell::new(Some(on_confirm)));
     {
         let dlg = dialog.clone();
         confirm_btn.connect_clicked(move |_| {
@@ -315,7 +304,6 @@ pub fn confirm_action_dialog(
 }
 
 /// Shows a display configuration confirmation dialog with a live countdown timer.
-/// If the user clicks "Revert" or the countdown reaches 0, `on_revert` runs automatically.
 pub fn display_confirm_countdown_dialog(
     parent: &ApplicationWindow,
     seconds: u32,
@@ -327,15 +315,15 @@ pub fn display_confirm_countdown_dialog(
         .modal(true)
         .resizable(false)
         .title("Keep Display Changes?")
-        .default_width(420)
+        .default_width(390)
         .build();
     dialog.add_css_class("neon-settings-window");
 
-    let vbox = GtkBox::new(Orientation::Vertical, 14);
-    vbox.set_margin_top(20);
-    vbox.set_margin_bottom(20);
-    vbox.set_margin_start(22);
-    vbox.set_margin_end(22);
+    let vbox = GtkBox::new(Orientation::Vertical, 12);
+    vbox.set_margin_top(18);
+    vbox.set_margin_bottom(18);
+    vbox.set_margin_start(20);
+    vbox.set_margin_end(20);
 
     let heading = Label::new(Some("Keep these display settings?"));
     heading.add_css_class("settings-section-title");
@@ -348,15 +336,15 @@ pub fn display_confirm_countdown_dialog(
     countdown_lbl.set_halign(Align::Start);
     countdown_lbl.set_wrap(true);
 
-    let actions = GtkBox::new(Orientation::Horizontal, 10);
+    let actions = GtkBox::new(Orientation::Horizontal, 8);
     actions.set_halign(Align::End);
     actions.set_margin_top(6);
 
     let settled = Rc::new(Cell::new(false));
-    let keep_cb = Rc::new(std::cell::RefCell::new(Some(on_keep)));
-    let revert_cb = Rc::new(std::cell::RefCell::new(Some(on_revert)));
+    let keep_cb = Rc::new(RefCell::new(Some(on_keep)));
+    let revert_cb = Rc::new(RefCell::new(Some(on_revert)));
 
-    let revert_btn = Button::with_label("Revert Settings");
+    let revert_btn = Button::with_label("Revert");
     revert_btn.add_css_class("settings-secondary-btn");
     {
         let dlg = dialog.clone();
@@ -388,7 +376,6 @@ pub fn display_confirm_countdown_dialog(
         });
     }
 
-    // Also revert if user closes the dialog via X without clicking Keep Changes
     {
         let settled_c = Rc::clone(&settled);
         let revert_c = Rc::clone(&revert_cb);
@@ -402,7 +389,6 @@ pub fn display_confirm_countdown_dialog(
         });
     }
 
-    // Live 1-second countdown timer
     let remaining = Rc::new(Cell::new(seconds));
     {
         let dlg = dialog.clone();

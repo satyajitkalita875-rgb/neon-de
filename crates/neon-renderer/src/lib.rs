@@ -23,13 +23,15 @@ use smithay::{
             surface::{WaylandSurfaceRenderElement, render_elements_from_surface_tree},
             utils::RescaleRenderElement,
         },
-        gles::{GlesError, GlesRenderer, GlesTarget, Uniform, element::PixelShaderElement},
+        gles::{
+            GlesError, GlesRenderer, GlesTarget, GlesTexture, Uniform, element::PixelShaderElement,
+        },
     },
     desktop::{Window, layer_map_for_output},
     input::pointer::{CursorIcon, CursorImageAttributes, CursorImageStatus},
     output::Output,
     render_elements,
-    utils::{Logical, Physical, Point, Rectangle, Scale, Size},
+    utils::{Buffer as BufferCoord, Logical, Physical, Point, Rectangle, Scale, Size},
     wayland::{
         compositor::with_states, session_lock::LockSurface, shell::wlr_layer::Layer as WlrLayer,
     },
@@ -127,6 +129,7 @@ pub struct NeonRenderer {
     titlebar_cache: HashMap<WindowId, CachedTitlebar>,
     backdrop_cache: Option<CachedBackdrop>,
     cursor_cache: CursorCache,
+    pub(crate) screencopy_offscreen: Option<(Size<i32, BufferCoord>, GlesTexture)>,
 }
 
 impl NeonRenderer {
@@ -160,6 +163,7 @@ impl NeonRenderer {
             titlebar_cache: HashMap::new(),
             backdrop_cache: None,
             cursor_cache: CursorCache::load_default(),
+            screencopy_offscreen: None,
         }
     }
 

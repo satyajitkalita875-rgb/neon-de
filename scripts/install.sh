@@ -66,6 +66,7 @@ BINARIES=(
     neon-settings
     neon-lockscreen
     neon-session
+    neon-mcp
 )
 
 BIN_DIR="${PREFIX}/bin"

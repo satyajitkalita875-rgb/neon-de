@@ -252,6 +252,16 @@ fn run_session(cli: Cli) -> Result<ExitCode> {
             .env("XCURSOR_THEME", &cursor_theme)
             .env("XCURSOR_SIZE", &cursor_size)
             .status();
+        // Refresh XDG Desktop Portals so ScreenCast (xdg-desktop-portal-wlr for OBS/WebRTC)
+        // binds cleanly to the live WAYLAND_DISPLAY and XDG_CURRENT_DESKTOP=NEON-DE.
+        let _ = Command::new("systemctl")
+            .args([
+                "--user",
+                "try-restart",
+                "xdg-desktop-portal.service",
+                "xdg-desktop-portal-wlr.service",
+            ])
+            .spawn();
     }
 
     let mut shell_child: Option<Child> = if !cli.no_shell {
