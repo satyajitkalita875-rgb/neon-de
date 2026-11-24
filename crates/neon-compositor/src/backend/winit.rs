@@ -12,6 +12,8 @@ use neon_renderer::{
 use smithay::{
     reexports::wayland_server::Resource,
     backend::{
+        drm::{DrmNode, NodeType},
+        egl::EGLDevice,
         renderer::{ImportDma, gles::GlesRenderer},
         winit::{self, WinitEvent},
     },
@@ -151,15 +153,27 @@ pub fn run_winit(config: WinitConfig) -> Result<()> {
     // Initialize NEON DE's modular GPU renderer and compile custom GLES shaders.
     let neon_renderer = NeonRenderer::new(backend.renderer(), &output);
     let dmabuf_formats = backend.renderer().dmabuf_formats();
+    let render_dev_id = EGLDevice::device_for_display(backend.renderer().egl_context().display())
+        .ok()
+        .and_then(|dev| dev.drm_device_path().ok())
+        .and_then(|path| DrmNode::from_path(path).ok())
+        .or_else(|| DrmNode::from_path("/dev/dri/renderD128").ok())
+        .and_then(|n| {
+            n.node_with_type(NodeType::Render)
+                .and_then(Result::ok)
+                .or(Some(n))
+        })
+        .map(|n| n.dev_id());
 
     let backend_cell = Rc::new(RefCell::new((backend, neon_renderer, false)));
     let display_cell = Rc::new(RefCell::new(display));
 
-    // Advertise zwp_linux_dmabuf_v1 if the EGL context supports DMA-BUF textures.
+    // Advertise zwp_linux_dmabuf_v1 (v4 with DmabufFeedback when a render node is present).
     {
         let backend_for_dma = Rc::clone(&backend_cell);
         state.enable_dmabuf(
             dmabuf_formats,
+            render_dev_id,
             Box::new(move |dmabuf| {
                 let mut guard = backend_for_dma.borrow_mut();
                 guard.0.renderer().import_dmabuf(dmabuf, None).is_ok()

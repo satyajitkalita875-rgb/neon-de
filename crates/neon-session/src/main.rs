@@ -357,7 +357,8 @@ fn spawn_shell(
         .env("XDG_CURRENT_DESKTOP", "NEON-DE")
         .env("XDG_SESSION_TYPE", "wayland")
         .env("XCURSOR_THEME", cursor_theme)
-        .env("XCURSOR_SIZE", cursor_size);
+        .env("XCURSOR_SIZE", cursor_size)
+        .env("GTK_USE_PORTAL", "0");
     if let Some(disp) = detect_xwayland_display() {
         cmd.env("DISPLAY", disp);
     }

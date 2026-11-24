@@ -40,7 +40,7 @@ use smithay::{
     wayland::{
         compositor::{CompositorClientState, CompositorState, with_states},
         cursor_shape::CursorShapeManagerState,
-        dmabuf::{DmabufGlobal, DmabufState},
+        dmabuf::{DmabufFeedbackBuilder, DmabufGlobal, DmabufState},
         fractional_scale::{FractionalScaleManagerState, with_fractional_scale},
         output::OutputManagerState,
         pointer_gestures::PointerGesturesState,
@@ -340,9 +340,14 @@ impl NeonState {
         self.clock.now().into()
     }
 
-    /// Advertises `zwp_linux_dmabuf_v1` once the graphics backend reports supported GPU formats.
-    pub fn enable_dmabuf<I>(&mut self, formats: I, import_hook: DmabufImportHook)
-    where
+    /// Advertises `zwp_linux_dmabuf_v1` (version 4 with `DmabufFeedback` when a DRM render node
+    /// is available, falling back to version 3) once the graphics backend reports GPU formats.
+    pub fn enable_dmabuf<I>(
+        &mut self,
+        formats: I,
+        render_node_dev_id: Option<u64>,
+        import_hook: DmabufImportHook,
+    ) where
         I: IntoIterator<Item = Format>,
     {
         let format_vec: Vec<Format> = formats.into_iter().collect();
@@ -353,13 +358,26 @@ impl NeonState {
             return;
         }
         let count = format_vec.len();
-        let global = self
-            .dmabuf_state
-            .create_global::<Self>(&self.display_handle, format_vec);
+        let (global, version) = if let Some(dev_id) = render_node_dev_id
+            && let Ok(feedback) = DmabufFeedbackBuilder::new(dev_id, format_vec.clone()).build()
+        {
+            (
+                self.dmabuf_state
+                    .create_global_with_default_feedback::<Self>(&self.display_handle, &feedback),
+                4u32,
+            )
+        } else {
+            (
+                self.dmabuf_state
+                    .create_global::<Self>(&self.display_handle, format_vec),
+                3u32,
+            )
+        };
         self.dmabuf_global = Some(global);
         self.dmabuf_import_hook = Some(import_hook);
         info!(
             format_count = count,
+            dmabuf_version = version,
             "Advertised zwp_linux_dmabuf_v1 global"
         );
     }

@@ -27,7 +27,7 @@ use smithay::{
             gbm::{GbmAllocator, GbmBufferFlags, GbmDevice},
         },
         drm::{
-            DrmDevice, DrmDeviceFd, DrmEvent, DrmNode,
+            DrmDevice, DrmDeviceFd, DrmEvent, DrmNode, NodeType,
             compositor::FrameFlags,
             exporter::gbm::GbmFramebufferExporter,
             output::{DrmOutput, DrmOutputManager, DrmOutputRenderElements},
@@ -371,11 +371,15 @@ pub fn run_drm(config: DrmConfig) -> Result<()> {
         paused: false,
     }));
 
-    // Advertise DMA-BUF formats backed by the DRM GLES renderer.
+    // Advertise DMA-BUF v4 (with default DmabufFeedback) backed by the DRM GLES render node.
     {
+        let render_dev_id = drm_node
+            .and_then(|n| n.node_with_type(NodeType::Render).and_then(Result::ok).or(Some(n)))
+            .map(|n| n.dev_id());
         let rt_for_dmabuf = Rc::clone(&runtime);
         state.enable_dmabuf(
             dmabuf_formats,
+            render_dev_id,
             Box::new(move |dmabuf| {
                 rt_for_dmabuf
                     .borrow_mut()
