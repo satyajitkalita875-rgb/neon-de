@@ -13,6 +13,9 @@ use std::collections::HashMap;
 
 use tracing::debug;
 
+/// Maximum number of desktops/workspaces supported concurrently.
+pub const MAX_WORKSPACES: usize = 10;
+
 /// Stable monotonic identifier for a workspace.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct WorkspaceId(pub u64);
@@ -25,15 +28,18 @@ pub struct WorkspaceId(pub u64);
 pub struct Workspace<W> {
     pub id: WorkspaceId,
     pub name: Option<String>,
+    /// Explicitly created desktop that persists even while empty until removed by the user.
+    pub pinned: bool,
     /// Windows assigned to this workspace in insertion / stacking order.
     windows: Vec<W>,
 }
 
 impl<W: Copy + PartialEq> Workspace<W> {
-    fn new(id: WorkspaceId) -> Self {
+    fn new(id: WorkspaceId, pinned: bool) -> Self {
         Self {
             id,
             name: None,
+            pinned,
             windows: Vec::new(),
         }
     }
@@ -298,14 +304,56 @@ impl<W: Copy + Eq + std::hash::Hash + std::fmt::Debug> WorkspaceManager<W> {
         self.move_window_to_index(window, target_idx, follow)
     }
 
+    /// Explicitly appends a new desktop (up to [`MAX_WORKSPACES`], i.e. 10) and returns its
+    /// `(WorkspaceId, index)`, or `None` if already at the maximum limit.
+    pub fn add_workspace(&mut self) -> Option<(WorkspaceId, usize)> {
+        if self.workspaces.len() >= MAX_WORKSPACES {
+            return None;
+        }
+        // Pin existing workspaces too so adding Desktop 3, 4, ..., 10 preserves every desktop.
+        for ws in &mut self.workspaces {
+            ws.pinned = true;
+        }
+        let id = self.push_new_workspace_with(true);
+        let idx = self.workspaces.len() - 1;
+        debug!(?id, index = idx, total = self.workspaces.len(), "Added user desktop");
+        Some((id, idx))
+    }
+
+    /// Removes the desktop at `index` (when at least 2 desktops exist), relocating any windows
+    /// cleanly to an adjacent desktop and keeping `active_index` valid.
+    pub fn remove_workspace(&mut self, index: usize) -> bool {
+        if self.workspaces.len() <= 1 || index >= self.workspaces.len() {
+            return false;
+        }
+        let removed = self.workspaces.remove(index);
+        let fallback_idx = index.min(self.workspaces.len() - 1);
+        let fallback_id = self.workspaces[fallback_idx].id;
+        for w in removed.windows {
+            self.workspaces[fallback_idx].windows.push(w);
+            self.window_index.insert(w, fallback_id);
+        }
+        if self.active_index >= self.workspaces.len() {
+            self.active_index = self.workspaces.len() - 1;
+        } else if index < self.active_index {
+            self.active_index -= 1;
+        }
+        debug!(removed = ?removed.id, total = self.workspaces.len(), "Removed desktop");
+        true
+    }
+
     fn push_new_workspace(&mut self) -> WorkspaceId {
+        self.push_new_workspace_with(false)
+    }
+
+    fn push_new_workspace_with(&mut self, pinned: bool) -> WorkspaceId {
         self.next_id += 1;
         let id = WorkspaceId(self.next_id);
-        self.workspaces.push(Workspace::new(id));
+        self.workspaces.push(Workspace::new(id, pinned));
         id
     }
 
-    /// Enforces GNOME-style dynamic workspace invariants without dropping the active workspace.
+    /// Enforces GNOME-style dynamic workspace invariants without dropping active or pinned desktops.
     fn reconcile_dynamic_workspaces(&mut self) {
         if !self.policy.dynamic {
             return;
@@ -313,23 +361,24 @@ impl<W: Copy + Eq + std::hash::Hash + std::fmt::Debug> WorkspaceManager<W> {
 
         let active_id = self.workspaces[self.active_index].id;
 
-        // 1. Always ensure the trailing workspace is empty so the user can move into a new one.
-        if self
-            .workspaces
-            .last()
-            .map(|ws| !ws.is_empty())
-            .unwrap_or(true)
+        // 1. Always ensure the trailing workspace is empty (up to MAX_WORKSPACES).
+        if self.workspaces.len() < MAX_WORKSPACES
+            && self
+                .workspaces
+                .last()
+                .map(|ws| !ws.is_empty())
+                .unwrap_or(true)
         {
             self.push_new_workspace();
         }
 
-        // 2. Remove empty workspaces that are neither the active workspace nor the single trailing
-        //    empty workspace. Also collapse multiple consecutive trailing empty workspaces (unless active).
+        // 2. Remove non-pinned empty workspaces that are neither active nor the trailing empty slot.
         let mut idx = 0;
         while idx + 1 < self.workspaces.len() {
             let is_active = self.workspaces[idx].id == active_id;
             let is_empty = self.workspaces[idx].is_empty();
-            if is_empty && !is_active {
+            let is_pinned = self.workspaces[idx].pinned;
+            if is_empty && !is_active && !is_pinned {
                 let removed = self.workspaces.remove(idx);
                 debug!(workspace = ?removed.id, "Pruned empty dynamic workspace");
                 continue;
@@ -418,5 +467,28 @@ mod tests {
         assert_eq!(back, ws0);
         assert_eq!(mgr.workspace_of_window(2), Some(ws0));
         assert_eq!(mgr.active_workspace_id(), ws1);
+    }
+
+    #[test]
+    fn adding_desktops_persists_up_to_ten_and_allows_removal() {
+        let mut mgr: WorkspaceManager<u64> = WorkspaceManager::default();
+        assert_eq!(mgr.len(), 1);
+        for expected in 2..=MAX_WORKSPACES {
+            let (_, idx) = mgr.add_workspace().expect("should add desktop up to 10");
+            assert_eq!(mgr.len(), expected);
+            assert_eq!(idx, expected - 1);
+        }
+        // 11th desktop must be rejected
+        assert!(mgr.add_workspace().is_none());
+        assert_eq!(mgr.len(), 10);
+
+        // Switching across pinned empty desktops must keep all 10 intact
+        mgr.switch_to_index(5);
+        mgr.switch_to_index(0);
+        assert_eq!(mgr.len(), 10);
+
+        // Removing a desktop shrinks cleanly back to 9
+        assert!(mgr.remove_workspace(9));
+        assert_eq!(mgr.len(), 9);
     }
 }

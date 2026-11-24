@@ -8,6 +8,7 @@ repository.workspace = true
 description = "Linux desktop system integration (NetworkManager, PipeWire, BlueZ, UPower, Notifications, Polkit, XDG Portals) for NEON DE"
 
 [dependencies]
+libc = { workspace = true }
 serde = { workspace = true }
 tracing = { workspace = true }
 zbus = { workspace = true }

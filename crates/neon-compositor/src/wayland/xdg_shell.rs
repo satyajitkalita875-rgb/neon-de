@@ -1,13 +1,19 @@
 //! `xdg_wm_base`, `xdg_surface`, `xdg_toplevel`, and `xdg_popup` handlers wired to `WindowManager`.
 
 use smithay::{
-    desktop::{PopupKind, Window, find_popup_root_surface, get_popup_toplevel_coords},
+    desktop::{
+        PopupKeyboardGrab, PopupKind, PopupPointerGrab, PopupUngrabStrategy, Window,
+        find_popup_root_surface, get_popup_toplevel_coords,
+    },
     input::{
         Seat,
         pointer::{Focus, GrabStartData as PointerGrabStartData},
     },
     reexports::{
-        wayland_protocols::xdg::shell::server::xdg_toplevel,
+        wayland_protocols::xdg::{
+            decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode as DecorationMode,
+            shell::server::xdg_toplevel,
+        },
         wayland_server::{
             Resource,
             protocol::{wl_output::WlOutput, wl_seat::WlSeat},
@@ -18,7 +24,7 @@ use smithay::{
         compositor::with_states,
         shell::xdg::{
             PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
-            XdgToplevelSurfaceData,
+            XdgToplevelSurfaceData, decoration::XdgDecorationHandler,
         },
     },
 };
@@ -70,6 +76,10 @@ impl XdgShellHandler for NeonState {
             let was_focused = self.wm.focused_id() == Some(id);
             self.space.unmap_elem(&window);
             self.managed_windows.remove(&id);
+            self.ssd_windows.remove(&id);
+            if self.hovered_titlebar_window == Some(id) {
+                self.hovered_titlebar_window = None;
+            }
             self.wm.remove_window(id);
             self.effects.remove_window(id);
             self.scene.remove_window(id);
@@ -156,8 +166,38 @@ impl XdgShellHandler for NeonState {
         surface.send_repositioned(token);
     }
 
-    fn grab(&mut self, _surface: PopupSurface, _seat: WlSeat, _serial: Serial) {
-        // Popup pointer grabs will be expanded alongside layer-shell/overview in Milestone 4.
+    fn grab(&mut self, surface: PopupSurface, seat: WlSeat, serial: Serial) {
+        let seat = Seat::from_resource(&seat).unwrap_or_else(|| self.seat.clone());
+        let popup = PopupKind::Xdg(surface);
+        let Ok(root) = find_popup_root_surface(&popup) else {
+            return;
+        };
+        let Ok(mut grab) = self.popups.grab_popup(root, popup, &seat, serial) else {
+            return;
+        };
+
+        if let Some(keyboard) = seat.get_keyboard() {
+            if keyboard.is_grabbed()
+                && !(keyboard.has_grab(serial)
+                    || keyboard.has_grab(grab.previous_serial().unwrap_or(serial)))
+            {
+                grab.ungrab(PopupUngrabStrategy::All);
+                return;
+            }
+            keyboard.set_focus(self, grab.current_grab(), serial);
+            keyboard.set_grab(self, PopupKeyboardGrab::new(&grab), serial);
+        }
+        if let Some(pointer) = seat.get_pointer() {
+            if pointer.is_grabbed()
+                && !(pointer.has_grab(serial)
+                    || pointer.has_grab(grab.previous_serial().unwrap_or(serial)))
+            {
+                grab.ungrab(PopupUngrabStrategy::All);
+                return;
+            }
+            pointer.set_grab(self, PopupPointerGrab::new(&grab), serial, Focus::Keep);
+        }
+        self.needs_redraw = true;
     }
 
     fn move_request(&mut self, surface: ToplevelSurface, seat: WlSeat, serial: Serial) {
@@ -278,6 +318,46 @@ impl XdgShellHandler for NeonState {
         if let Some((id, _)) = self.find_window_by_surface(surface.wl_surface()) {
             self.minimize_window(id, SERIAL_COUNTER.next_serial());
         }
+    }
+}
+
+impl XdgDecorationHandler for NeonState {
+    fn new_decoration(&mut self, toplevel: ToplevelSurface) {
+        toplevel.with_pending_state(|state| {
+            state.decoration_mode = Some(DecorationMode::ServerSide);
+        });
+        if let Some((id, _)) = self.find_window_by_surface(toplevel.wl_surface()) {
+            self.enable_ssd_for_window(id);
+        }
+        toplevel.send_configure();
+    }
+
+    fn request_mode(&mut self, toplevel: ToplevelSurface, mode: DecorationMode) {
+        let effective = match mode {
+            DecorationMode::ClientSide => DecorationMode::ClientSide,
+            _ => DecorationMode::ServerSide,
+        };
+        toplevel.with_pending_state(|state| {
+            state.decoration_mode = Some(effective);
+        });
+        if let Some((id, _)) = self.find_window_by_surface(toplevel.wl_surface()) {
+            if effective == DecorationMode::ServerSide {
+                self.enable_ssd_for_window(id);
+            } else {
+                self.ssd_windows.remove(&id);
+            }
+        }
+        toplevel.send_configure();
+    }
+
+    fn unset_mode(&mut self, toplevel: ToplevelSurface) {
+        toplevel.with_pending_state(|state| {
+            state.decoration_mode = Some(DecorationMode::ServerSide);
+        });
+        if let Some((id, _)) = self.find_window_by_surface(toplevel.wl_surface()) {
+            self.enable_ssd_for_window(id);
+        }
+        toplevel.send_configure();
     }
 }
 

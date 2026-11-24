@@ -8,16 +8,19 @@ mod xdg_shell;
 pub mod xwayland;
 
 use smithay::{
-    delegate_compositor, delegate_data_control, delegate_data_device, delegate_dmabuf,
-    delegate_fractional_scale, delegate_layer_shell, delegate_output, delegate_pointer_gestures,
-    delegate_presentation, delegate_seat, delegate_session_lock, delegate_shm, delegate_viewporter,
-    delegate_xdg_shell, delegate_xwayland_shell,
+    delegate_compositor, delegate_cursor_shape, delegate_data_control, delegate_data_device,
+    delegate_dmabuf, delegate_fractional_scale, delegate_layer_shell, delegate_output,
+    delegate_pointer_gestures, delegate_presentation, delegate_seat, delegate_session_lock,
+    delegate_shm, delegate_viewporter, delegate_xdg_decoration, delegate_xdg_shell,
+    delegate_xwayland_shell,
 };
 
 use crate::state::NeonState;
 
 delegate_compositor!(NeonState);
+delegate_cursor_shape!(NeonState);
 delegate_xdg_shell!(NeonState);
+delegate_xdg_decoration!(NeonState);
 delegate_layer_shell!(NeonState);
 delegate_session_lock!(NeonState);
 delegate_fractional_scale!(NeonState);

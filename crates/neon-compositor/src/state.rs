@@ -10,10 +10,10 @@ use std::{
     time::Duration,
 };
 
-use neon_config::{FocusMode, NeonConfig};
+use neon_config::{FocusMode, NeonConfig, ThemeMode};
 use neon_effects::{EffectsConfig, EffectsManager};
 use neon_output::{DisplayMode, OutputConfigPatch, OutputId, OutputManager, OutputTransform};
-use neon_scene::{BorderStyle, SceneGraph, ShadowStyle};
+use neon_scene::{BorderStyle, MACOS_TITLEBAR_HEIGHT, SceneGraph, ShadowStyle, TitlebarStyle};
 use neon_workspaces::{WorkspaceId, WorkspacePolicy};
 use smithay::{
     backend::allocator::{Format, dmabuf::Dmabuf},
@@ -39,6 +39,7 @@ use smithay::{
     },
     wayland::{
         compositor::{CompositorClientState, CompositorState, with_states},
+        cursor_shape::CursorShapeManagerState,
         dmabuf::{DmabufGlobal, DmabufState},
         fractional_scale::{FractionalScaleManagerState, with_fractional_scale},
         output::OutputManagerState,
@@ -52,7 +53,7 @@ use smithay::{
                 KeyboardInteractivity, Layer as WlrLayer, LayerSurfaceCachedState,
                 WlrLayerShellState,
             },
-            xdg::XdgShellState,
+            xdg::{XdgShellState, decoration::XdgDecorationState},
         },
         shm::ShmState,
         viewporter::ViewporterState,
@@ -99,6 +100,15 @@ impl ClientData for NeonClientData {
 /// Callback invoked by `DmabufHandler::dmabuf_imported` to validate GPU buffer import.
 pub type DmabufImportHook = Box<dyn FnMut(&Dmabuf) -> bool>;
 
+/// Hit-test region inside a server-side macOS window titlebar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TitlebarHit {
+    Close,
+    Minimize,
+    Maximize,
+    Drag,
+}
+
 /// Callback invoked when the user presses `Ctrl+Alt+F1..F12` on a bare-metal TTY session.
 pub type VtSwitchHook = Box<dyn FnMut(i32)>;
 
@@ -113,11 +123,13 @@ pub struct NeonState {
     // Wayland protocol states
     pub compositor_state: CompositorState,
     pub xdg_shell_state: XdgShellState,
+    pub xdg_decoration_state: XdgDecorationState,
     pub layer_shell_state: WlrLayerShellState,
     pub session_lock_manager_state: SessionLockManagerState,
     pub fractional_scale_manager_state: FractionalScaleManagerState,
     pub viewporter_state: ViewporterState,
     pub pointer_gestures_state: PointerGesturesState,
+    pub cursor_shape_manager_state: CursorShapeManagerState,
     pub presentation_state: PresentationState,
     pub xwayland_shell_state: XWaylandShellState,
     pub shm_state: ShmState,
@@ -142,6 +154,20 @@ pub struct NeonState {
     pub space: Space<Window>,
     /// All live managed toplevel windows across all workspaces (including minimized windows).
     pub managed_windows: HashMap<WindowId, Window>,
+    /// Mapped XWayland override-redirect windows (X11 context menus, dropdowns, tooltips).
+    pub override_redirect_windows: Vec<Window>,
+    /// Windows using NEON DE's GPU-rendered macOS server-side titlebar (traffic-light controls).
+    pub ssd_windows: HashSet<WindowId>,
+    /// Last rendered logical rect per visible window (drives smooth Hyprland/M3 geometry morphs).
+    pub last_rendered_rects: HashMap<WindowId, WmRect>,
+    /// Windows currently playing their dock-swoop minimize animation (`id -> unmap_at`).
+    pub minimizing_windows: HashMap<WindowId, Duration>,
+    /// Windows currently playing their popout close animation (`id -> (deadline, close_sent)`).
+    pub closing_windows: HashMap<WindowId, (Duration, bool)>,
+    /// Window whose macOS SSD traffic-light button cluster is currently hovered by the pointer.
+    pub hovered_titlebar_window: Option<WindowId>,
+    /// Flag indicating fresh input/state changes that warrant an immediate VBlank-synced frame.
+    pub needs_redraw: bool,
     /// NEON DE window manager & dynamic workspace manager.
     pub wm: WindowManager,
     /// Retained scene graph synchronized every frame before GPU composition.
@@ -176,6 +202,8 @@ pub struct NeonState {
     pub pending_screenshot: Option<(PathBuf, Option<[i32; 4]>)>,
     /// Signals `neon-shell` to open the GNOME-style interactive screenshot overlay.
     pub pending_screenshot_ui: bool,
+    /// Signals `neon-shell` to open the OS-level right-click context menu at `(x, y)`.
+    pub pending_context_menu: Option<(i32, i32, neon_ipc::ContextMenuTarget)>,
 }
 
 impl NeonState {
@@ -190,6 +218,7 @@ impl NeonState {
 
         let compositor_state = CompositorState::new::<Self>(&display_handle);
         let xdg_shell_state = XdgShellState::new::<Self>(&display_handle);
+        let xdg_decoration_state = XdgDecorationState::new::<Self>(&display_handle);
         let layer_shell_state = WlrLayerShellState::new::<Self>(&display_handle);
         let session_lock_manager_state =
             SessionLockManagerState::new::<Self, _>(&display_handle, |_| true);
@@ -197,6 +226,7 @@ impl NeonState {
             FractionalScaleManagerState::new::<Self>(&display_handle);
         let viewporter_state = ViewporterState::new::<Self>(&display_handle);
         let pointer_gestures_state = PointerGesturesState::new::<Self>(&display_handle);
+        let cursor_shape_manager_state = CursorShapeManagerState::new::<Self>(&display_handle);
         let clock = Clock::<Monotonic>::new();
         let presentation_state = PresentationState::new::<Self>(&display_handle, clock.id() as u32);
         let xwayland_shell_state = XWaylandShellState::new::<Self>(&display_handle);
@@ -222,11 +252,13 @@ impl NeonState {
             socket_name,
             compositor_state,
             xdg_shell_state,
+            xdg_decoration_state,
             layer_shell_state,
             session_lock_manager_state,
             fractional_scale_manager_state,
             viewporter_state,
             pointer_gestures_state,
+            cursor_shape_manager_state,
             presentation_state,
             xwayland_shell_state,
             shm_state,
@@ -244,6 +276,13 @@ impl NeonState {
             output_handles: HashMap::new(),
             space: Space::default(),
             managed_windows: HashMap::new(),
+            override_redirect_windows: Vec::new(),
+            ssd_windows: HashSet::new(),
+            last_rendered_rects: HashMap::new(),
+            minimizing_windows: HashMap::new(),
+            closing_windows: HashMap::new(),
+            hovered_titlebar_window: None,
+            needs_redraw: true,
             wm: WindowManager::new(WorkspacePolicy::default()),
             scene: SceneGraph::new(),
             effects: EffectsManager::new(EffectsConfig::default()),
@@ -265,6 +304,7 @@ impl NeonState {
             vt_switch_hook: None,
             pending_screenshot: None,
             pending_screenshot_ui: false,
+            pending_context_menu: None,
         }
     }
 
@@ -325,13 +365,63 @@ impl NeonState {
     /// Returns `true` if any animations remain in flight.
     pub fn sync_scene_graph(&mut self) -> bool {
         let now = self.now_duration();
-        let animating = self.effects.tick(now);
+
+        // 1. Complete finished minimize animations by unmapping their windows from Space.
+        let finished_min: Vec<WindowId> = self
+            .minimizing_windows
+            .iter()
+            .filter(|&(_, &done_at)| now >= done_at)
+            .map(|(&id, _)| id)
+            .collect();
+        for id in finished_min {
+            self.minimizing_windows.remove(&id);
+            if let Some(window) = self.find_window_by_id(id)
+                && self.wm.get(id).map(|w| w.mode.is_minimized()).unwrap_or(true)
+            {
+                self.space.unmap_elem(&window);
+            }
+            self.last_rendered_rects.remove(&id);
+        }
+
+        // 2. Dispatch deferred close requests once popout animation finishes, or cancel if the
+        //    application stayed open (e.g. "Save unsaved changes?" dialog).
+        let closing_ids: Vec<(WindowId, Duration, bool)> = self
+            .closing_windows
+            .iter()
+            .map(|(&id, &(deadline, sent))| (id, deadline, sent))
+            .collect();
+        for (id, deadline, sent) in closing_ids {
+            if now < deadline {
+                continue;
+            }
+            if !sent {
+                let sent_ok = self.send_native_close(id);
+                if sent_ok {
+                    self.closing_windows
+                        .insert(id, (now + Duration::from_millis(280), true));
+                } else {
+                    self.closing_windows.remove(&id);
+                }
+            } else {
+                self.closing_windows.remove(&id);
+                self.effects.animate_window_cancel_close(id, now);
+            }
+        }
+
+        let mut animating = self.effects.tick(now)
+            || !self.minimizing_windows.is_empty()
+            || !self.closing_windows.is_empty();
 
         let output_size = self.output_logical_size();
         self.scene.set_backdrop(to_wm_size(output_size));
 
         let fx_cfg = self.effects.config;
         let focused_id = self.wm.focused_id();
+        let pointer_grabbed = self
+            .seat
+            .get_pointer()
+            .map(|p| p.is_grabbed())
+            .unwrap_or(false);
         let mut visible_ids: HashSet<WindowId> = HashSet::new();
 
         for (z_idx, window) in self.space.elements().enumerate() {
@@ -343,6 +433,23 @@ impl NeonState {
             };
             let win_size = window.geometry().size;
             let bounds = WmRect::new(to_wm_point(loc), to_wm_size(win_size));
+
+            // Detect maximize / unmaximize / snap / fullscreen / resize transitions on
+            // already-visible windows and drive a smooth Material 3 Expressive spatial morph.
+            if win_size.w > 0
+                && win_size.h > 0
+                && !self.minimizing_windows.contains_key(&id)
+                && !self.closing_windows.contains_key(&id)
+            {
+                if !pointer_grabbed
+                    && let Some(&prev_bounds) = self.last_rendered_rects.get(&id)
+                    && prev_bounds != bounds
+                {
+                    self.effects.animate_window_geometry(id, prev_bounds, bounds, now);
+                    animating = true;
+                }
+                self.last_rendered_rects.insert(id, bounds);
+            }
 
             let is_focused = focused_id == Some(id);
             let mode = self
@@ -392,15 +499,30 @@ impl NeonState {
                 true,
                 opacity,
                 (visual.offset_x, visual.offset_y),
+                (visual.scale_x, visual.scale_y),
                 is_focused,
                 visual.focus_progress,
                 fullscreen,
                 shadow,
                 border,
             );
+            let titlebar = if !fullscreen && self.ssd_windows.contains(&id) {
+                Some(TitlebarStyle {
+                    height: MACOS_TITLEBAR_HEIGHT,
+                    corner_radius: if maximized { 0.0 } else { fx_cfg.corner_radius },
+                    focused: is_focused,
+                    light_theme: self.config.appearance.theme == ThemeMode::NeonLight,
+                    hover_controls: self.hovered_titlebar_window == Some(id),
+                })
+            } else {
+                None
+            };
+            self.scene.set_window_titlebar(id, titlebar);
             visible_ids.insert(id);
         }
 
+        self.last_rendered_rects
+            .retain(|id, _| visible_ids.contains(id));
         self.scene.retain_windows(|id| visible_ids.contains(&id));
         animating
     }
@@ -590,7 +712,8 @@ impl NeonState {
     }
 
     /// Resolves the Wayland surface and its logical origin under the given compositor coordinates,
-    /// respecting `zwlr_layer_shell_v1` Z-order (`Overlay`/`Top` above windows, `Bottom`/`Background` below).
+    /// respecting `zwlr_layer_shell_v1` Z-order (`Overlay`/`Top` above override-redirect popups &
+    /// windows, `Bottom`/`Background` below).
     pub fn surface_under(
         &self,
         pos: Point<f64, Logical>,
@@ -599,6 +722,22 @@ impl NeonState {
             self.layer_surface_under(pos, &[WlrLayer::Overlay, WlrLayer::Top])
         {
             return Some((surf, loc));
+        }
+
+        // Check XWayland override-redirect popups (context menus / dropdowns) above regular windows.
+        for or_win in self.override_redirect_windows.iter().rev() {
+            if !or_win.alive() {
+                continue;
+            }
+            if let Some(loc) = self
+                .space
+                .element_location(or_win)
+                .or_else(|| or_win.x11_surface().map(|s| s.geometry().loc))
+                && let Some((surface, surface_loc)) =
+                    or_win.surface_under(pos - loc.to_f64(), WindowSurfaceType::ALL)
+            {
+                return Some((surface, (loc + surface_loc).to_f64()));
+            }
         }
 
         if let Some(win_hit) = self
@@ -735,6 +874,7 @@ impl NeonState {
 
     /// Synchronizes `Space` membership with the active workspace and restores focus & pointer hover.
     pub fn sync_active_workspace_space(&mut self, serial: Serial) {
+        self.last_rendered_rects.clear();
         let active_ws = self.wm.active_workspace_id();
         let all_ids = self.wm.all_window_ids();
 
@@ -854,14 +994,148 @@ impl NeonState {
         }
     }
 
+    fn send_native_close(&self, id: WindowId) -> bool {
+        let Some(window) = self.find_window_by_id(id) else {
+            return false;
+        };
+        if let Some(toplevel) = window.toplevel() {
+            info!(?id, "Sending xdg_toplevel.close to window");
+            toplevel.send_close();
+            true
+        } else if let Some(x11) = window.x11_surface() {
+            info!(?id, "Sending WM_DELETE_WINDOW to XWayland window");
+            let _ = x11.close();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Requests graceful closure of a window with a smooth Hyprland/M3 popout close animation.
+    pub fn close_window_by_id(&mut self, id: WindowId) -> bool {
+        if self.find_window_by_id(id).is_none() {
+            return false;
+        }
+        if self.closing_windows.contains_key(&id) {
+            return true;
+        }
+        let now = self.now_duration();
+        let dur = self.effects.animate_window_close(id, now);
+        self.needs_redraw = true;
+        if dur.is_zero() || self.backend_name == "headless" {
+            self.send_native_close(id)
+        } else {
+            self.closing_windows.insert(id, (now + dur, false));
+            true
+        }
+    }
+
     /// Requests graceful closure of the currently focused toplevel window.
     pub fn close_focused_window(&mut self) {
-        if let Some(focused_id) = self.wm.focused_id()
-            && let Some(window) = self.find_window_by_id(focused_id)
-            && let Some(toplevel) = window.toplevel()
+        if let Some(focused_id) = self.wm.focused_id() {
+            self.close_window_by_id(focused_id);
+        }
+    }
+
+    /// Enables NEON DE's macOS server-side titlebar for `id` and ensures it does not overlap the panel.
+    pub fn enable_ssd_for_window(&mut self, id: WindowId) {
+        self.ssd_windows.insert(id);
+        let work_area = self.work_area();
+        let min_y = work_area.loc.y + MACOS_TITLEBAR_HEIGHT;
+        if let Some(rec) = self.wm.get(id).cloned()
+            && rec.current_geometry.loc.y < min_y
+            && rec.mode.is_floating()
         {
-            info!(?focused_id, "Sending xdg_toplevel.close to focused window");
-            toplevel.send_close();
+            let mut new_loc = rec.current_geometry.loc;
+            new_loc.y = min_y;
+            self.wm.set_floating_location(id, new_loc);
+            if let Some(window) = self.find_window_by_id(id)
+                && rec.is_visible_on(self.wm.active_workspace_id())
+            {
+                self.space.map_element(window, from_wm_point(new_loc), false);
+            }
+        }
+        self.needs_redraw = true;
+    }
+
+    /// Computes effective work area for a window, reserving space for a macOS SSD titlebar if active.
+    pub fn effective_work_area_for(&self, id: WindowId) -> WmRect {
+        let mut wa = self.work_area();
+        if self.ssd_windows.contains(&id) {
+            wa.loc.y += MACOS_TITLEBAR_HEIGHT;
+            wa.size.h = (wa.size.h - MACOS_TITLEBAR_HEIGHT).max(200);
+        }
+        wa
+    }
+
+    /// Hit-tests `pos` against front-to-back SSD macOS titlebars and traffic-light controls.
+    pub fn ssd_titlebar_hit_test(
+        &self,
+        pos: Point<f64, Logical>,
+    ) -> Option<(WindowId, Window, TitlebarHit)> {
+        let elements: Vec<&Window> = self.space.elements().collect();
+        for window in elements.into_iter().rev() {
+            let Some(id) = window_id(window) else {
+                continue;
+            };
+            if !self.ssd_windows.contains(&id) {
+                continue;
+            }
+            if self
+                .wm
+                .get(id)
+                .map(|r| r.mode.is_fullscreen())
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            let Some(loc) = self.space.element_location(window) else {
+                continue;
+            };
+            let w = window.geometry().size.w;
+            if w <= 0 {
+                continue;
+            }
+            let tb_top = (loc.y - MACOS_TITLEBAR_HEIGHT) as f64;
+            let tb_bot = loc.y as f64;
+            let tb_left = loc.x as f64;
+            let tb_right = (loc.x + w) as f64;
+            if pos.x >= tb_left && pos.x <= tb_right && pos.y >= tb_top && pos.y <= tb_bot {
+                let lx = pos.x - tb_left;
+                let ly = pos.y - tb_top;
+                let cy = MACOS_TITLEBAR_HEIGHT as f64 * 0.5;
+                let dist_sq = |cx: f64| (lx - cx).powi(2) + (ly - cy).powi(2);
+                let hit_r_sq = 8.5_f64.powi(2);
+                let hit = if dist_sq(16.0) <= hit_r_sq {
+                    TitlebarHit::Close
+                } else if dist_sq(36.0) <= hit_r_sq {
+                    TitlebarHit::Minimize
+                } else if dist_sq(56.0) <= hit_r_sq {
+                    TitlebarHit::Maximize
+                } else {
+                    TitlebarHit::Drag
+                };
+                return Some((id, window.clone(), hit));
+            }
+        }
+        None
+    }
+
+    /// Toggles maximize state for any window ID (supports both Wayland and XWayland windows).
+    pub fn toggle_maximize_window(&mut self, id: WindowId) {
+        let work_area = self.effective_work_area_for(id);
+        if let Some(update) = self.wm.toggle_maximized(id, work_area) {
+            info!(?id, mode = ?update.mode, "Toggled maximize on window");
+            if let Some(window) = self.find_window_by_id(id)
+                && let Some(x11) = window.x11_surface()
+            {
+                let _ = x11.set_maximized(update.mode.is_maximized());
+                if let (Some(loc), Some(sz)) = (update.target_location, update.configure_size) {
+                    let _ = x11.configure(Rectangle::new(from_wm_point(loc), from_wm_size(sz)));
+                }
+            }
+            self.apply_layout_update(&update);
+            self.needs_redraw = true;
         }
     }
 
@@ -871,11 +1145,7 @@ impl NeonState {
         let Some(id) = self.wm.focused_id() else {
             return;
         };
-        let work_area = self.work_area();
-        if let Some(update) = self.wm.toggle_maximized(id, work_area) {
-            info!(?id, mode = ?update.mode, "Toggled maximize on focused window");
-            self.apply_layout_update(&update);
-        }
+        self.toggle_maximize_window(id);
     }
 
     pub fn toggle_fullscreen_focused(&mut self) {
@@ -889,15 +1159,26 @@ impl NeonState {
         }
     }
 
+    pub fn snap_window_by_id(&mut self, id: WindowId, region: SnapRegion) {
+        let work_area = self.effective_work_area_for(id);
+        if let Some(update) = self.wm.toggle_snap(id, region, work_area) {
+            info!(?id, mode = ?update.mode, "Updated window snap state");
+            if let Some(window) = self.find_window_by_id(id)
+                && let Some(x11) = window.x11_surface()
+                && let (Some(loc), Some(sz)) = (update.target_location, update.configure_size)
+            {
+                let _ = x11.configure(Rectangle::new(from_wm_point(loc), from_wm_size(sz)));
+            }
+            self.apply_layout_update(&update);
+            self.needs_redraw = true;
+        }
+    }
+
     pub fn snap_focused(&mut self, region: SnapRegion) {
         let Some(id) = self.wm.focused_id() else {
             return;
         };
-        let work_area = self.work_area();
-        if let Some(update) = self.wm.toggle_snap(id, region, work_area) {
-            info!(?id, mode = ?update.mode, "Updated window snap state");
-            self.apply_layout_update(&update);
-        }
+        self.snap_window_by_id(id, region);
     }
 
     pub fn unmaximize_or_minimize_focused(&mut self, serial: Serial) {
@@ -920,11 +1201,38 @@ impl NeonState {
         }
     }
 
+    fn dock_swoop_delta_for(&self, id: WindowId) -> (f64, f64) {
+        let out_sz = self.output_logical_size();
+        let dock_x = out_sz.w as f64 * 0.5;
+        let dock_y = (out_sz.h - 32).max(100) as f64;
+        if let Some(rect) = self
+            .last_rendered_rects
+            .get(&id)
+            .copied()
+            .or_else(|| self.wm.get(id).map(|r| r.current_geometry))
+        {
+            let cx = rect.loc.x as f64 + rect.size.w as f64 * 0.5;
+            let cy = rect.loc.y as f64 + rect.size.h as f64 * 0.5;
+            (dock_x - cx, dock_y - cy)
+        } else {
+            (0.0, 260.0)
+        }
+    }
+
     pub fn minimize_window(&mut self, id: WindowId, serial: Serial) {
+        let (dx, dy) = self.dock_swoop_delta_for(id);
         let work_area = self.work_area();
         if let Some(update) = self.wm.minimize(id, work_area) {
             info!(?id, "Minimized window");
-            self.apply_layout_update(&update);
+            let now = self.now_duration();
+            let dur = self.effects.animate_window_minimize(id, dx, dy, now);
+            if dur.is_zero() || self.backend_name == "headless" {
+                self.apply_layout_update(&update);
+            } else {
+                // Keep window visible in Space while it swoops smoothly down into the Dock.
+                self.minimizing_windows.insert(id, now + dur);
+                self.needs_redraw = true;
+            }
             self.focus_topmost_window(serial);
         }
     }
@@ -935,13 +1243,36 @@ impl NeonState {
         }
     }
 
+    /// Restores a specific minimized window with a smooth Material 3 spring rise from the Dock.
+    pub fn restore_minimized_window(&mut self, id: WindowId, serial: Serial) -> bool {
+        let work_area = self.work_area();
+        let Some(update) = self.wm.restore_window(id, work_area) else {
+            return false;
+        };
+        self.minimizing_windows.remove(&id);
+        self.last_rendered_rects.remove(&id);
+        self.apply_layout_update(&update);
+        let (dx, dy) = self.dock_swoop_delta_for(id);
+        let now = self.now_duration();
+        self.effects.animate_window_restore(id, dx, dy, now);
+        self.needs_redraw = true;
+        if let Some(window) = self.find_window_by_id(id) {
+            self.focus_window(Some(&window), serial);
+        }
+        true
+    }
+
     pub fn restore_last_minimized(&mut self, serial: Serial) {
         let work_area = self.work_area();
         if let Some(update) = self.wm.restore_last_minimized(work_area) {
             info!(id = ?update.id, mode = ?update.mode, "Restored minimized window");
+            self.minimizing_windows.remove(&update.id);
+            self.last_rendered_rects.remove(&update.id);
             self.apply_layout_update(&update);
+            let (dx, dy) = self.dock_swoop_delta_for(update.id);
             let now = self.now_duration();
-            self.effects.animate_window_open(update.id, now);
+            self.effects.animate_window_restore(update.id, dx, dy, now);
+            self.needs_redraw = true;
             if let Some(window) = self.find_window_by_id(update.id) {
                 self.focus_window(Some(&window), serial);
             }
@@ -990,6 +1321,34 @@ impl NeonState {
         );
         self.sync_active_workspace_space(serial);
         Some(new_ws)
+    }
+
+    /// Adds a new persistent desktop (up to 10 total).
+    pub fn add_workspace(&mut self) -> Option<(WorkspaceId, usize)> {
+        let res = self.wm.add_workspace()?;
+        self.needs_redraw = true;
+        info!(
+            workspace = ?res.0,
+            index = res.1,
+            total = self.wm.workspaces().len(),
+            "Created new desktop"
+        );
+        Some(res)
+    }
+
+    /// Removes the desktop at `index` (keeping at least 1 desktop) and syncs active space.
+    pub fn remove_workspace(&mut self, index: usize, serial: Serial) -> bool {
+        if !self.wm.remove_workspace(index) {
+            return false;
+        }
+        self.sync_active_workspace_space(serial);
+        self.needs_redraw = true;
+        info!(
+            index,
+            total = self.wm.workspaces().len(),
+            "Removed desktop"
+        );
+        true
     }
 
     pub fn move_focused_to_next_workspace(
@@ -1241,6 +1600,13 @@ impl NeonState {
             if let Some(window) = self.managed_windows.remove(&id) {
                 self.space.unmap_elem(&window);
             }
+            self.ssd_windows.remove(&id);
+            self.last_rendered_rects.remove(&id);
+            self.minimizing_windows.remove(&id);
+            self.closing_windows.remove(&id);
+            if self.hovered_titlebar_window == Some(id) {
+                self.hovered_titlebar_window = None;
+            }
             if self.wm.focused_id() == Some(id) {
                 lost_focus = true;
             }
@@ -1250,6 +1616,13 @@ impl NeonState {
             debug!(?id, "Cleaned up dead window");
         }
 
+        self.override_redirect_windows.retain(|w| {
+            let alive = w.alive();
+            if !alive {
+                self.space.unmap_elem(w);
+            }
+            alive
+        });
         self.space.refresh();
         self.popups.cleanup();
 

@@ -2,7 +2,7 @@
 
 use smithay::{
     backend::{allocator::dmabuf::Dmabuf, renderer::utils::on_commit_buffer_handler},
-    desktop::{WindowSurfaceType, layer_map_for_output},
+    desktop::{WindowSurfaceType, find_popup_root_surface, layer_map_for_output},
     reexports::wayland_server::{
         Client,
         protocol::{wl_buffer::WlBuffer, wl_surface::WlSurface},
@@ -221,22 +221,29 @@ impl CompositorHandler for NeonState {
             }
         }
 
-        // Handle popup commit and initial configure.
+        // Handle popup commit, initial configure, and refresh root window bbox so popups
+        // extending outside parent windows render and hit-test accurately.
         self.popups.commit(surface);
-        if let Some(popup) = self.popups.find_popup(surface)
-            && let smithay::desktop::PopupKind::Xdg(xdg_popup) = popup
-        {
-            let initial_configure_sent = with_states(surface, |states| {
-                states
-                    .data_map
-                    .get::<XdgPopupSurfaceData>()
-                    .map(|data| data.lock().unwrap().initial_configure_sent)
-                    .unwrap_or(true)
-            });
-            if !initial_configure_sent {
-                let _ = xdg_popup.send_configure();
+        if let Some(popup) = self.popups.find_popup(surface) {
+            if let Ok(root) = find_popup_root_surface(&popup)
+                && let Some((_, win)) = self.find_window_by_surface(&root)
+            {
+                win.on_commit();
+            }
+            if let smithay::desktop::PopupKind::Xdg(xdg_popup) = popup {
+                let initial_configure_sent = with_states(surface, |states| {
+                    states
+                        .data_map
+                        .get::<XdgPopupSurfaceData>()
+                        .map(|data| data.lock().unwrap().initial_configure_sent)
+                        .unwrap_or(true)
+                });
+                if !initial_configure_sent {
+                    let _ = xdg_popup.send_configure();
+                }
             }
         }
+        self.needs_redraw = true;
     }
 
     fn destroyed(&mut self, _surface: &WlSurface) {

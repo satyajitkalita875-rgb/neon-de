@@ -168,12 +168,22 @@ fn run_session(cli: Cli) -> Result<ExitCode> {
         "Starting NEON DE supervised session"
     );
 
+    let session_cfg = load_or_default(&default_config_path());
+    let cursor_theme = if session_cfg.appearance.cursor_theme.trim().is_empty() {
+        "macOS".to_string()
+    } else {
+        session_cfg.appearance.cursor_theme.clone()
+    };
+    let cursor_size = session_cfg.appearance.cursor_size.clamp(16, 48).to_string();
+
     let mut comp_cmd = Command::new(&compositor_bin);
     comp_cmd
         .arg("--socket")
         .arg(&socket_name)
         .arg("--ipc-socket")
-        .arg(&ipc_socket);
+        .arg(&ipc_socket)
+        .env("XCURSOR_THEME", &cursor_theme)
+        .env("XCURSOR_SIZE", &cursor_size);
 
     if standalone_drm
         && let Ok(log_file) = OpenOptions::new()
@@ -233,15 +243,25 @@ fn run_session(cli: Cli) -> Result<ExitCode> {
                 "WAYLAND_DISPLAY",
                 "XDG_CURRENT_DESKTOP",
                 "XDG_SESSION_TYPE",
+                "XCURSOR_THEME",
+                "XCURSOR_SIZE",
             ])
             .env("WAYLAND_DISPLAY", &socket_name)
             .env("XDG_CURRENT_DESKTOP", "NEON-DE")
             .env("XDG_SESSION_TYPE", "wayland")
+            .env("XCURSOR_THEME", &cursor_theme)
+            .env("XCURSOR_SIZE", &cursor_size)
             .status();
     }
 
     let mut shell_child: Option<Child> = if !cli.no_shell {
-        Some(spawn_shell(&shell_bin, &socket_name, &ipc_socket)?)
+        Some(spawn_shell(
+            &shell_bin,
+            &socket_name,
+            &ipc_socket,
+            &cursor_theme,
+            &cursor_size,
+        )?)
     } else {
         None
     };
@@ -282,7 +302,13 @@ fn run_session(cli: Cli) -> Result<ExitCode> {
                 );
                 thread::sleep(backoff);
                 if compositor.try_wait()?.is_none() {
-                    match spawn_shell(&shell_bin, &socket_name, &ipc_socket) {
+                    match spawn_shell(
+                        &shell_bin,
+                        &socket_name,
+                        &ipc_socket,
+                        &cursor_theme,
+                        &cursor_size,
+                    ) {
                         Ok(child) => {
                             info!(pid = child.id(), "Restarted neon-shell successfully");
                             shell_child = Some(child);
@@ -306,18 +332,52 @@ fn run_session(cli: Cli) -> Result<ExitCode> {
     Ok(exit_code)
 }
 
-fn spawn_shell(shell_bin: &Path, socket_name: &str, ipc_socket: &Path) -> Result<Child> {
-    let child = Command::new(shell_bin)
-        .arg("--ipc-socket")
+fn spawn_shell(
+    shell_bin: &Path,
+    socket_name: &str,
+    ipc_socket: &Path,
+    cursor_theme: &str,
+    cursor_size: &str,
+) -> Result<Child> {
+    let mut cmd = Command::new(shell_bin);
+    cmd.arg("--ipc-socket")
         .arg(ipc_socket)
         .env("WAYLAND_DISPLAY", socket_name)
         .env("NEON_IPC_SOCKET", ipc_socket)
         .env("XDG_CURRENT_DESKTOP", "NEON-DE")
         .env("XDG_SESSION_TYPE", "wayland")
+        .env("XCURSOR_THEME", cursor_theme)
+        .env("XCURSOR_SIZE", cursor_size);
+    if let Some(disp) = detect_xwayland_display() {
+        cmd.env("DISPLAY", disp);
+    }
+    let child = cmd
         .spawn()
         .with_context(|| format!("Failed to spawn {}", shell_bin.display()))?;
     info!(pid = child.id(), "Launched supervised neon-shell");
     Ok(child)
+}
+
+fn detect_xwayland_display() -> Option<String> {
+    if let Ok(existing) = std::env::var("DISPLAY")
+        && !existing.trim().is_empty()
+    {
+        return Some(existing);
+    }
+    if let Ok(entries) = fs::read_dir("/tmp/.X11-unix") {
+        let mut sockets: Vec<String> = entries
+            .flatten()
+            .filter_map(|e| {
+                let name = e.file_name().to_string_lossy().into_owned();
+                name.strip_prefix('X').map(|n| format!(":{n}"))
+            })
+            .collect();
+        sockets.sort();
+        if let Some(first) = sockets.into_iter().next() {
+            return Some(first);
+        }
+    }
+    None
 }
 
 fn wait_for_compositor_ready(

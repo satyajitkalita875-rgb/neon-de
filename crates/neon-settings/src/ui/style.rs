@@ -1,8 +1,8 @@
 //! Authentic macOS Sequoia × GNOME 47 Boxed-List GTK4 CSS Theme for `neon-settings`.
 //!
-//! Supports both crisp **Neon Light** and neutral macOS **Neon Dark**, circular accent color
-//! swatches, visual style preview cards, wallpaper thumbnail tiles, segmented controls, and
-//! clean hairline boxed lists.
+//! Supports Neon Light and Neon Dark, NEON DE sidebar branding, circular accent color swatches,
+//! visual style preview cards, wallpaper thumbnail tiles, capability badges, search highlights,
+//! and clean hairline boxed lists.
 
 use gtk4::{CssProvider, STYLE_PROVIDER_PRIORITY_APPLICATION, gdk::Display};
 use neon_config::ThemeMode;
@@ -54,7 +54,7 @@ fn build_css(mode: ThemeMode, accent: &str) -> String {
         muted,
         border,
         row_hover,
-        row_selected_bg,
+        _row_selected_bg,
         seg_track,
         seg_active,
         trough_bg,
@@ -76,25 +76,25 @@ fn build_css(mode: ThemeMode, accent: &str) -> String {
         )
     } else {
         (
-            "#1E1E22",
-            "#26262B",
-            "#2B2B31",
+            "#1C1C20",
+            "#242429",
+            "#2A2A30",
             "#F5F5F7",
             "#9A9AA3",
             "rgba(255, 255, 255, 0.08)",
             "rgba(255, 255, 255, 0.05)",
-            "rgba(255, 255, 255, 0.11)",
+            "rgba(255, 255, 255, 0.12)",
             "rgba(255, 255, 255, 0.07)",
-            "#3A3A42",
+            "#3A3A44",
             "rgba(255, 255, 255, 0.14)",
-            "0 1px 3px rgba(0, 0, 0, 0.25)",
+            "0 1px 3px rgba(0, 0, 0, 0.28)",
         )
     };
 
     format!(
         r#"
 * {{
-    font-family: "Adwaita Sans", "Inter", "SF Pro Text", sans-serif;
+    font-family: "Inter", "Adwaita Sans", "Cantarell", sans-serif;
 }}
 
 window.neon-settings-window {{
@@ -102,10 +102,10 @@ window.neon-settings-window {{
     color: {fg};
 }}
 
-/* ===================== SPLIT HEADERBAR (macOS x GNOME 47) ===================== */
+/* ===================== SPLIT HEADERBAR (macOS x GNOME) ===================== */
 
 .settings-split-header {{
-    min-height: 46px;
+    min-height: 48px;
     background-color: {win_bg};
 }}
 
@@ -113,13 +113,14 @@ window.neon-settings-window {{
     background-color: {sidebar_bg};
     border-right: 1px solid {border};
     padding: 0 10px;
-    min-height: 46px;
+    min-height: 48px;
 }}
 
 .settings-content-header {{
     background-color: {win_bg};
+    border-bottom: 1px solid {border};
     padding: 0 14px;
-    min-height: 46px;
+    min-height: 48px;
 }}
 
 .settings-header-title {{
@@ -147,30 +148,84 @@ menubutton.settings-header-icon-btn > button:hover {{
     background-color: {row_hover};
 }}
 
-button.settings-close-circle {{
+button.settings-header-icon-btn:disabled {{
+    opacity: 0.35;
+}}
+
+.macos-traffic-lights {{
+    margin-left: 4px;
+}}
+
+button.macos-tl-btn {{
     background-image: none;
-    background-color: {seg_track};
-    border: none;
-    box-shadow: none;
     border-radius: 999px;
-    min-width: 26px;
-    min-height: 26px;
+    min-width: 13px;
+    min-height: 13px;
     padding: 0;
-    color: {fg};
-    font-weight: 700;
+    margin: 0;
+    font-size: 9px;
+    font-weight: 800;
+    color: transparent;
+    box-shadow: inset 0 0 0 0.75px rgba(0, 0, 0, 0.22);
+    border: none;
+    transition: background-color 120ms ease, color 120ms ease;
 }}
 
-button.settings-close-circle:hover {{
-    background-color: rgba(239, 68, 68, 0.85);
-    color: #FFFFFF;
+button.macos-tl-close {{ background-color: #FF5F57; }}
+button.macos-tl-min {{ background-color: #FEBC2E; }}
+button.macos-tl-max {{ background-color: #28C840; }}
+
+window:backdrop button.macos-tl-btn {{
+    background-color: rgba(135, 137, 145, 0.45);
 }}
 
-/* ===================== SIDEBAR NAVIGATION ===================== */
+.macos-traffic-lights:hover button.macos-tl-close {{
+    background-color: #FF5F57;
+    color: rgba(77, 0, 0, 0.85);
+}}
+
+.macos-traffic-lights:hover button.macos-tl-min {{
+    background-color: #FEBC2E;
+    color: rgba(110, 62, 0, 0.85);
+}}
+
+.macos-traffic-lights:hover button.macos-tl-max {{
+    background-color: #28C840;
+    color: rgba(0, 72, 12, 0.85);
+}}
+
+/* ===================== SIDEBAR BRANDING & NAVIGATION ===================== */
 
 .settings-sidebar {{
     background-color: {sidebar_bg};
     border-right: 1px solid {border};
-    padding: 6px 10px 12px 10px;
+    padding: 8px 10px 10px 10px;
+}}
+
+.neon-brand-card {{
+    padding: 6px 8px 10px 8px;
+}}
+
+.neon-brand-emblem {{
+    background-image: linear-gradient(135deg, {accent} 0%, #6366F1 100%);
+    color: #FFFFFF;
+    border-radius: 9px;
+    min-width: 30px;
+    min-height: 30px;
+    font-size: 13px;
+    font-weight: 800;
+    box-shadow: 0 2px 8px alpha({accent}, 0.35);
+}}
+
+.neon-brand-title {{
+    font-size: 13px;
+    font-weight: 700;
+    color: {fg};
+}}
+
+.neon-brand-sub {{
+    font-size: 11px;
+    color: {muted};
 }}
 
 .settings-search {{
@@ -204,7 +259,7 @@ list.settings-nav-list row.settings-nav-row:hover {{
 }}
 
 list.settings-nav-list row.settings-nav-row:selected {{
-    background-color: {row_selected_bg};
+    background-color: alpha({accent}, 0.18);
     color: {fg};
     font-weight: 600;
 }}
@@ -212,21 +267,56 @@ list.settings-nav-list row.settings-nav-row:selected {{
 .settings-sidebar-sep {{
     background-color: {border};
     min-height: 1px;
-    margin: 7px 8px;
+    margin: 6px 8px;
 }}
 
-/* ===================== CONTENT CLAMP & BOXED LIST CARDS ===================== */
+button.settings-about-footer-btn {{
+    background-image: none;
+    background-color: transparent;
+    border: 1px solid transparent;
+    box-shadow: none;
+    border-radius: 10px;
+    padding: 8px 10px;
+    margin-top: 6px;
+    color: {fg};
+    font-size: 13px;
+    font-weight: 600;
+    transition: background-color 120ms ease;
+}}
+
+button.settings-about-footer-btn:hover {{
+    background-color: {row_hover};
+}}
+
+button.settings-about-footer-btn.active {{
+    background-color: alpha({accent}, 0.18);
+    border-color: alpha({accent}, 0.35);
+}}
+
+/* ===================== PAGE HEADER, CLAMP & BOXED CARDS ===================== */
 
 .settings-content-clamp {{
-    padding: 18px 28px 28px 28px;
+    padding: 18px 28px 32px 28px;
+}}
+
+.settings-page-title {{
+    font-size: 22px;
+    font-weight: 700;
+    color: {fg};
+}}
+
+.settings-page-desc {{
+    font-size: 13px;
+    color: {muted};
+    margin-bottom: 10px;
 }}
 
 .settings-section-title {{
-    font-size: 14px;
+    font-size: 13px;
     font-weight: 700;
     color: {fg};
-    margin-top: 10px;
-    margin-bottom: 8px;
+    margin-top: 12px;
+    margin-bottom: 7px;
 }}
 
 .settings-card {{
@@ -240,6 +330,11 @@ list.settings-nav-list row.settings-nav-row:selected {{
 
 .settings-row {{
     padding: 11px 16px;
+}}
+
+.settings-row-highlighted {{
+    background-color: alpha({accent}, 0.14);
+    border-radius: 10px;
 }}
 
 .settings-row-sep {{
@@ -259,6 +354,8 @@ list.settings-nav-list row.settings-nav-row:selected {{
     color: {muted};
 }}
 
+/* ===================== CAPABILITY & STATUS BADGES ===================== */
+
 .settings-badge {{
     background-color: {seg_track};
     color: {fg};
@@ -273,7 +370,43 @@ list.settings-nav-list row.settings-nav-row:selected {{
     color: #10B981;
 }}
 
-/* ===================== VISUAL STYLE CARDS (GNOME 47 / macOS) ===================== */
+.settings-badge.partial {{
+    background-color: alpha(#F59E0B, 0.18);
+    color: #F59E0B;
+}}
+
+.settings-badge.elevated {{
+    background-color: alpha(#38BDF8, 0.18);
+    color: #38BDF8;
+}}
+
+.settings-badge.unavailable {{
+    background-color: alpha(#94A3B8, 0.18);
+    color: {muted};
+}}
+
+.settings-badge.unsupported {{
+    background-color: alpha(#EF4444, 0.14);
+    color: #F87171;
+}}
+
+/* ===================== GLOBAL SEARCH RESULTS ===================== */
+
+button.search-hit-btn {{
+    background-image: none;
+    background-color: transparent;
+    border: none;
+    box-shadow: none;
+    border-radius: 10px;
+    padding: 10px 14px;
+    color: {fg};
+}}
+
+button.search-hit-btn:hover {{
+    background-color: {row_hover};
+}}
+
+/* ===================== VISUAL STYLE CARDS ===================== */
 
 button.style-preview-btn {{
     background-image: none;
@@ -286,10 +419,10 @@ button.style-preview-btn {{
 
 .style-preview-frame {{
     border-radius: 12px;
-    min-width: 176px;
-    min-height: 112px;
+    min-width: 152px;
+    min-height: 98px;
     border: 3px solid transparent;
-    padding: 12px;
+    padding: 10px;
     transition: border-color 140ms ease;
 }}
 
@@ -305,24 +438,28 @@ button.style-preview-btn.active .style-preview-frame {{
     background-image: linear-gradient(135deg, #0F172A 0%, #1E3A8A 50%, #172554 100%);
 }}
 
+.style-preview-auto-bg {{
+    background-image: linear-gradient(135deg, #60A5FA 0%, #3B82F6 48%, #0F172A 52%, #1E293B 100%);
+}}
+
 .style-mini-win-light {{
     background-color: #FFFFFF;
     border-radius: 7px;
-    min-width: 96px;
-    min-height: 60px;
-    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.28);
+    min-width: 82px;
+    min-height: 52px;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.26);
 }}
 
 .style-mini-win-dark {{
     background-color: #1F2229;
     border: 1px solid rgba(255, 255, 255, 0.12);
     border-radius: 7px;
-    min-width: 96px;
-    min-height: 60px;
+    min-width: 82px;
+    min-height: 52px;
     box-shadow: 0 4px 12px rgba(0, 0, 0, 0.40);
 }}
 
-/* ===================== CIRCULAR ACCENT COLOR SWATCHES ===================== */
+/* ===================== ACCENT SWATCHES & WALLPAPERS ===================== */
 
 button.accent-circle {{
     background-image: none;
@@ -346,8 +483,6 @@ button.accent-amber {{ background-color: #F59E0B; }}
 button.accent-rose {{ background-color: #F43F5E; }}
 button.accent-pink {{ background-color: #EC4899; }}
 
-/* ===================== WALLPAPER THUMBNAIL GRID ===================== */
-
 button.wp-thumb-btn {{
     background-image: none;
     background-color: transparent;
@@ -358,19 +493,12 @@ button.wp-thumb-btn {{
     transition: border-color 140ms ease;
 }}
 
-button.wp-thumb-btn:hover {{
-    border-color: {border};
-}}
+button.wp-thumb-btn:hover {{ border-color: {border}; }}
+button.wp-thumb-btn.active {{ border-color: {accent}; }}
 
-button.wp-thumb-btn.active {{
-    border-color: {accent};
-}}
+.wp-thumb-pic {{ border-radius: 9px; }}
 
-.wp-thumb-pic {{
-    border-radius: 9px;
-}}
-
-/* ===================== SEGMENTED CONTROLS & SLIDERS ===================== */
+/* ===================== BUTTONS, SEGMENTED CONTROLS & SLIDERS ===================== */
 
 .settings-seg-track {{
     background-color: {seg_track};
@@ -402,7 +530,7 @@ button.settings-action-btn {{
     color: #FFFFFF;
     border: none;
     border-radius: 10px;
-    padding: 7px 16px;
+    padding: 7px 15px;
     font-size: 13px;
     font-weight: 600;
 }}
@@ -414,6 +542,17 @@ button.settings-secondary-btn {{
     border: 1px solid {border};
     border-radius: 10px;
     padding: 7px 14px;
+    font-size: 13px;
+    font-weight: 600;
+}}
+
+button.settings-destructive-btn {{
+    background-image: none;
+    background-color: #DC2626;
+    color: #FFFFFF;
+    border: none;
+    border-radius: 10px;
+    padding: 7px 15px;
     font-size: 13px;
     font-weight: 600;
 }}
@@ -439,12 +578,22 @@ scale.settings-scale slider {{
     box-shadow: 0 1px 4px rgba(0, 0, 0, 0.25);
 }}
 
+/* ===================== STATUS BAR & POPOVERS ===================== */
+
 .settings-status-bar {{
-    padding: 6px 16px;
+    padding: 7px 16px;
     border-top: 1px solid {border};
     background-color: {sidebar_bg};
     font-size: 12px;
     color: {muted};
+}}
+
+.settings-status-bar.status-ok {{
+    color: #10B981;
+}}
+
+.settings-status-bar.status-error {{
+    color: #EF4444;
 }}
 
 popover > contents {{
@@ -469,6 +618,23 @@ button.settings-menu-item {{
 
 button.settings-menu-item:hover {{
     background-color: {row_hover};
+}}
+
+.monitor-canvas {{
+    background-color: {seg_track};
+    border: 1px solid {border};
+    border-radius: 12px;
+}}
+
+.kbd-pill {{
+    background-color: {seg_track};
+    border: 1px solid {border};
+    border-radius: 7px;
+    padding: 3px 9px;
+    font-family: monospace;
+    font-size: 12px;
+    font-weight: 700;
+    color: {fg};
 }}
 "#
     )

@@ -357,10 +357,14 @@ fn render_frame(
     let size = backend.window_size();
     let full_damage = Rectangle::from_size(size);
     let blur = BlurSettings {
-        enabled: state.effects.config.blur_enabled,
+        enabled: state.effects.config.blur_enabled && !state.config.appearance.reduce_blur,
         strength: state.effects.config.blur_strength,
         corner_radius: state.effects.config.corner_radius,
     };
+    neon_renderer.sync_cursor_config(
+        &state.config.appearance.cursor_theme,
+        state.config.appearance.cursor_size,
+    );
 
     let (should_submit, render_damage) = {
         let age = backend.buffer_age().unwrap_or(0);
@@ -393,13 +397,25 @@ fn render_frame(
                         lock_surface,
                     )
                 } else {
-                    neon_renderer.render_scene(
+                    let or_popups: Vec<_> = state
+                        .override_redirect_windows
+                        .iter()
+                        .filter_map(|w| {
+                            let loc = state
+                                .space
+                                .element_location(w)
+                                .or_else(|| w.x11_surface().map(|s| s.geometry().loc))?;
+                            Some((w, loc))
+                        })
+                        .collect();
+                    neon_renderer.render_scene_with_popups(
                         output,
                         renderer,
                         &mut framebuffer,
                         age,
                         &state.scene,
                         blur,
+                        &or_popups,
                         |id| state.managed_windows.get(&id),
                     )
                 };

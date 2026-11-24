@@ -590,6 +590,30 @@ impl WindowManager {
         self.workspaces.switch_prev()
     }
 
+    /// Adds a new desktop (up to 10 total) and returns its `(WorkspaceId, index)`.
+    pub fn add_workspace(&mut self) -> Option<(WorkspaceId, usize)> {
+        self.workspaces.add_workspace()
+    }
+
+    /// Removes the desktop at `index`, relocating any windows cleanly to an adjacent desktop.
+    pub fn remove_workspace(&mut self, index: usize) -> bool {
+        let removed_ws_id = self.workspaces.workspaces().get(index).map(|w| w.id);
+        if !self.workspaces.remove_workspace(index) {
+            return false;
+        }
+        // Keep per-window `workspace_id` metadata synchronized with WorkspaceManager.
+        for (&wid, win) in &mut self.windows {
+            if let Some(new_ws) = self.workspaces.workspace_of_window(wid) {
+                win.workspace_id = new_ws;
+            }
+        }
+        if let Some(old_id) = removed_ws_id {
+            self.focus_history.remove(&old_id);
+            self.minimized_history.remove(&old_id);
+        }
+        true
+    }
+
     /// Moves `id` to the next workspace (dynamically appending one if needed).
     pub fn move_window_to_next_workspace(
         &mut self,

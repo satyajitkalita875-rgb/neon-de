@@ -9,12 +9,18 @@
 //! - PolicyKit1 (`org.freedesktop.PolicyKit1.AuthenticationAgent`)
 //! - XDG Desktop Portals (`org.freedesktop.portal.Desktop`)
 
+pub mod apps;
 pub mod audio;
 pub mod bluetooth;
+pub mod datetime;
+pub mod media;
 pub mod network;
 pub mod notifications;
 pub mod polkit;
 pub mod portals;
+pub mod storage;
+pub mod updates;
+pub mod users;
 
 use std::{sync::mpsc, thread, time::Duration};
 
@@ -23,7 +29,7 @@ use tracing::warn;
 use zbus::blocking::Connection;
 
 use crate::{
-    audio::AudioStatus, bluetooth::BluetoothStatus, network::NetworkStatus,
+    audio::AudioStatus, bluetooth::BluetoothStatus, media::MediaStatus, network::NetworkStatus,
     notifications::NotificationServiceStatus, polkit::PolkitStatus, portals::PortalStatus,
     power::PowerStatus,
 };
@@ -37,6 +43,7 @@ pub struct SystemSnapshot {
     pub audio: AudioStatus,
     pub bluetooth: BluetoothStatus,
     pub power: PowerStatus,
+    pub media: MediaStatus,
     pub notifications: NotificationServiceStatus,
     pub polkit: PolkitStatus,
     pub portals: PortalStatus,
@@ -55,6 +62,10 @@ pub enum SystemAction {
     ToggleSourceMute,
     SetDefaultSink(u32),
     SetPowerProfile(String),
+    SetBrightness(u32),
+    MediaCommand { bus_name: Option<String>, method: String },
+    InvokePowerAction(String),
+    LogOut,
     SendTestNotification { bus_name: String },
 }
 
@@ -75,6 +86,7 @@ pub fn query_system_snapshot() -> SystemSnapshot {
         .map(power::query_power_with_connection)
         .unwrap_or_default();
     let audio = audio::query_audio_status();
+    let media = media::query_media_status();
     let notifications = notifications::query_notification_service_status();
     let polkit = polkit::query_polkit_status();
     let portals = portals::query_portal_status();
@@ -84,6 +96,7 @@ pub fn query_system_snapshot() -> SystemSnapshot {
         audio,
         bluetooth,
         power,
+        media,
         notifications,
         polkit,
         portals,
@@ -106,6 +119,12 @@ pub fn execute_system_action(action: &SystemAction) -> Result<(), String> {
         SystemAction::ToggleSourceMute => audio::toggle_source_mute(),
         SystemAction::SetDefaultSink(id) => audio::set_default_sink(*id),
         SystemAction::SetPowerProfile(profile) => power::set_power_profile(profile),
+        SystemAction::SetBrightness(pct) => power::set_backlight_percent(*pct),
+        SystemAction::MediaCommand { bus_name, method } => {
+            media::invoke_media_command(bus_name.as_deref(), method)
+        }
+        SystemAction::InvokePowerAction(method) => power::invoke_logind_action(method),
+        SystemAction::LogOut => power::terminate_current_session(),
         SystemAction::SendTestNotification { bus_name } => notifications::send_dbus_notification(
             bus_name,
             "NEON DE",
@@ -155,17 +174,27 @@ pub fn start_system_monitor(
                         }
                         // Drain any burst of rapid slider actions before re-querying.
                         let mut latest_vol: Option<f32> = None;
+                        let mut latest_brightness: Option<u32> = None;
                         while let Ok(next) = action_rx.try_recv() {
-                            if let SystemAction::SetSinkVolume(v) = next {
-                                latest_vol = Some(v);
-                            } else if let Err(err) = execute_system_action(&next) {
-                                warn!(?next, %err, "Queued system action failed");
+                            match next {
+                                SystemAction::SetSinkVolume(v) => latest_vol = Some(v),
+                                SystemAction::SetBrightness(b) => latest_brightness = Some(b),
+                                other => {
+                                    if let Err(err) = execute_system_action(&other) {
+                                        warn!(?other, %err, "Queued system action failed");
+                                    }
+                                }
                             }
                         }
                         if let Some(v) = latest_vol
                             && let Err(err) = audio::set_sink_volume(v)
                         {
                             warn!(%err, "Coalesced sink volume action failed");
+                        }
+                        if let Some(b) = latest_brightness
+                            && let Err(err) = power::set_backlight_percent(b)
+                        {
+                            warn!(%err, "Coalesced display brightness action failed");
                         }
                         let snap = query_system_snapshot();
                         last_snapshot = snap.clone();

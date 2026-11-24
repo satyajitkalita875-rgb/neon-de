@@ -43,12 +43,23 @@ pub fn spawn_xwayland(state: &mut NeonState) {
                         display_number,
                     } => match X11Wm::start_wm(wm_handle.clone(), x11_socket, client.clone()) {
                         Ok(wm) => {
+                            let disp_str = format!(":{display_number}");
                             state.xwm = Some(wm);
                             state.xwayland_display = Some(display_number);
                             info!(
-                                display = format!(":{display_number}"),
+                                display = %disp_str,
                                 "XWayland ready and X11 window manager attached"
                             );
+                            // Export DISPLAY to systemd/D-Bus activation environment for X11 apps
+                            // such as DaVinci Resolve launched from shell or portals.
+                            std::thread::spawn(move || {
+                                let _ = std::process::Command::new(
+                                    "dbus-update-activation-environment",
+                                )
+                                .args(["--systemd", "DISPLAY"])
+                                .env("DISPLAY", &disp_str)
+                                .status();
+                            });
                         }
                         Err(err) => {
                             warn!(?err, "Failed to start X11Wm for XWayland");
@@ -109,7 +120,14 @@ impl XwmHandler for NeonState {
         let work_area = self.work_area();
         let record = self.wm.register_window(work_area, None);
         let id = record.id;
-        let loc = from_wm_point(record.current_geometry.loc);
+        let wants_ssd = surface.is_decorated();
+        let mut loc = from_wm_point(record.current_geometry.loc);
+        if wants_ssd {
+            let min_y = work_area.loc.y + neon_scene::MACOS_TITLEBAR_HEIGHT;
+            if loc.y < min_y {
+                loc.y = min_y;
+            }
+        }
 
         let mut geo = surface.geometry();
         geo.loc = loc;
@@ -122,6 +140,8 @@ impl XwmHandler for NeonState {
             rec.title = Some(surface.title());
             rec.app_id = Some(surface.class());
             rec.mapped = true;
+            rec.current_geometry.loc.y = loc.y;
+            rec.floating_geometry.loc.y = loc.y;
             rec.current_geometry.size = to_wm_size(geo.size);
             rec.floating_geometry.size = to_wm_size(geo.size);
         }
@@ -129,6 +149,9 @@ impl XwmHandler for NeonState {
         let window = Window::new_x11_window(surface);
         attach_window_id(&window, id);
         self.managed_windows.insert(id, window.clone());
+        if wants_ssd {
+            self.ssd_windows.insert(id);
+        }
 
         if record.is_visible_on(self.wm.active_workspace_id()) {
             self.space.map_element(window.clone(), loc, true);
@@ -143,12 +166,31 @@ impl XwmHandler for NeonState {
 
     fn mapped_override_redirect_window(&mut self, _xwm: XwmId, surface: X11Surface) {
         let loc = surface.geometry().loc;
+        let xid = surface.window_id();
         let window = Window::new_x11_window(surface);
+        self.override_redirect_windows.retain(|w| {
+            w.x11_surface()
+                .map(|s| s.window_id() != xid)
+                .unwrap_or(true)
+        });
+        self.override_redirect_windows.push(window.clone());
         self.space.map_element(window, loc, true);
+        self.needs_redraw = true;
     }
 
     fn unmapped_window(&mut self, _xwm: XwmId, surface: X11Surface) {
         let target_xid = surface.window_id();
+        self.override_redirect_windows.retain(|w| {
+            let matches = w
+                .x11_surface()
+                .map(|s| s.window_id() == target_xid)
+                .unwrap_or(false);
+            if matches {
+                self.space.unmap_elem(w);
+                self.needs_redraw = true;
+            }
+            !matches
+        });
         let matching = self
             .managed_windows
             .iter()
@@ -163,6 +205,10 @@ impl XwmHandler for NeonState {
             let was_focused = self.wm.focused_id() == Some(id);
             self.space.unmap_elem(&window);
             self.managed_windows.remove(&id);
+            self.ssd_windows.remove(&id);
+            if self.hovered_titlebar_window == Some(id) {
+                self.hovered_titlebar_window = None;
+            }
             self.wm.remove_window(id);
             self.effects.remove_window(id);
             self.scene.remove_window(id);

@@ -1,5 +1,6 @@
 //! Entrypoint for `neon-shell` — NEON DE's custom Rust + GTK4 Wayland desktop shell.
 
+mod context_menu;
 mod desktop_apps;
 mod dock;
 mod ipc_bridge;
@@ -10,8 +11,9 @@ mod quick_settings;
 mod screenshot_ui;
 mod style;
 mod wallpaper;
+mod workspaces_panel;
 
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{path::PathBuf, rc::Rc, sync::Arc, time::Duration};
 
 use clap::Parser;
 use gtk4::{Application, gio, glib, prelude::*};
@@ -23,7 +25,11 @@ use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 use crate::{
-    desktop_apps::{discover_applications, select_default_favorites},
+    context_menu::ContextMenuOverlay,
+    desktop_apps::{
+        discover_applications, select_default_favorites, set_live_cursor_config,
+        set_live_xwayland_display,
+    },
     dock::Dock,
     ipc_bridge::{ShellIpcUpdate, resolve_ipc_socket_path, start_ipc_bridge},
     notifications::NotificationOverlay,
@@ -32,6 +38,7 @@ use crate::{
     quick_settings::QuickSettingsPanel,
     screenshot_ui::ScreenshotOverlay,
     wallpaper::WallpaperLayer,
+    workspaces_panel::WorkspacesPanel,
 };
 
 #[derive(Debug, Parser)]
@@ -87,8 +94,11 @@ fn main() {
 
         let (ipc_sender, update_rx) = start_ipc_bridge(socket_path.clone());
 
+        // System-wide macOS right-click context menu overlay (Desktop, Dock, Panel, Windows).
+        let context_menu = ContextMenuOverlay::build(app, apps.clone(), ipc_sender.clone());
+
         // Background wallpaper layer renders behind all desktop windows & panels.
-        let wallpaper_layer = WallpaperLayer::build(app);
+        let wallpaper_layer = WallpaperLayer::build(app, context_menu.clone());
         let screenshot_overlay = ScreenshotOverlay::build(app, ipc_sender.clone());
         let toast_overlay = NotificationOverlay::build(app, Arc::clone(&notif_store));
         let quick_settings = QuickSettingsPanel::build(
@@ -98,14 +108,39 @@ fn main() {
             Arc::clone(&notif_store),
             toast_overlay.clone(),
         );
-        let top_panel = TopPanel::build(
+        let workspaces_panel = WorkspacesPanel::build(app, ipc_sender.clone());
+        let top_panel = Rc::new(TopPanel::build(
             app,
             ipc_sender.clone(),
             sys_tx.clone(),
             quick_settings.clone(),
-        );
-        let dock = Dock::build(app, &favorites, apps.clone(), ipc_sender.clone());
+            workspaces_panel.clone(),
+            context_menu.clone(),
+        ));
+        let dock = Rc::new(Dock::build(
+            app,
+            &favorites,
+            apps.clone(),
+            ipc_sender.clone(),
+            context_menu.clone(),
+        ));
         let overview = Overview::build(app, apps, ipc_sender);
+        {
+            let tp_layer = Rc::clone(&top_panel);
+            let dk_layer = Rc::clone(&dock);
+            let tp_bg = Rc::clone(&top_panel);
+            let dk_bg = Rc::clone(&dock);
+            overview.set_chrome_hooks(
+                move |elevated| {
+                    tp_layer.set_drawer_layer_elevated(elevated);
+                    dk_layer.set_drawer_layer_elevated(elevated);
+                },
+                move |hidden| {
+                    tp_bg.set_drawer_bg_hidden(hidden);
+                    dk_bg.set_drawer_bg_hidden(hidden);
+                },
+            );
+        }
 
         let sys_rx_local = sys_rx.borrow_mut().take();
         let notif_rx_local = notif_rx.borrow_mut().take();
@@ -116,19 +151,35 @@ fn main() {
             while let Ok(update) = update_rx.try_recv() {
                 match update {
                     ShellIpcUpdate::Snapshot(snapshot) => {
+                        set_live_xwayland_display(snapshot.xwayland_display.as_deref());
+                        set_live_cursor_config(
+                            snapshot.appearance.cursor_theme.as_deref(),
+                            snapshot.appearance.cursor_size,
+                        );
                         theme_ctrl.apply_if_changed(&snapshot.appearance);
                         wallpaper_layer.update(&snapshot.appearance);
                         quick_settings.update_appearance(&snapshot.appearance);
+                        context_menu.update_snapshot(&snapshot);
                         screenshot_overlay.update_snapshot(&snapshot);
                         top_panel.update(&snapshot);
+                        workspaces_panel.update(&snapshot);
                         dock.update(&snapshot);
                         overview.update(&snapshot);
                     }
                     ShellIpcUpdate::OverviewToggled(open) => {
+                        context_menu.close();
+                        if open {
+                            quick_settings.close();
+                            workspaces_panel.close();
+                        }
                         overview.set_open(open);
                     }
                     ShellIpcUpdate::ScreenshotUiRequested => {
+                        context_menu.close();
                         screenshot_overlay.open();
+                    }
+                    ShellIpcUpdate::ContextMenuRequested { x, y, target } => {
+                        context_menu.handle_compositor_request(x, y, target);
                     }
                 }
             }

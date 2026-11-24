@@ -1,4 +1,5 @@
 /target
+/target-user
 **/*.rs.bk
 *.swp
 *.swo

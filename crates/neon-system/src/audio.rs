@@ -124,6 +124,144 @@ pub fn set_default_sink(sink_id: u32) -> Result<(), String> {
     Ok(())
 }
 
+/// Sets the default PipeWire microphone source volume (`0.0..=1.5`).
+pub fn set_source_volume(volume: f32) -> Result<(), String> {
+    let clamped = volume.clamp(0.0, 1.5);
+    let arg = format!("{clamped:.2}");
+    run_wpctl(&["set-volume", "@DEFAULT_AUDIO_SOURCE@", &arg])?;
+    Ok(())
+}
+
+/// Sets or clears mute on the default PipeWire microphone source.
+pub fn set_source_mute(muted: bool) -> Result<(), String> {
+    let flag = if muted { "1" } else { "0" };
+    run_wpctl(&["set-mute", "@DEFAULT_AUDIO_SOURCE@", flag])?;
+    Ok(())
+}
+
+/// Switches the default PipeWire audio input source by WirePlumber node ID.
+pub fn set_default_source(source_id: u32) -> Result<(), String> {
+    let id_str = source_id.to_string();
+    run_wpctl(&["set-default", &id_str])?;
+    Ok(())
+}
+
+/// Sets the volume of a specific PipeWire audio stream node ID (`0.0..=1.5`).
+pub fn set_node_volume(node_id: u32, volume: f32) -> Result<(), String> {
+    let id_str = node_id.to_string();
+    let arg = format!("{:.2}", volume.clamp(0.0, 1.5));
+    run_wpctl(&["set-volume", &id_str, &arg])?;
+    Ok(())
+}
+
+/// Plays a real stereo speaker test sound via PipeWire / freedesktop sound assets.
+pub fn test_speakers() -> Result<(), String> {
+    for sound in [
+        "/usr/share/sounds/freedesktop/stereo/bell.oga",
+        "/usr/share/sounds/freedesktop/stereo/audio-volume-change.oga",
+        "/usr/share/sounds/freedesktop/stereo/complete.oga",
+    ] {
+        if std::path::Path::new(sound).exists() {
+            if Command::new("paplay").arg(sound).spawn().is_ok()
+                || Command::new("pw-play").arg(sound).spawn().is_ok()
+            {
+                return Ok(());
+            }
+        }
+    }
+    Err("no test sound player (paplay / pw-play) or sound asset found".into())
+}
+
+/// Lists PipeWire microphone / input sources parsed from `wpctl status`.
+pub fn query_audio_sources() -> Vec<AudioSink> {
+    match run_wpctl(&["status"]) {
+        Ok(stdout) => parse_wpctl_section(&stdout, "Sources:"),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Lists active per-application PipeWire playback streams parsed from `wpctl status`.
+pub fn query_audio_streams() -> Vec<AudioSink> {
+    match run_wpctl(&["status"]) {
+        Ok(stdout) => parse_wpctl_section(&stdout, "Streams:"),
+        Err(_) => Vec::new(),
+    }
+}
+
+fn parse_wpctl_section(output: &str, header: &str) -> Vec<AudioSink> {
+    let mut items = Vec::new();
+    let mut in_audio = false;
+    let mut in_section = false;
+
+    for line in output.lines() {
+        let trimmed = line.trim();
+        if trimmed == "Audio" {
+            in_audio = true;
+            in_section = false;
+            continue;
+        }
+        if in_audio && (trimmed == "Video" || trimmed == "Settings") {
+            break;
+        }
+        if !in_audio {
+            continue;
+        }
+        if trimmed.contains(header) {
+            in_section = true;
+            continue;
+        }
+        if in_section
+            && (trimmed.contains("Sinks:")
+                || trimmed.contains("Sources:")
+                || trimmed.contains("Filters:")
+                || trimmed.contains("Streams:")
+                || trimmed.contains("Devices:"))
+        {
+            in_section = false;
+            continue;
+        }
+        if !in_section {
+            continue;
+        }
+        let cleaned = trimmed.trim_start_matches(['│', '├', '└', '─', ' ']).trim();
+        if cleaned.is_empty() {
+            continue;
+        }
+        let (is_default, after_star) = if let Some(rest) = cleaned.strip_prefix('*') {
+            (true, rest.trim_start())
+        } else {
+            (false, cleaned)
+        };
+        let Some((id_str, rest)) = after_star.split_once('.') else {
+            continue;
+        };
+        let Ok(id) = id_str.trim().parse::<u32>() else {
+            continue;
+        };
+        let (name_part, meta_part) = match rest.split_once("[vol:") {
+            Some((n, m)) => (n.trim(), Some(m)),
+            None => (rest.trim(), None),
+        };
+        let muted = meta_part.is_some_and(|m| m.contains("MUTED"));
+        let volume = meta_part.and_then(|m| {
+            m.trim_start()
+                .split([' ', ']'])
+                .next()
+                .and_then(|v| v.parse::<f32>().ok())
+        });
+        if !name_part.is_empty() {
+            items.push(AudioSink {
+                id,
+                name: name_part.to_string(),
+                is_default,
+                volume,
+                muted,
+            });
+        }
+    }
+    items
+}
+
 fn run_wpctl(args: &[&str]) -> Result<String, String> {
     let output = Command::new("wpctl")
         .args(args)

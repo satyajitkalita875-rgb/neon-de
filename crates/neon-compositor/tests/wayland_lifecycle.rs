@@ -1118,6 +1118,10 @@ fn ipc_server_state_overview_workspace_and_effects_roundtrip() {
                 show_workspaces: Some(true),
                 high_contrast: Some(true),
                 wallpaper: None,
+                reduce_blur: Some(true),
+                blur_strength: Some(0.4),
+                cursor_theme: Some("macOS".into()),
+                cursor_size: Some(20),
             })
             .unwrap();
         let IpcResult::Ok {
@@ -1129,6 +1133,9 @@ fn ipc_server_state_overview_workspace_and_effects_roundtrip() {
         assert_eq!(appearance.theme, "neon_light");
         assert_eq!(appearance.accent_color, "#A855F7");
         assert!(appearance.high_contrast);
+        assert!(appearance.reduce_blur);
+        assert_eq!(appearance.cursor_theme.as_deref(), Some("macOS"));
+        assert_eq!(appearance.cursor_size, Some(20));
 
         let diag_res = client.request(IpcRequest::GetDiagnostics).unwrap();
         let IpcResult::Ok {

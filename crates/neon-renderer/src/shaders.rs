@@ -166,6 +166,132 @@ void main() {
 }
 "#;
 
+/// Authentic macOS Sequoia server-side window titlebar shader with crisp SDF traffic-light
+/// Close (#FF5F57), Minimize (#FEBC2E), and Maximize (#28C840) buttons + hover glyphs (×, −, +).
+pub const MACOS_TITLEBAR_FRAGMENT_SHADER: &str = r#"
+precision mediump float;
+
+varying vec2 v_coords;
+uniform vec2 size;
+uniform float alpha;
+
+uniform float u_corner_radius;
+uniform float u_focused;
+uniform float u_light_theme;
+uniform float u_hover_controls;
+uniform float u_opacity;
+
+float rounded_top_sdf(vec2 pos, vec2 sz, float r) {
+    float rad = min(r, min(sz.x * 0.5, sz.y));
+    // Only round the top-left and top-right corners; bottom joins flush with client surface
+    vec2 p = pos - vec2(sz.x * 0.5, sz.y * 0.5);
+    vec2 half_sz = sz * 0.5;
+    float corner_r = (pos.y < rad) ? rad : 0.0;
+    vec2 q = abs(p) - half_sz + vec2(corner_r);
+    return min(max(q.x, q.y), 0.0) + length(max(q, 0.0)) - corner_r;
+}
+
+float sd_segment(vec2 p, vec2 a, vec2 b) {
+    vec2 pa = p - a;
+    vec2 ba = b - a;
+    float h = clamp(dot(pa, ba) / max(dot(ba, ba), 1e-5), 0.0, 1.0);
+    return length(pa - ba * h);
+}
+
+void main() {
+    vec2 pos = v_coords * size;
+    float box_d = rounded_top_sdf(pos, size, u_corner_radius);
+    float mask = 1.0 - smoothstep(-0.75, 0.75, box_d);
+    if (mask <= 0.001) {
+        gl_FragColor = vec4(0.0);
+        return;
+    }
+
+    // macOS dark vs light titlebar surface gradient
+    float t = clamp(pos.y / max(size.y, 1.0), 0.0, 1.0);
+    vec3 dark_top = mix(vec3(0.145, 0.149, 0.173), vec3(0.180, 0.184, 0.212), u_focused);
+    vec3 dark_bot = mix(vec3(0.125, 0.129, 0.153), vec3(0.155, 0.159, 0.186), u_focused);
+    vec3 light_top = mix(vec3(0.910, 0.914, 0.925), vec3(0.955, 0.958, 0.968), u_focused);
+    vec3 light_bot = mix(vec3(0.875, 0.879, 0.892), vec3(0.922, 0.926, 0.938), u_focused);
+
+    vec3 bg = mix(mix(dark_top, dark_bot, t), mix(light_top, light_bot, t), u_light_theme);
+
+    // Subtle 1px bottom hairline divider
+    if (pos.y > size.y - 1.1) {
+        vec3 sep = mix(vec3(1.0, 1.0, 1.0), vec3(0.0, 0.0, 0.0), u_light_theme);
+        bg = mix(bg, sep, 0.10);
+    }
+
+    // macOS traffic-light buttons at top-left: Close (16, 14), Minimize (36, 14), Maximize (56, 14)
+    float cy = size.y * 0.5;
+    float btn_r = 6.0;
+    vec2 c_close = vec2(16.0, cy);
+    vec2 c_min   = vec2(36.0, cy);
+    vec2 c_max   = vec2(56.0, cy);
+
+    float show_color = max(u_focused, u_hover_controls);
+    vec3 inactive_dot = mix(vec3(0.36, 0.37, 0.41), vec3(0.76, 0.77, 0.79), u_light_theme);
+    vec3 col_close = mix(inactive_dot, vec3(1.000, 0.373, 0.341), show_color); // #FF5F57
+    vec3 col_min   = mix(inactive_dot, vec3(0.996, 0.737, 0.180), show_color); // #FEBC2E
+    vec3 col_max   = mix(inactive_dot, vec3(0.157, 0.784, 0.251), show_color); // #28C840
+
+    vec3 rgb = bg;
+
+    // 1. Close button (red) + × glyph on hover
+    float d_close = length(pos - c_close) - btn_r;
+    float m_close = 1.0 - smoothstep(-0.65, 0.65, d_close);
+    if (m_close > 0.001) {
+        vec3 bcol = col_close;
+        float rim = smoothstep(-1.2, -0.2, d_close);
+        bcol *= (1.0 - rim * 0.16);
+        if (u_hover_controls > 0.5) {
+            vec2 lp = pos - c_close;
+            float g1 = sd_segment(lp, vec2(-2.6, -2.6), vec2(2.6, 2.6)) - 0.65;
+            float g2 = sd_segment(lp, vec2(-2.6,  2.6), vec2(2.6, -2.6)) - 0.65;
+            float gm = 1.0 - smoothstep(-0.45, 0.45, min(g1, g2));
+            bcol = mix(bcol, vec3(0.30, 0.03, 0.03), gm * 0.85);
+        }
+        rgb = mix(rgb, bcol, m_close);
+    }
+
+    // 2. Minimize button (yellow) + − glyph on hover
+    float d_min = length(pos - c_min) - btn_r;
+    float m_min = 1.0 - smoothstep(-0.65, 0.65, d_min);
+    if (m_min > 0.001) {
+        vec3 bcol = col_min;
+        float rim = smoothstep(-1.2, -0.2, d_min);
+        bcol *= (1.0 - rim * 0.16);
+        if (u_hover_controls > 0.5) {
+            vec2 lp = pos - c_min;
+            float g = sd_segment(lp, vec2(-3.0, 0.0), vec2(3.0, 0.0)) - 0.68;
+            float gm = 1.0 - smoothstep(-0.45, 0.45, g);
+            bcol = mix(bcol, vec3(0.38, 0.22, 0.01), gm * 0.85);
+        }
+        rgb = mix(rgb, bcol, m_min);
+    }
+
+    // 3. Maximize button (green) + + glyph on hover
+    float d_max = length(pos - c_max) - btn_r;
+    float m_max = 1.0 - smoothstep(-0.65, 0.65, d_max);
+    if (m_max > 0.001) {
+        vec3 bcol = col_max;
+        float rim = smoothstep(-1.2, -0.2, d_max);
+        bcol *= (1.0 - rim * 0.16);
+        if (u_hover_controls > 0.5) {
+            vec2 lp = pos - c_max;
+            float g1 = sd_segment(lp, vec2(-2.9, 0.0), vec2(2.9, 0.0)) - 0.65;
+            float g2 = sd_segment(lp, vec2(0.0, -2.9), vec2(0.0, 2.9)) - 0.65;
+            float gm = 1.0 - smoothstep(-0.45, 0.45, min(g1, g2));
+            bcol = mix(bcol, vec3(0.03, 0.28, 0.06), gm * 0.85);
+        }
+        rgb = mix(rgb, bcol, m_max);
+    }
+
+    float a = mask * u_opacity * alpha;
+    gl_FragColor = vec4(rgb * a, a);
+}
+"#;
+
 /// Compiled NEON DE custom shader suite cached for the lifetime of a `GlesRenderer`.
 #[derive(Debug, Clone)]
 pub struct NeonShaders {
@@ -173,6 +299,7 @@ pub struct NeonShaders {
     pub border: GlesPixelProgram,
     pub backdrop: GlesPixelProgram,
     pub frosted_glass: GlesPixelProgram,
+    pub titlebar: GlesPixelProgram,
 }
 
 impl NeonShaders {
@@ -220,11 +347,23 @@ impl NeonShaders {
             ],
         )?;
 
+        let titlebar = renderer.compile_custom_pixel_shader(
+            MACOS_TITLEBAR_FRAGMENT_SHADER,
+            &[
+                UniformName::new("u_corner_radius", UniformType::_1f),
+                UniformName::new("u_focused", UniformType::_1f),
+                UniformName::new("u_light_theme", UniformType::_1f),
+                UniformName::new("u_hover_controls", UniformType::_1f),
+                UniformName::new("u_opacity", UniformType::_1f),
+            ],
+        )?;
+
         Ok(Self {
             shadow,
             border,
             backdrop,
             frosted_glass,
+            titlebar,
         })
     }
 }

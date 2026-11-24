@@ -1,12 +1,13 @@
 //! Time-based, interruptible, frame-driven animation engine for **NEON DE**.
 //!
-//! Designed to never block the compositor event loop: every animation is a pure function of
-//! monotonic timestamp (`Duration`), supports seamless mid-flight retargeting, cancellation,
-//! chaining, cubic Bézier curves, spring physics, and accessibility reduced-motion fallback.
+//! Powered by **Material 3 Expressive** spring physics (`Spatial` springs with controlled organic
+//! overshoot for position/size/scale morphs, and critically-damped `Effects` springs for crisp
+//! zero-overshoot opacity/focus transitions) combined with Hyprland-style window open/close,
+//! dock-swoop minimize/restore, and smooth geometry morphing for maximize/unmaximize/snap/resize.
 
 use std::{collections::HashMap, time::Duration};
 
-use neon_window_manager::WindowId;
+use neon_window_manager::{WindowId, geometry::Rect};
 
 /// Supported easing functions and physics curves.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -22,7 +23,7 @@ pub enum Easing {
         x2: f64,
         y2: f64,
     },
-    /// Damped harmonic oscillator spring curve.
+    /// Damped harmonic oscillator spring curve (`m = mass`, `k = stiffness`, `c = damping`).
     Spring {
         stiffness: f64,
         damping: f64,
@@ -31,7 +32,7 @@ pub enum Easing {
 }
 
 impl Easing {
-    /// NEON DE signature smooth deceleration curve (crisp start, fluid settle).
+    /// NEON DE smooth deceleration curve (crisp start, fluid settle).
     pub const NEON_STANDARD: Self = Self::CubicBezier {
         x1: 0.2,
         y1: 0.0,
@@ -39,10 +40,55 @@ impl Easing {
         y2: 1.0,
     };
 
-    /// Crisp spring tuned for window open/focus micro-interactions.
+    /// Crisp spring tuned for window micro-interactions.
     pub const NEON_SPRING: Self = Self::Spring {
         stiffness: 260.0,
         damping: 26.0,
+        mass: 1.0,
+    };
+
+    /// **Material 3 Expressive — Fast Spatial** (`k = 800, ζ = 0.6`, lively bouncy settle).
+    pub const M3_EXPRESSIVE_FAST_SPATIAL: Self = Self::Spring {
+        stiffness: 800.0,
+        damping: 33.9411,
+        mass: 1.0,
+    };
+
+    /// **Material 3 Expressive — Default Spatial** (`k = 380, ζ = 0.8`, organic overshoot).
+    /// Used for window open, restore, maximize, unmaximize, snap, and resize morphs.
+    pub const M3_EXPRESSIVE_DEFAULT_SPATIAL: Self = Self::Spring {
+        stiffness: 380.0,
+        damping: 31.1897,
+        mass: 1.0,
+    };
+
+    /// **Material 3 Expressive — Slow Spatial** (`k = 200, ζ = 0.8`, sweeping viewport physics).
+    /// Used for multi-desktop workspace switches.
+    pub const M3_EXPRESSIVE_SLOW_SPATIAL: Self = Self::Spring {
+        stiffness: 200.0,
+        damping: 22.6274,
+        mass: 1.0,
+    };
+
+    /// **Material 3 Expressive — Fast Effects** (`k = 3800, ζ = 1.0`, critically damped, zero bounce).
+    pub const M3_EXPRESSIVE_FAST_EFFECTS: Self = Self::Spring {
+        stiffness: 3800.0,
+        damping: 123.2883,
+        mass: 1.0,
+    };
+
+    /// **Material 3 Expressive — Default Effects** (`k = 1600, ζ = 1.0`, critically damped, zero bounce).
+    /// Used for window opacity and focus ring transitions.
+    pub const M3_EXPRESSIVE_DEFAULT_EFFECTS: Self = Self::Spring {
+        stiffness: 1600.0,
+        damping: 80.0,
+        mass: 1.0,
+    };
+
+    /// **Material 3 Expressive — Slow Effects** (`k = 800, ζ = 1.0`, critically damped).
+    pub const M3_EXPRESSIVE_SLOW_EFFECTS: Self = Self::Spring {
+        stiffness: 800.0,
+        damping: 56.5685,
         mass: 1.0,
     };
 
@@ -81,7 +127,6 @@ impl Easing {
 }
 
 fn eval_cubic_bezier(x: f64, x1: f64, y1: f64, x2: f64, y2: f64) -> f64 {
-    // Solve B_x(u) = x via Newton-Raphson with safe clamping.
     let mut u = x;
     for _ in 0..8 {
         let bx = cubic_component(u, x1, x2);
@@ -109,23 +154,33 @@ fn eval_spring(t: f64, stiffness: f64, damping: f64, mass: f64) -> f64 {
     let m = mass.max(0.001);
     let k = stiffness.max(1.0);
     let c = damping.max(0.0);
-    // Map normalized t in [0, 1] across a physical settle horizon of 0.8s.
-    let tau = t * 0.8;
     let omega0 = (k / m).sqrt();
     let zeta = c / (2.0 * (k * m).sqrt());
+    // Compute a natural physical settle horizon (~5 decay constants) so fast springs feel
+    // energetic while slower spatial springs retain their graceful expressive overshoot.
+    let settle_horizon = (5.2 / (zeta.max(0.35) * omega0)).clamp(0.22, 0.95);
+    let tau = t * settle_horizon;
 
-    let displacement = if zeta < 1.0 {
+    let displacement = if zeta < 1.0 - 1e-4 {
         let omega_d = omega0 * (1.0 - zeta * zeta).sqrt();
         (-zeta * omega0 * tau).exp()
             * ((omega_d * tau).cos() + (zeta * omega0 / omega_d) * (omega_d * tau).sin())
-    } else if (zeta - 1.0).abs() < 1e-4 {
+    } else if (zeta - 1.0).abs() <= 1e-4 {
         (-omega0 * tau).exp() * (1.0 + omega0 * tau)
     } else {
         let r1 = -omega0 * (zeta - (zeta * zeta - 1.0).sqrt());
         let r2 = -omega0 * (zeta + (zeta * zeta - 1.0).sqrt());
         (r2 * (r1 * tau).exp() - r1 * (r2 * tau).exp()) / (r2 - r1)
     };
-    1.0 - displacement
+    let raw = 1.0 - displacement;
+    // Smoothly feather the tiny residual tail over the final 8% so arrival at 1.0 never snaps.
+    if t > 0.92 {
+        let blend = (t - 0.92) / 0.08;
+        let smooth = blend * blend * (3.0 - 2.0 * blend);
+        raw + (1.0 - raw) * smooth
+    } else {
+        raw
+    }
 }
 
 /// A single interruptible, chainable scalar animation segment.
@@ -228,6 +283,8 @@ pub struct WindowVisualState {
     pub opacity: f32,
     pub offset_x: f64,
     pub offset_y: f64,
+    pub scale_x: f64,
+    pub scale_y: f64,
     pub focus_progress: f32,
 }
 
@@ -237,6 +294,8 @@ impl Default for WindowVisualState {
             opacity: 1.0,
             offset_x: 0.0,
             offset_y: 0.0,
+            scale_x: 1.0,
+            scale_y: 1.0,
             focus_progress: 0.0,
         }
     }
@@ -247,6 +306,8 @@ struct WindowAnimations {
     opacity: Option<Animation>,
     offset_x: Option<Animation>,
     offset_y: Option<Animation>,
+    scale_x: Option<Animation>,
+    scale_y: Option<Animation>,
     focus_progress: Option<Animation>,
     last_focus_value: f32,
 }
@@ -281,7 +342,8 @@ impl Default for EffectsConfig {
     }
 }
 
-/// Coordinates all frame-driven compositor animations (window open, focus, restore, workspace slide).
+/// Coordinates all frame-driven compositor animations (window open, close, minimize, restore,
+/// maximize/unmaximize/snap/resize morph, focus highlight, and workspace slide).
 #[derive(Debug, Default)]
 pub struct EffectsManager {
     pub config: EffectsConfig,
@@ -298,7 +360,7 @@ impl EffectsManager {
         }
     }
 
-    fn scaled_duration(&self, base_ms: u64) -> Duration {
+    pub fn scaled_duration(&self, base_ms: u64) -> Duration {
         if !self.config.enabled || self.config.reduced_motion {
             return Duration::ZERO;
         }
@@ -306,23 +368,305 @@ impl EffectsManager {
         Duration::from_secs_f64((base_ms as f64 / 1000.0) / speed)
     }
 
-    /// Starts a smooth fade-in + subtle upward glide when a window maps or restores.
+    /// Hyprland `popin` × Material 3 Expressive Default Spatial open animation.
     pub fn animate_window_open(&mut self, id: WindowId, now: Duration) {
-        let dur = self.scaled_duration(180);
+        let spatial_dur = self.scaled_duration(360);
+        let fade_dur = self.scaled_duration(200);
+        let entry = self.window_anims.entry(id).or_default();
+        if spatial_dur.is_zero() {
+            entry.opacity = None;
+            entry.offset_x = None;
+            entry.offset_y = None;
+            entry.scale_x = None;
+            entry.scale_y = None;
+            return;
+        }
+        entry.opacity = Some(Animation::new(
+            0.0,
+            1.0,
+            now,
+            fade_dur,
+            Easing::M3_EXPRESSIVE_DEFAULT_EFFECTS,
+        ));
+        entry.offset_x = None;
+        entry.offset_y = Some(Animation::new(
+            24.0,
+            0.0,
+            now,
+            spatial_dur,
+            Easing::M3_EXPRESSIVE_DEFAULT_SPATIAL,
+        ));
+        entry.scale_x = Some(Animation::new(
+            0.86,
+            1.0,
+            now,
+            spatial_dur,
+            Easing::M3_EXPRESSIVE_DEFAULT_SPATIAL,
+        ));
+        entry.scale_y = Some(Animation::new(
+            0.86,
+            1.0,
+            now,
+            spatial_dur,
+            Easing::M3_EXPRESSIVE_DEFAULT_SPATIAL,
+        ));
+    }
+
+    /// Hyprland `popout` × Material 3 Expressive close animation. Returns its duration.
+    pub fn animate_window_close(&mut self, id: WindowId, now: Duration) -> Duration {
+        let dur = self.scaled_duration(185);
+        let entry = self.window_anims.entry(id).or_default();
+        if dur.is_zero() {
+            return Duration::ZERO;
+        }
+        let cur_op = entry.opacity.as_ref().map(|a| a.sample(now)).unwrap_or(1.0);
+        let cur_sx = entry.scale_x.as_ref().map(|a| a.sample(now)).unwrap_or(1.0);
+        let cur_sy = entry.scale_y.as_ref().map(|a| a.sample(now)).unwrap_or(1.0);
+        let cur_oy = entry.offset_y.as_ref().map(|a| a.sample(now)).unwrap_or(0.0);
+
+        entry.opacity = Some(Animation::new(
+            cur_op,
+            0.0,
+            now,
+            dur,
+            Easing::M3_EXPRESSIVE_FAST_EFFECTS,
+        ));
+        entry.scale_x = Some(Animation::new(
+            cur_sx,
+            0.84,
+            now,
+            dur,
+            Easing::M3_EXPRESSIVE_FAST_EFFECTS,
+        ));
+        entry.scale_y = Some(Animation::new(
+            cur_sy,
+            0.84,
+            now,
+            dur,
+            Easing::M3_EXPRESSIVE_FAST_EFFECTS,
+        ));
+        entry.offset_y = Some(Animation::new(
+            cur_oy,
+            cur_oy + 20.0,
+            now,
+            dur,
+            Easing::M3_EXPRESSIVE_FAST_EFFECTS,
+        ));
+        dur
+    }
+
+    /// Smoothly restores a window that declined closure (e.g., prompted to save unsaved changes).
+    pub fn animate_window_cancel_close(&mut self, id: WindowId, now: Duration) {
+        let dur = self.scaled_duration(260);
+        let fade_dur = self.scaled_duration(180);
         let entry = self.window_anims.entry(id).or_default();
         if dur.is_zero() {
             entry.opacity = None;
+            entry.offset_x = None;
             entry.offset_y = None;
+            entry.scale_x = None;
+            entry.scale_y = None;
             return;
         }
-        entry.opacity = Some(Animation::new(0.0, 1.0, now, dur, Easing::EaseOut));
-        entry.offset_y = Some(Animation::new(16.0, 0.0, now, dur, Easing::NEON_STANDARD));
+        let cur_op = entry.opacity.as_ref().map(|a| a.sample(now)).unwrap_or(0.0);
+        let cur_sx = entry.scale_x.as_ref().map(|a| a.sample(now)).unwrap_or(0.86);
+        let cur_sy = entry.scale_y.as_ref().map(|a| a.sample(now)).unwrap_or(0.86);
+        let cur_oy = entry.offset_y.as_ref().map(|a| a.sample(now)).unwrap_or(16.0);
+
+        entry.opacity = Some(Animation::new(
+            cur_op,
+            1.0,
+            now,
+            fade_dur,
+            Easing::M3_EXPRESSIVE_DEFAULT_EFFECTS,
+        ));
+        entry.scale_x = Some(Animation::new(
+            cur_sx,
+            1.0,
+            now,
+            dur,
+            Easing::M3_EXPRESSIVE_FAST_SPATIAL,
+        ));
+        entry.scale_y = Some(Animation::new(
+            cur_sy,
+            1.0,
+            now,
+            dur,
+            Easing::M3_EXPRESSIVE_FAST_SPATIAL,
+        ));
+        entry.offset_y = Some(Animation::new(
+            cur_oy,
+            0.0,
+            now,
+            dur,
+            Easing::M3_EXPRESSIVE_FAST_SPATIAL,
+        ));
+    }
+
+    /// macOS dock-swoop minimize animation toward `(target_dx, target_dy)` below the window.
+    pub fn animate_window_minimize(
+        &mut self,
+        id: WindowId,
+        target_dx: f64,
+        target_dy: f64,
+        now: Duration,
+    ) -> Duration {
+        let dur = self.scaled_duration(240);
+        let entry = self.window_anims.entry(id).or_default();
+        if dur.is_zero() {
+            return Duration::ZERO;
+        }
+        let cur_op = entry.opacity.as_ref().map(|a| a.sample(now)).unwrap_or(1.0);
+        let cur_ox = entry.offset_x.as_ref().map(|a| a.sample(now)).unwrap_or(0.0);
+        let cur_oy = entry.offset_y.as_ref().map(|a| a.sample(now)).unwrap_or(0.0);
+        let cur_sx = entry.scale_x.as_ref().map(|a| a.sample(now)).unwrap_or(1.0);
+        let cur_sy = entry.scale_y.as_ref().map(|a| a.sample(now)).unwrap_or(1.0);
+
+        entry.opacity = Some(Animation::new(
+            cur_op,
+            0.0,
+            now,
+            dur,
+            Easing::M3_EXPRESSIVE_DEFAULT_EFFECTS,
+        ));
+        entry.offset_x = Some(Animation::new(cur_ox, target_dx, now, dur, Easing::NEON_STANDARD));
+        entry.offset_y = Some(Animation::new(cur_oy, target_dy, now, dur, Easing::NEON_STANDARD));
+        entry.scale_x = Some(Animation::new(cur_sx, 0.22, now, dur, Easing::NEON_STANDARD));
+        entry.scale_y = Some(Animation::new(cur_sy, 0.22, now, dur, Easing::NEON_STANDARD));
+        dur
+    }
+
+    /// macOS × Material 3 Expressive spring restore animation rising back up from the Dock.
+    pub fn animate_window_restore(
+        &mut self,
+        id: WindowId,
+        from_dx: f64,
+        from_dy: f64,
+        now: Duration,
+    ) {
+        let spatial_dur = self.scaled_duration(380);
+        let fade_dur = self.scaled_duration(200);
+        let entry = self.window_anims.entry(id).or_default();
+        if spatial_dur.is_zero() {
+            entry.opacity = None;
+            entry.offset_x = None;
+            entry.offset_y = None;
+            entry.scale_x = None;
+            entry.scale_y = None;
+            return;
+        }
+        entry.opacity = Some(Animation::new(
+            0.0,
+            1.0,
+            now,
+            fade_dur,
+            Easing::M3_EXPRESSIVE_DEFAULT_EFFECTS,
+        ));
+        entry.offset_x = Some(Animation::new(
+            from_dx,
+            0.0,
+            now,
+            spatial_dur,
+            Easing::M3_EXPRESSIVE_DEFAULT_SPATIAL,
+        ));
+        entry.offset_y = Some(Animation::new(
+            from_dy,
+            0.0,
+            now,
+            spatial_dur,
+            Easing::M3_EXPRESSIVE_DEFAULT_SPATIAL,
+        ));
+        entry.scale_x = Some(Animation::new(
+            0.28,
+            1.0,
+            now,
+            spatial_dur,
+            Easing::M3_EXPRESSIVE_DEFAULT_SPATIAL,
+        ));
+        entry.scale_y = Some(Animation::new(
+            0.28,
+            1.0,
+            now,
+            spatial_dur,
+            Easing::M3_EXPRESSIVE_DEFAULT_SPATIAL,
+        ));
+    }
+
+    /// Hyprland × Material 3 Expressive spatial morph between `old_rect` and `new_rect`
+    /// (maximize, unmaximize, snap, fullscreen, or programmatic resize).
+    pub fn animate_window_geometry(
+        &mut self,
+        id: WindowId,
+        old_rect: Rect,
+        new_rect: Rect,
+        now: Duration,
+    ) {
+        let dur = self.scaled_duration(380);
+        if dur.is_zero() || old_rect.size.w <= 0 || old_rect.size.h <= 0 || new_rect.size.w <= 0 || new_rect.size.h <= 0 {
+            return;
+        }
+        let dx_edge = (old_rect.loc.x - new_rect.loc.x).abs();
+        let dy_edge = (old_rect.loc.y - new_rect.loc.y).abs();
+        let dw = (old_rect.size.w - new_rect.size.w).abs();
+        let dh = (old_rect.size.h - new_rect.size.h).abs();
+        if dx_edge < 6 && dy_edge < 6 && dw < 6 && dh < 6 {
+            return;
+        }
+
+        let entry = self.window_anims.entry(id).or_default();
+        // Account for any in-flight transform so rapid maximize/unmaximize clicks retarget seamlessly.
+        let cur_ox = entry.offset_x.as_ref().map(|a| a.sample(now)).unwrap_or(0.0);
+        let cur_oy = entry.offset_y.as_ref().map(|a| a.sample(now)).unwrap_or(0.0);
+        let cur_sx = entry.scale_x.as_ref().map(|a| a.sample(now)).unwrap_or(1.0);
+        let cur_sy = entry.scale_y.as_ref().map(|a| a.sample(now)).unwrap_or(1.0);
+
+        let visual_old_w = (old_rect.size.w as f64) * cur_sx;
+        let visual_old_h = (old_rect.size.h as f64) * cur_sy;
+        let old_cx = old_rect.loc.x as f64 + cur_ox + old_rect.size.w as f64 * 0.5;
+        let old_cy = old_rect.loc.y as f64 + cur_oy + old_rect.size.h as f64 * 0.5;
+
+        let new_cx = new_rect.loc.x as f64 + new_rect.size.w as f64 * 0.5;
+        let new_cy = new_rect.loc.y as f64 + new_rect.size.h as f64 * 0.5;
+
+        let start_sx = (visual_old_w / new_rect.size.w as f64).clamp(0.22, 3.2);
+        let start_sy = (visual_old_h / new_rect.size.h as f64).clamp(0.22, 3.2);
+        let start_ox = old_cx - new_cx;
+        let start_oy = old_cy - new_cy;
+
+        entry.offset_x = Some(Animation::new(
+            start_ox,
+            0.0,
+            now,
+            dur,
+            Easing::M3_EXPRESSIVE_DEFAULT_SPATIAL,
+        ));
+        entry.offset_y = Some(Animation::new(
+            start_oy,
+            0.0,
+            now,
+            dur,
+            Easing::M3_EXPRESSIVE_DEFAULT_SPATIAL,
+        ));
+        entry.scale_x = Some(Animation::new(
+            start_sx,
+            1.0,
+            now,
+            dur,
+            Easing::M3_EXPRESSIVE_DEFAULT_SPATIAL,
+        ));
+        entry.scale_y = Some(Animation::new(
+            start_sy,
+            1.0,
+            now,
+            dur,
+            Easing::M3_EXPRESSIVE_DEFAULT_SPATIAL,
+        ));
     }
 
     /// Smoothly transitions focus highlight (`0.0` unfocused <-> `1.0` focused).
     pub fn animate_focus(&mut self, id: WindowId, focused: bool, now: Duration) {
         let target = if focused { 1.0 } else { 0.0 };
-        let dur = self.scaled_duration(140);
+        let dur = self.scaled_duration(180);
         let entry = self.window_anims.entry(id).or_default();
         if dur.is_zero() {
             entry.focus_progress = None;
@@ -330,32 +674,32 @@ impl EffectsManager {
             return;
         }
         if let Some(anim) = entry.focus_progress.as_mut() {
-            anim.retarget(target, now, dur, Easing::EaseOut);
+            anim.retarget(target, now, dur, Easing::M3_EXPRESSIVE_DEFAULT_EFFECTS);
         } else {
             entry.focus_progress = Some(Animation::new(
                 f64::from(entry.last_focus_value),
                 target,
                 now,
                 dur,
-                Easing::EaseOut,
+                Easing::M3_EXPRESSIVE_DEFAULT_EFFECTS,
             ));
         }
     }
 
-    /// Starts a horizontal workspace transition slide (`direction`: `+1` moving right, `-1` moving left).
+    /// Starts a Material 3 Expressive Slow Spatial horizontal workspace transition slide.
     pub fn animate_workspace_switch(&mut self, direction: i32, now: Duration) {
-        let dur = self.scaled_duration(220);
+        let dur = self.scaled_duration(380);
         if dur.is_zero() {
             self.workspace_offset_x = None;
             return;
         }
-        let start_offset = if direction >= 0 { 180.0 } else { -180.0 };
+        let start_offset = if direction >= 0 { 320.0 } else { -320.0 };
         self.workspace_offset_x = Some(Animation::new(
             start_offset,
             0.0,
             now,
             dur,
-            Easing::NEON_STANDARD,
+            Easing::M3_EXPRESSIVE_SLOW_SPATIAL,
         ));
     }
 
@@ -377,6 +721,8 @@ impl EffectsManager {
                 opacity: 1.0,
                 offset_x: ws_dx,
                 offset_y: 0.0,
+                scale_x: 1.0,
+                scale_y: 1.0,
                 focus_progress: if focused { 1.0 } else { 0.0 },
             };
         };
@@ -398,6 +744,18 @@ impl EffectsManager {
             .as_ref()
             .map(|a| a.sample(now))
             .unwrap_or(0.0);
+        let scale_x = entry
+            .scale_x
+            .as_ref()
+            .map(|a| a.sample(now))
+            .unwrap_or(1.0)
+            .clamp(0.10, 3.5);
+        let scale_y = entry
+            .scale_y
+            .as_ref()
+            .map(|a| a.sample(now))
+            .unwrap_or(1.0)
+            .clamp(0.10, 3.5);
         let focus_progress = entry
             .focus_progress
             .as_ref()
@@ -409,6 +767,8 @@ impl EffectsManager {
             opacity,
             offset_x,
             offset_y,
+            scale_x,
+            scale_y,
             focus_progress,
         }
     }
@@ -426,25 +786,19 @@ impl EffectsManager {
         }
 
         for entry in self.window_anims.values_mut() {
-            if let Some(a) = &entry.opacity {
-                if a.is_finished(now) {
-                    entry.opacity = None;
-                } else {
-                    active = true;
-                }
-            }
-            if let Some(a) = &entry.offset_x {
-                if a.is_finished(now) {
-                    entry.offset_x = None;
-                } else {
-                    active = true;
-                }
-            }
-            if let Some(a) = &entry.offset_y {
-                if a.is_finished(now) {
-                    entry.offset_y = None;
-                } else {
-                    active = true;
+            for slot in [
+                &mut entry.opacity,
+                &mut entry.offset_x,
+                &mut entry.offset_y,
+                &mut entry.scale_x,
+                &mut entry.scale_y,
+            ] {
+                if let Some(a) = slot {
+                    if a.is_finished(now) {
+                        *slot = None;
+                    } else {
+                        active = true;
+                    }
                 }
             }
             if let Some(a) = &entry.focus_progress {
@@ -472,26 +826,16 @@ impl EffectsManager {
             return true;
         }
         self.window_anims.values().any(|entry| {
-            entry
-                .opacity
-                .as_ref()
-                .map(|a| !a.is_finished(now))
-                .unwrap_or(false)
-                || entry
-                    .offset_x
-                    .as_ref()
-                    .map(|a| !a.is_finished(now))
-                    .unwrap_or(false)
-                || entry
-                    .offset_y
-                    .as_ref()
-                    .map(|a| !a.is_finished(now))
-                    .unwrap_or(false)
-                || entry
-                    .focus_progress
-                    .as_ref()
-                    .map(|a| !a.is_finished(now))
-                    .unwrap_or(false)
+            [
+                &entry.opacity,
+                &entry.offset_x,
+                &entry.offset_y,
+                &entry.scale_x,
+                &entry.scale_y,
+                &entry.focus_progress,
+            ]
+            .into_iter()
+            .any(|slot| slot.as_ref().map(|a| !a.is_finished(now)).unwrap_or(false))
         })
     }
 }
@@ -499,6 +843,7 @@ impl EffectsManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use neon_window_manager::geometry::{Point, Size};
 
     #[test]
     fn easings_satisfy_endpoints_and_monotonic_progress() {
@@ -509,12 +854,24 @@ mod tests {
             Easing::EaseInOut,
             Easing::NEON_STANDARD,
             Easing::NEON_SPRING,
+            Easing::M3_EXPRESSIVE_FAST_SPATIAL,
+            Easing::M3_EXPRESSIVE_DEFAULT_SPATIAL,
+            Easing::M3_EXPRESSIVE_SLOW_SPATIAL,
+            Easing::M3_EXPRESSIVE_FAST_EFFECTS,
+            Easing::M3_EXPRESSIVE_DEFAULT_EFFECTS,
+            Easing::M3_EXPRESSIVE_SLOW_EFFECTS,
         ];
         for curve in curves {
             assert_eq!(curve.evaluate(0.0), 0.0);
             assert_eq!(curve.evaluate(1.0), 1.0);
             let mid = curve.evaluate(0.5);
-            assert!(mid > 0.0 && mid < 1.25, "mid={mid} for {curve:?}");
+            assert!(mid > 0.0 && mid < 1.30, "mid={mid} for {curve:?}");
+        }
+        // Critically damped M3 Effects springs must never overshoot 1.0.
+        for step in 1..100 {
+            let t = f64::from(step) / 100.0;
+            let val = Easing::M3_EXPRESSIVE_DEFAULT_EFFECTS.evaluate(t);
+            assert!(val <= 1.0001, "M3 Effects spring overshot at t={t}: {val}");
         }
     }
 
@@ -527,12 +884,31 @@ mod tests {
         let mid_before = anim.sample(t_mid);
         assert!((mid_before - 50.0).abs() < 1e-6);
 
-        // Retarget backwards to 0.0 at t=100ms
         anim.retarget(0.0, t_mid, Duration::from_millis(100), Easing::Linear);
         let mid_after = anim.sample(t_mid);
         assert!((mid_after - 50.0).abs() < 1e-6, "retarget must not jump");
         assert!((anim.sample(Duration::from_millis(150)) - 25.0).abs() < 1e-6);
         assert!(anim.is_finished(Duration::from_millis(200)));
+    }
+
+    #[test]
+    fn geometry_morph_animates_scale_and_center_offset_smoothly() {
+        let mut fx = EffectsManager::default();
+        let id = WindowId(7);
+        let old_r = Rect::new(Point::new(200, 150), Size::new(800, 500));
+        let new_r = Rect::new(Point::new(0, 30), Size::new(1920, 976));
+        let t0 = Duration::from_millis(100);
+
+        fx.animate_window_geometry(id, old_r, new_r, t0);
+        let s0 = fx.sample_window(id, true, t0);
+        assert!((s0.scale_x - (800.0 / 1920.0)).abs() < 0.01);
+        assert!((s0.scale_y - (500.0 / 976.0)).abs() < 0.01);
+
+        let s_end = fx.sample_window(id, true, t0 + Duration::from_millis(500));
+        assert!((s_end.scale_x - 1.0).abs() < 1e-6);
+        assert!((s_end.scale_y - 1.0).abs() < 1e-6);
+        assert!(s_end.offset_x.abs() < 1e-6);
+        assert!(s_end.offset_y.abs() < 1e-6);
     }
 
     #[test]
@@ -570,5 +946,7 @@ mod tests {
         assert_eq!(vis.opacity, 1.0);
         assert_eq!(vis.offset_x, 0.0);
         assert_eq!(vis.offset_y, 0.0);
+        assert_eq!(vis.scale_x, 1.0);
+        assert_eq!(vis.scale_y, 1.0);
     }
 }

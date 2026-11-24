@@ -13,6 +13,7 @@ use smithay::{
             },
             wlr_data_control::{DataControlHandler, DataControlState},
         },
+        tablet_manager::TabletSeatHandler,
     },
 };
 
@@ -34,8 +35,11 @@ impl SeatHandler for NeonState {
 
     fn cursor_image(&mut self, _seat: &Seat<Self>, image: CursorImageStatus) {
         self.cursor_status = image;
+        self.needs_redraw = true;
     }
 }
+
+impl TabletSeatHandler for NeonState {}
 
 impl SelectionHandler for NeonState {
     type SelectionUserData = ();

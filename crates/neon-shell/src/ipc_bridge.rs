@@ -8,8 +8,8 @@ use std::{
 };
 
 use neon_ipc::{
-    DesktopSnapshot, EventTopic, IpcClient, IpcEvent, IpcPayload, IpcRequest, IpcResult,
-    IpcServerMessage, default_socket_path,
+    ContextMenuTarget, DesktopSnapshot, EventTopic, IpcClient, IpcEvent, IpcPayload, IpcRequest,
+    IpcResult, IpcServerMessage, default_socket_path,
 };
 use tracing::{debug, info, warn};
 
@@ -20,6 +20,11 @@ pub enum ShellIpcUpdate {
     Snapshot(DesktopSnapshot),
     OverviewToggled(bool),
     ScreenshotUiRequested,
+    ContextMenuRequested {
+        x: i32,
+        y: i32,
+        target: ContextMenuTarget,
+    },
 }
 
 /// Handle used by GTK4 widgets to send fire-and-forget commands to `neon-compositor`.
@@ -119,6 +124,18 @@ pub fn start_ipc_bridge(socket_path: PathBuf) -> (IpcCommandSender, Receiver<She
                                     IpcEvent::ScreenshotUiRequested => {
                                         if update_tx
                                             .send(ShellIpcUpdate::ScreenshotUiRequested)
+                                            .is_err()
+                                        {
+                                            return;
+                                        }
+                                    }
+                                    IpcEvent::ContextMenuRequested { x, y, target } => {
+                                        if update_tx
+                                            .send(ShellIpcUpdate::ContextMenuRequested {
+                                                x,
+                                                y,
+                                                target,
+                                            })
                                             .is_err()
                                         {
                                             return;

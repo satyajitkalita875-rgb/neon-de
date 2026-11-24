@@ -451,12 +451,12 @@ pub fn run_drm(config: DrmConfig) -> Result<()> {
             .map_err(|err| anyhow::anyhow!("Failed to insert libseat notifier: {err}"))?;
     }
 
-    // 7. Handle DRM VBlank completion notifications.
+    // 7. Handle DRM VBlank completion notifications (triggers immediate VSync-locked redraw if dirty).
     {
         let rt_for_drm = Rc::clone(&runtime);
         event_loop
             .handle()
-            .insert_source(drm_notifier, move |event, _meta, _state| match event {
+            .insert_source(drm_notifier, move |event, _meta, state| match event {
                 DrmEvent::VBlank(crtc_handle) => {
                     let mut rt = rt_for_drm.borrow_mut();
                     if let Some(out) = rt.outputs.get_mut(&crtc_handle) {
@@ -465,12 +465,35 @@ pub fn run_drm(config: DrmConfig) -> Result<()> {
                         }
                         out.pending_vblank_since = None;
                     }
+                    if state.needs_redraw {
+                        render_all_drm_outputs(&mut rt, state);
+                    }
                 }
                 DrmEvent::Error(err) => {
                     error!(?err, "DRM device event error");
                 }
             })
             .map_err(|err| anyhow::anyhow!("Failed to insert DRM notifier: {err}"))?;
+    }
+
+    // 7b. Register incoming IPC socket accepts into calloop for instant non-polling IPC response.
+    {
+        let ipc_for_accept = Rc::clone(&ipc_server);
+        let fd = ipc_for_accept
+            .borrow()
+            .listener()
+            .try_clone()
+            .context("Failed to clone IPC listener socket")?;
+        event_loop
+            .handle()
+            .insert_source(
+                Generic::new(fd, Interest::READ, TriggerMode::Level),
+                move |_, _, state| {
+                    ipc_for_accept.borrow_mut().poll_requests(state);
+                    Ok(PostAction::Continue)
+                },
+            )
+            .map_err(|err| anyhow::anyhow!("Failed to insert IPC listener source: {err}"))?;
     }
 
     // 8. Wire Wayland socket & client dispatch.
@@ -510,12 +533,16 @@ pub fn run_drm(config: DrmConfig) -> Result<()> {
     {
         let rt_for_timer = Rc::clone(&runtime);
         let ipc_for_timer = Rc::clone(&ipc_server);
+        let mut tick_count: u64 = 0;
         event_loop
             .handle()
             .insert_source(
                 Timer::from_duration(Duration::from_millis(16)),
                 move |_, _, state| {
-                    ipc_for_timer.borrow_mut().poll_requests(state);
+                    tick_count = tick_count.wrapping_add(1);
+                    if tick_count % 2 == 0 {
+                        ipc_for_timer.borrow_mut().poll_requests(state);
+                    }
                     render_all_drm_outputs(&mut rt_for_timer.borrow_mut(), state);
                     TimeoutAction::ToDuration(Duration::from_millis(16))
                 },
@@ -541,7 +568,6 @@ pub fn run_drm(config: DrmConfig) -> Result<()> {
     event_loop
         .run(None, &mut state, |state| {
             state.cleanup_dead_windows();
-            ipc_server.borrow_mut().poll_requests(state);
             let mut display = display_cell.borrow_mut();
             if let Err(err) = display.dispatch_clients(state) {
                 warn!(?err, "Error dispatching Wayland clients during idle");
@@ -575,16 +601,22 @@ fn render_all_drm_outputs(rt: &mut DrmRuntime, state: &mut NeonState) {
     }
 
     let is_locked = state.is_locked();
-    if !is_locked {
-        let _animating = state.sync_scene_graph();
+    let animating = if !is_locked {
+        let anim = state.sync_scene_graph();
         let _dirty = state.scene.take_dirty_regions();
-    }
+        anim
+    } else {
+        false
+    };
+    state.needs_redraw = animating;
 
     let blur = BlurSettings {
-        enabled: state.effects.config.blur_enabled,
+        enabled: state.effects.config.blur_enabled && !state.config.appearance.reduce_blur,
         strength: state.effects.config.blur_strength,
         corner_radius: state.effects.config.corner_radius,
     };
+    let cursor_theme = state.config.appearance.cursor_theme.clone();
+    let cursor_size = state.config.appearance.cursor_size;
     let pointer_loc = state.pointer_location;
     let now = state.clock.now();
 
@@ -624,6 +656,9 @@ fn render_all_drm_outputs(rt: &mut DrmRuntime, state: &mut NeonState) {
         }
 
         let frame_start = std::time::Instant::now();
+        active
+            .neon_renderer
+            .sync_cursor_config(&cursor_theme, cursor_size);
         let scale_f = active.output.current_scale().fractional_scale();
         let output_origin = active.output.current_location();
         let mut elements = active.neon_renderer.cursor_elements(
@@ -642,11 +677,23 @@ fn render_all_drm_outputs(rt: &mut DrmRuntime, state: &mut NeonState) {
             ));
             LOCK_CURTAIN_COLOR
         } else {
-            elements.extend(active.neon_renderer.collect_scene_elements(
+            let or_popups: Vec<_> = state
+                .override_redirect_windows
+                .iter()
+                .filter_map(|w| {
+                    let loc = state
+                        .space
+                        .element_location(w)
+                        .or_else(|| w.x11_surface().map(|s| s.geometry().loc))?;
+                    Some((w, loc))
+                })
+                .collect();
+            elements.extend(active.neon_renderer.collect_scene_elements_with_popups(
                 &active.output,
                 &mut rt.renderer,
                 &state.scene,
                 blur,
+                &or_popups,
                 |id| state.managed_windows.get(&id),
             ));
             FALLBACK_CLEAR_COLOR

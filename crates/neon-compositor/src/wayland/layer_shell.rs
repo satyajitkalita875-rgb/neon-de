@@ -59,10 +59,27 @@ impl WlrLayerShellHandler for NeonState {
         self.relayout_non_floating_windows();
     }
 
-    fn new_popup(&mut self, _parent: WlrLayerSurface, popup: PopupSurface) {
+    fn new_popup(&mut self, parent: WlrLayerSurface, popup: PopupSurface) {
+        // Unconstrain layer-shell popups (panel/dock/desktop menus) within the active output.
+        if let Some(output) = self.primary_output.as_ref()
+            && let Some(output_geo) = self.space.output_geometry(output)
+        {
+            let map = layer_map_for_output(output);
+            let parent_id = parent.wl_surface().id();
+            if let Some(layer) = map.layers().find(|l| l.wl_surface().id() == parent_id)
+                && let Some(layer_geo) = map.layer_geometry(layer)
+            {
+                let mut target = output_geo;
+                target.loc -= layer_geo.loc;
+                popup.with_pending_state(|state| {
+                    state.geometry = state.positioner.get_unconstrained_geometry(target);
+                });
+            }
+        }
         if let Err(err) = self.popups.track_popup(PopupKind::Xdg(popup)) {
             warn!(?err, "Failed to track popup for layer surface");
         }
+        self.needs_redraw = true;
     }
 
     fn layer_destroyed(&mut self, surface: WlrLayerSurface) {

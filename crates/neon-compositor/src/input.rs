@@ -25,7 +25,7 @@ use tracing::info;
 
 use crate::{
     grabs::{MoveSurfaceGrab, ResizeEdge, ResizeSurfaceGrab},
-    state::NeonState,
+    state::{NeonState, TitlebarHit},
     window::{FocusPolicy, SnapRegion, window_id},
 };
 
@@ -337,6 +337,25 @@ fn apply_pointer_motion_at(
     time: u32,
 ) {
     state.pointer_location = pos;
+    state.needs_redraw = true;
+
+    // Update hover highlight for macOS SSD traffic-light controls (×, −, + glyphs on hover).
+    let hovered_tb = if !state.is_locked()
+        && state
+            .layer_surface_under(pos, &[WlrLayer::Overlay, WlrLayer::Top])
+            .is_none()
+    {
+        state.ssd_titlebar_hit_test(pos).and_then(|(id, _, hit)| {
+            matches!(
+                hit,
+                TitlebarHit::Close | TitlebarHit::Minimize | TitlebarHit::Maximize
+            )
+            .then_some(id)
+        })
+    } else {
+        None
+    };
+    state.hovered_titlebar_window = hovered_tb;
 
     let serial = SERIAL_COUNTER.next_serial();
     let under = if state.is_locked() {
@@ -425,14 +444,17 @@ fn handle_pointer_button<B: InputBackend>(state: &mut NeonState, event: B::Point
 
     if !state.is_locked() && button_state == ButtonState::Pressed && !pointer.is_grabbed() {
         let pos = state.pointer_location;
-        let alt_held = state
+        let (alt_held, super_held) = state
             .seat
             .get_keyboard()
-            .map(|kbd| kbd.modifier_state().alt)
-            .unwrap_or(false);
+            .map(|kbd| {
+                let m = kbd.modifier_state();
+                (m.alt, m.logo)
+            })
+            .unwrap_or((false, false));
 
-        // If clicking an upper layer-shell surface (Panel, Dock, Overview), deliver the click
-        // to the layer surface instead of windows underneath.
+        // If clicking an upper layer-shell surface (Panel, Dock, Overview, Context Menu),
+        // deliver the click directly to the layer surface.
         if let Some((layer_surface, _, interactivity)) =
             state.layer_surface_under(pos, &[WlrLayer::Overlay, WlrLayer::Top])
         {
@@ -443,9 +465,75 @@ fn handle_pointer_button<B: InputBackend>(state: &mut NeonState, event: B::Point
             {
                 keyboard.set_focus(state, Some(layer_surface), serial);
             }
+        } else if button == BTN_RIGHT
+            && let Some((id, window, _hit)) = state.ssd_titlebar_hit_test(pos)
+        {
+            // Right-clicking a server-side macOS titlebar opens the OS Window Context Menu.
+            state.focus_window(Some(&window), serial);
+            state.pending_context_menu = Some((
+                pos.x.round() as i32,
+                pos.y.round() as i32,
+                neon_ipc::ContextMenuTarget::Window { window_id: id.0 },
+            ));
+            state.needs_redraw = true;
+            return;
+        } else if button == BTN_LEFT
+            && let Some((id, window, hit)) = state.ssd_titlebar_hit_test(pos)
+        {
+            // Clicked a server-side macOS titlebar (traffic-light Close/Minimize/Maximize or drag).
+            state.focus_window(Some(&window), serial);
+            state.needs_redraw = true;
+            match hit {
+                TitlebarHit::Close => {
+                    state.close_window_by_id(id);
+                    return;
+                }
+                TitlebarHit::Minimize => {
+                    state.minimize_window(id, serial);
+                    return;
+                }
+                TitlebarHit::Maximize => {
+                    state.toggle_maximize_window(id);
+                    return;
+                }
+                TitlebarHit::Drag => {
+                    let work_area = state.effective_work_area_for(id);
+                    if let Some(update) = state.wm.set_floating(id, work_area) {
+                        state.apply_layout_update(&update);
+                    }
+                    if let Some(window_loc) = state.space.element_location(&window) {
+                        let start_data = PointerGrabStartData {
+                            focus: state.surface_under(pos),
+                            button,
+                            location: pos,
+                        };
+                        let grab = MoveSurfaceGrab {
+                            start_data,
+                            window,
+                            initial_window_location: window_loc,
+                        };
+                        pointer.set_grab(state, grab, serial, Focus::Clear);
+                    }
+                    return;
+                }
+            }
         } else if let Some((window, mut window_loc)) = state.window_under(pos) {
             // Click-to-focus & raise
             state.focus_window(Some(&window), serial);
+
+            // Super+Right-Click opens the OS Window Context Menu on any window (CSD or SSD)
+            if super_held
+                && button == BTN_RIGHT
+                && let Some(id) = window_id(&window)
+            {
+                state.pending_context_menu = Some((
+                    pos.x.round() as i32,
+                    pos.y.round() as i32,
+                    neon_ipc::ContextMenuTarget::Window { window_id: id.0 },
+                ));
+                state.needs_redraw = true;
+                return;
+            }
 
             // Compositor-initiated Alt+Left move (auto-unmaximizes/unsnaps cleanly)
             if alt_held && button == BTN_LEFT {
@@ -506,6 +594,15 @@ fn handle_pointer_button<B: InputBackend>(state: &mut NeonState, event: B::Point
         } else {
             // Clicking empty desktop canvas clears window focus cleanly
             state.focus_window(None, serial);
+            if button == BTN_RIGHT {
+                state.pending_context_menu = Some((
+                    pos.x.round() as i32,
+                    pos.y.round() as i32,
+                    neon_ipc::ContextMenuTarget::Desktop,
+                ));
+                state.needs_redraw = true;
+                return;
+            }
         }
     }
 

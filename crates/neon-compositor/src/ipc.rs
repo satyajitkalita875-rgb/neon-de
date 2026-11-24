@@ -213,9 +213,21 @@ impl IpcServer {
         } else {
             None
         };
+        let context_menu_frame =
+            state
+                .pending_context_menu
+                .take()
+                .map(|(x, y, target)| {
+                    encode_frame(&IpcServerMessage::Event {
+                        version: PROTOCOL_VERSION,
+                        event: IpcEvent::ContextMenuRequested { x, y, target },
+                    })
+                });
 
         let snapshot = build_snapshot(state);
-        if screenshot_ui_frame.is_none() && self.last_broadcast_snapshot.as_ref() == Some(&snapshot)
+        if screenshot_ui_frame.is_none()
+            && context_menu_frame.is_none()
+            && self.last_broadcast_snapshot.as_ref() == Some(&snapshot)
         {
             return;
         }
@@ -264,6 +276,14 @@ impl IpcServer {
             if !failed
                 && !client.subscriptions.is_empty()
                 && let Some(Ok(bytes)) = &screenshot_ui_frame
+                && client.stream.write_all(bytes).is_err()
+            {
+                failed = true;
+            }
+
+            if !failed
+                && !client.subscriptions.is_empty()
+                && let Some(Ok(bytes)) = &context_menu_frame
                 && client.stream.write_all(bytes).is_err()
             {
                 failed = true;
@@ -341,6 +361,30 @@ fn handle_ipc_request(
                 }
             }
         }
+        IpcRequest::AddWorkspace => {
+            if state.add_workspace().is_some() {
+                IpcResult::Ok {
+                    payload: IpcPayload::Ack,
+                }
+            } else {
+                IpcResult::Err {
+                    code: "workspace_limit".into(),
+                    message: "Maximum of 10 desktops reached".into(),
+                }
+            }
+        }
+        IpcRequest::RemoveWorkspace { index } => {
+            if state.remove_workspace(index, serial) {
+                IpcResult::Ok {
+                    payload: IpcPayload::Ack,
+                }
+            } else {
+                IpcResult::Err {
+                    code: "invalid_workspace".into(),
+                    message: format!("Cannot remove desktop at index {index}"),
+                }
+            }
+        }
         IpcRequest::MoveWindowToWorkspace {
             window_id,
             workspace_index,
@@ -403,10 +447,7 @@ fn handle_ipc_request(
                 state.switch_workspace_index(ws_idx, serial);
             }
             if record.mode.is_minimized() {
-                let work_area = state.work_area();
-                if let Some(update) = state.wm.restore_window(id, work_area) {
-                    state.apply_layout_update(&update);
-                }
+                state.restore_minimized_window(id, serial);
             }
             if let Some(window) = state.find_window_by_id(id) {
                 state.set_overview_open(false, serial);
@@ -418,10 +459,7 @@ fn handle_ipc_request(
         }
         IpcRequest::CloseWindow { window_id } => {
             let id = WindowId(window_id);
-            if let Some(window) = state.find_window_by_id(id)
-                && let Some(toplevel) = window.toplevel()
-            {
-                toplevel.send_close();
+            if state.close_window_by_id(id) {
                 IpcResult::Ok {
                     payload: IpcPayload::Ack,
                 }
@@ -448,12 +486,7 @@ fn handle_ipc_request(
         }
         IpcRequest::RestoreWindow { window_id } => {
             let id = WindowId(window_id);
-            let work_area = state.work_area();
-            if let Some(update) = state.wm.restore_window(id, work_area) {
-                state.apply_layout_update(&update);
-                if let Some(window) = state.find_window_by_id(id) {
-                    state.focus_window(Some(&window), serial);
-                }
+            if state.restore_minimized_window(id, serial) {
                 IpcResult::Ok {
                     payload: IpcPayload::Ack,
                 }
@@ -461,6 +494,48 @@ fn handle_ipc_request(
                 IpcResult::Err {
                     code: "not_minimized".into(),
                     message: format!("Window {window_id} is not minimized"),
+                }
+            }
+        }
+        IpcRequest::ToggleMaximizeWindow { window_id } => {
+            let id = WindowId(window_id);
+            if state.wm.get(id).is_some() {
+                state.toggle_maximize_window(id);
+                IpcResult::Ok {
+                    payload: IpcPayload::Ack,
+                }
+            } else {
+                IpcResult::Err {
+                    code: "window_not_found".into(),
+                    message: format!("Window {window_id} does not exist"),
+                }
+            }
+        }
+        IpcRequest::SnapWindow { window_id, region } => {
+            let id = WindowId(window_id);
+            let parsed = match region.to_lowercase().as_str() {
+                "left" | "left_half" => Some(crate::window::SnapRegion::LeftHalf),
+                "right" | "right_half" => Some(crate::window::SnapRegion::RightHalf),
+                "top_left" => Some(crate::window::SnapRegion::TopLeft),
+                "top_right" => Some(crate::window::SnapRegion::TopRight),
+                "bottom_left" => Some(crate::window::SnapRegion::BottomLeft),
+                "bottom_right" => Some(crate::window::SnapRegion::BottomRight),
+                _ => None,
+            };
+            if state.wm.get(id).is_none() {
+                IpcResult::Err {
+                    code: "window_not_found".into(),
+                    message: format!("Window {window_id} does not exist"),
+                }
+            } else if let Some(snap_region) = parsed {
+                state.snap_window_by_id(id, snap_region);
+                IpcResult::Ok {
+                    payload: IpcPayload::Ack,
+                }
+            } else {
+                IpcResult::Err {
+                    code: "invalid_region".into(),
+                    message: format!("Unknown snap region '{region}'"),
                 }
             }
         }
@@ -593,6 +668,10 @@ fn handle_ipc_request(
             show_workspaces,
             high_contrast,
             wallpaper,
+            reduce_blur,
+            blur_strength,
+            cursor_theme,
+            cursor_size,
         } => {
             if let Some(t) = theme {
                 state.config.appearance.theme = match t.as_str() {
@@ -625,7 +704,24 @@ fn handle_ipc_request(
             if let Some(w) = wallpaper {
                 state.config.appearance.wallpaper_path = if w.is_empty() { None } else { Some(w) };
             }
+            if let Some(rb) = reduce_blur {
+                state.config.appearance.reduce_blur = rb;
+            }
+            if let Some(bs) = blur_strength {
+                let clamped = bs.clamp(0.0, 2.0);
+                state.config.effects.blur_strength = clamped;
+                state.effects.config.blur_strength = clamped;
+            }
+            if let Some(ct) = cursor_theme
+                && !ct.trim().is_empty()
+            {
+                state.config.appearance.cursor_theme = ct;
+            }
+            if let Some(cs) = cursor_size {
+                state.config.appearance.cursor_size = cs.clamp(16, 48);
+            }
             state.config.validate_and_clamp();
+            state.needs_redraw = true;
             IpcResult::Ok {
                 payload: IpcPayload::Appearance {
                     appearance: build_appearance(state),
@@ -684,6 +780,7 @@ pub fn build_snapshot(state: &NeonState) -> DesktopSnapshot {
         effects: build_effects(state),
         appearance: build_appearance(state),
         window_behavior: build_window_behavior(state),
+        xwayland_display: state.xwayland_display.map(|d| format!(":{d}")),
     }
 }
 
@@ -781,6 +878,10 @@ fn build_appearance(state: &NeonState) -> AppearanceInfo {
         show_workspaces: state.config.panel.show_workspaces,
         high_contrast: state.config.privacy_accessibility.high_contrast,
         wallpaper: state.config.appearance.wallpaper_path.clone(),
+        reduce_blur: state.config.appearance.reduce_blur,
+        blur_strength: state.effects.config.blur_strength,
+        cursor_theme: Some(state.config.appearance.cursor_theme.clone()),
+        cursor_size: Some(state.config.appearance.cursor_size),
     }
 }
 

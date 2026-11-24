@@ -176,6 +176,10 @@ pub struct EffectsInfo {
     pub speed_scale: f64,
 }
 
+fn default_blur_strength() -> f32 {
+    1.0
+}
+
 /// Snapshot of live appearance, dock, and panel shell settings.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AppearanceInfo {
@@ -190,6 +194,14 @@ pub struct AppearanceInfo {
     pub high_contrast: bool,
     #[serde(default)]
     pub wallpaper: Option<String>,
+    #[serde(default)]
+    pub reduce_blur: bool,
+    #[serde(default = "default_blur_strength")]
+    pub blur_strength: f32,
+    #[serde(default)]
+    pub cursor_theme: Option<String>,
+    #[serde(default)]
+    pub cursor_size: Option<u32>,
 }
 
 /// Live compositor frame-timing, uptime, and runtime diagnostics.
@@ -225,6 +237,8 @@ pub struct DesktopSnapshot {
     pub effects: EffectsInfo,
     pub appearance: AppearanceInfo,
     pub window_behavior: WindowBehaviorInfo,
+    #[serde(default)]
+    pub xwayland_display: Option<String>,
 }
 
 /// Typed request envelope sent by IPC clients.
@@ -247,6 +261,10 @@ pub enum IpcRequest {
     SwitchWorkspace {
         index: usize,
     },
+    AddWorkspace,
+    RemoveWorkspace {
+        index: usize,
+    },
     MoveWindowToWorkspace {
         window_id: u64,
         workspace_index: usize,
@@ -262,6 +280,13 @@ pub enum IpcRequest {
     },
     RestoreWindow {
         window_id: u64,
+    },
+    ToggleMaximizeWindow {
+        window_id: u64,
+    },
+    SnapWindow {
+        window_id: u64,
+        region: String,
     },
     ToggleOverview,
     SetOverview {
@@ -305,6 +330,14 @@ pub enum IpcRequest {
         high_contrast: Option<bool>,
         #[serde(default)]
         wallpaper: Option<String>,
+        #[serde(default)]
+        reduce_blur: Option<bool>,
+        #[serde(default)]
+        blur_strength: Option<f32>,
+        #[serde(default)]
+        cursor_theme: Option<String>,
+        #[serde(default)]
+        cursor_size: Option<u32>,
     },
     UpdateWindowBehavior {
         focus_follows_mouse: Option<bool>,
@@ -356,14 +389,31 @@ pub enum IpcPayload {
     Screenshot { path: String },
 }
 
+/// Target surface kind for an OS-level right-click context menu requested by the compositor.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ContextMenuTarget {
+    Desktop,
+    Window { window_id: u64 },
+}
+
 /// Asynchronous state-change events pushed to subscribed clients.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "event_type", rename_all = "snake_case")]
 #[allow(clippy::large_enum_variant)]
 pub enum IpcEvent {
-    StateChanged { snapshot: DesktopSnapshot },
-    OverviewToggled { open: bool },
+    StateChanged {
+        snapshot: DesktopSnapshot,
+    },
+    OverviewToggled {
+        open: bool,
+    },
     ScreenshotUiRequested,
+    ContextMenuRequested {
+        x: i32,
+        y: i32,
+        target: ContextMenuTarget,
+    },
 }
 
 /// Encodes a serializable IPC message as a newline-delimited JSON line.

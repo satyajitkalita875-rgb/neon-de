@@ -1,10 +1,15 @@
 //! NEON DE macOS × GNOME 47 Top Menu Bar (`zwlr_layer_shell_v1` `Layer::Top` anchored Top+Left+Right).
 
-use std::{cell::Cell, f64::consts::PI, rc::Rc, time::Duration};
+use std::{
+    cell::{Cell, RefCell},
+    f64::consts::PI,
+    rc::Rc,
+    time::Duration,
+};
 
 use gtk4::{
-    Align, Application, ApplicationWindow, Box as GtkBox, Button, CenterBox, DrawingArea, Image,
-    Label, Orientation, glib, prelude::*,
+    Align, Application, ApplicationWindow, Box as GtkBox, Button, CenterBox, DrawingArea,
+    GestureClick, Image, Label, Orientation, glib, prelude::*,
 };
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 use neon_ipc::{DesktopSnapshot, IpcRequest};
@@ -12,11 +17,15 @@ use neon_system::{
     SystemAction, SystemActionSender, SystemSnapshot, network::ConnectionKind, power::BatteryState,
 };
 
-use crate::{ipc_bridge::IpcCommandSender, quick_settings::QuickSettingsPanel};
+use crate::{
+    context_menu::ContextMenuOverlay, ipc_bridge::IpcCommandSender,
+    quick_settings::QuickSettingsPanel, workspaces_panel::WorkspacesPanel,
+};
 
 /// Live handles to updatable widgets in the NEON DE Top Menu Bar.
 pub struct TopPanel {
     window: ApplicationWindow,
+    bar: CenterBox,
     activities_btn: Button,
     workspaces_box: GtkBox,
     focused_label: Label,
@@ -32,7 +41,9 @@ pub struct TopPanel {
     power_pct_label: Label,
     cc_icon_area: DrawingArea,
     is_light_theme: Rc<Cell<bool>>,
+    drawer_bg_hidden: Rc<Cell<bool>>,
     notif_dot: GtkBox,
+    last_ws_sig: RefCell<Vec<(usize, bool, usize)>>,
     ipc: IpcCommandSender,
 }
 
@@ -42,6 +53,8 @@ impl TopPanel {
         ipc: IpcCommandSender,
         sys_tx: SystemActionSender,
         quick_settings: QuickSettingsPanel,
+        workspaces_panel: WorkspacesPanel,
+        context_menu: ContextMenuOverlay,
     ) -> Self {
         let window = ApplicationWindow::builder()
             .application(app)
@@ -72,11 +85,25 @@ impl TopPanel {
 
         let activities_btn = Button::with_label("NEON");
         activities_btn.add_css_class("neon-brand-button");
-        activities_btn.set_tooltip_text(Some("Activities Overview (Super+Space)"));
+        activities_btn.set_tooltip_text(Some("Workspaces & Desktops (Click to manage up to 10 desktops)"));
         {
-            let ipc = ipc.clone();
+            let btn_c = activities_btn.clone();
+            workspaces_panel.set_on_state_change(move |open| {
+                if open {
+                    btn_c.add_css_class("active");
+                } else {
+                    btn_c.remove_css_class("active");
+                }
+            });
+        }
+        {
+            let ws_panel = workspaces_panel;
+            let qs_close = quick_settings.clone();
+            let ipc_close_ov = ipc.clone();
             activities_btn.connect_clicked(move |_| {
-                ipc.send(IpcRequest::ToggleOverview);
+                qs_close.close();
+                ipc_close_ov.send(IpcRequest::SetOverview { open: false });
+                ws_panel.toggle();
             });
         }
 
@@ -179,6 +206,7 @@ impl TopPanel {
         }
 
         let is_light_theme = Rc::new(Cell::new(false));
+        let drawer_bg_hidden = Rc::new(Cell::new(false));
 
         // Authentic macOS Control Center dual-toggle-switches menu bar icon
         let cc_inner = GtkBox::new(Orientation::Horizontal, 4);
@@ -188,8 +216,9 @@ impl TopPanel {
         cc_icon_area.set_valign(Align::Center);
         {
             let light_flag = Rc::clone(&is_light_theme);
+            let drawer_flag = Rc::clone(&drawer_bg_hidden);
             cc_icon_area.set_draw_func(move |_, cr, w, h| {
-                let (r, g, b) = if light_flag.get() {
+                let (r, g, b) = if light_flag.get() && !drawer_flag.get() {
                     (0.06, 0.09, 0.16)
                 } else {
                     (0.95, 0.97, 1.0)
@@ -270,11 +299,20 @@ impl TopPanel {
         bar.set_start_widget(Some(&left_box));
         bar.set_end_widget(Some(&right_box));
 
+        // Right-clicking anywhere on the Top Menu Bar opens the System / Active Window context menu.
+        let panel_rc = GestureClick::new();
+        panel_rc.set_button(3);
+        panel_rc.connect_pressed(move |_, _, x, _y| {
+            context_menu.open_panel_menu(x.round() as i32, 34);
+        });
+        bar.add_controller(panel_rc);
+
         window.set_child(Some(&bar));
         window.present();
 
         Self {
             window,
+            bar,
             activities_btn,
             workspaces_box,
             focused_label,
@@ -290,9 +328,35 @@ impl TopPanel {
             power_pct_label,
             cc_icon_area,
             is_light_theme,
+            drawer_bg_hidden,
             notif_dot,
+            last_ws_sig: RefCell::new(Vec::new()),
             ipc,
         }
+    }
+
+    /// Elevates or restores the Top Bar's Wayland layer so it floats cleanly above the
+    /// fullscreen App Drawer (`Layer::Overlay` while open, `Layer::Top` normally).
+    pub fn set_drawer_layer_elevated(&self, elevated: bool) {
+        if gtk4_layer_shell::is_supported() {
+            self.window.set_layer(if elevated {
+                Layer::Overlay
+            } else {
+                Layer::Top
+            });
+        }
+        self.bar.queue_draw();
+    }
+
+    /// Smoothly fades out or fades back in the Top Bar background while keeping icons floating.
+    pub fn set_drawer_bg_hidden(&self, hidden: bool) {
+        self.drawer_bg_hidden.set(hidden);
+        if hidden {
+            self.bar.add_css_class("drawer-open");
+        } else {
+            self.bar.remove_css_class("drawer-open");
+        }
+        self.cc_icon_area.queue_draw();
     }
 
     pub fn update(&self, snapshot: &DesktopSnapshot) {
@@ -314,30 +378,38 @@ impl TopPanel {
             self.activities_btn.remove_css_class("active");
         }
 
-        while let Some(child) = self.workspaces_box.first_child() {
-            self.workspaces_box.remove(&child);
-        }
+        let ws_sig: Vec<(usize, bool, usize)> = snapshot
+            .workspaces
+            .iter()
+            .map(|ws| (ws.index, ws.active, ws.window_ids.len()))
+            .collect();
+        if *self.last_ws_sig.borrow() != ws_sig {
+            *self.last_ws_sig.borrow_mut() = ws_sig;
+            while let Some(child) = self.workspaces_box.first_child() {
+                self.workspaces_box.remove(&child);
+            }
 
-        for ws in &snapshot.workspaces {
-            let dot = Button::new();
-            dot.add_css_class("neon-ws-dot");
-            if !ws.window_ids.is_empty() {
-                dot.add_css_class("occupied");
+            for ws in &snapshot.workspaces {
+                let dot = Button::new();
+                dot.add_css_class("neon-ws-dot");
+                if !ws.window_ids.is_empty() {
+                    dot.add_css_class("occupied");
+                }
+                if ws.active {
+                    dot.add_css_class("active");
+                }
+                dot.set_tooltip_text(Some(&format!(
+                    "Workspace {} ({} windows)",
+                    ws.index + 1,
+                    ws.window_ids.len()
+                )));
+                let idx = ws.index;
+                let ipc = self.ipc.clone();
+                dot.connect_clicked(move |_| {
+                    ipc.send(IpcRequest::SwitchWorkspace { index: idx });
+                });
+                self.workspaces_box.append(&dot);
             }
-            if ws.active {
-                dot.add_css_class("active");
-            }
-            dot.set_tooltip_text(Some(&format!(
-                "Workspace {} ({} windows)",
-                ws.index + 1,
-                ws.window_ids.len()
-            )));
-            let idx = ws.index;
-            let ipc = self.ipc.clone();
-            dot.connect_clicked(move |_| {
-                ipc.send(IpcRequest::SwitchWorkspace { index: idx });
-            });
-            self.workspaces_box.append(&dot);
         }
 
         let title = snapshot
@@ -443,14 +515,18 @@ fn format_clock_now() -> String {
 }
 
 pub fn launch_sibling_binary(name: &str) {
+    launch_sibling_binary_with_args(name, &[]);
+}
+
+pub fn launch_sibling_binary_with_args(name: &str, args: &[&str]) {
     if let Ok(exe) = std::env::current_exe()
         && let Some(dir) = exe.parent()
     {
         let sibling = dir.join(name);
         if sibling.exists() {
-            let _ = std::process::Command::new(sibling).spawn();
+            let _ = std::process::Command::new(sibling).args(args).spawn();
             return;
         }
     }
-    let _ = std::process::Command::new(name).spawn();
+    let _ = std::process::Command::new(name).args(args).spawn();
 }

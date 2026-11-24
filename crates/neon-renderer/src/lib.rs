@@ -10,7 +10,7 @@ pub mod shaders;
 
 use std::collections::{HashMap, HashSet};
 
-use neon_scene::{BorderStyle, NodeContent, SceneGraph, ShadowStyle};
+use neon_scene::{BorderStyle, NodeContent, SceneGraph, ShadowStyle, TitlebarStyle};
 use neon_window_manager::WindowId;
 use smithay::{
     backend::renderer::{
@@ -21,6 +21,7 @@ use smithay::{
             memory::MemoryRenderBufferRenderElement,
             solid::{SolidColorBuffer, SolidColorRenderElement},
             surface::{WaylandSurfaceRenderElement, render_elements_from_surface_tree},
+            utils::RescaleRenderElement,
         },
         gles::{GlesError, GlesRenderer, GlesTarget, Uniform, element::PixelShaderElement},
     },
@@ -65,6 +66,7 @@ render_elements! {
     /// Unified render element type composited by [`NeonRenderer`].
     pub NeonRenderElement<=GlesRenderer>;
     Wayland=WaylandSurfaceRenderElement<GlesRenderer>,
+    RescaledWayland=RescaleRenderElement<WaylandSurfaceRenderElement<GlesRenderer>>,
     Memory=MemoryRenderBufferRenderElement<GlesRenderer>,
     Shader=PixelShaderElement,
     Solid=SolidColorRenderElement,
@@ -106,6 +108,14 @@ struct CachedGlass {
     opacity: f32,
 }
 
+#[derive(Debug, Clone)]
+struct CachedTitlebar {
+    element: PixelShaderElement,
+    area: Rectangle<i32, Logical>,
+    style: TitlebarStyle,
+    opacity: f32,
+}
+
 /// Stateful per-output GPU renderer with compiled custom shaders and cached damage-aware elements.
 #[derive(Debug)]
 pub struct NeonRenderer {
@@ -114,6 +124,7 @@ pub struct NeonRenderer {
     shadow_cache: HashMap<WindowId, CachedShadow>,
     border_cache: HashMap<WindowId, CachedBorder>,
     glass_cache: HashMap<WindowId, CachedGlass>,
+    titlebar_cache: HashMap<WindowId, CachedTitlebar>,
     backdrop_cache: Option<CachedBackdrop>,
     cursor_cache: CursorCache,
 }
@@ -146,9 +157,14 @@ impl NeonRenderer {
             shadow_cache: HashMap::new(),
             border_cache: HashMap::new(),
             glass_cache: HashMap::new(),
+            titlebar_cache: HashMap::new(),
             backdrop_cache: None,
             cursor_cache: CursorCache::load_default(),
         }
+    }
+
+    pub fn sync_cursor_config(&mut self, theme: &str, size: u32) {
+        self.cursor_cache.set_theme_and_size(theme, size);
     }
 
     pub fn has_shaders(&self) -> bool {
@@ -257,10 +273,10 @@ impl NeonRenderer {
         local_y: f64,
         scale_f: f64,
     ) -> Vec<NeonRenderElement> {
-        let loaded = self.cursor_cache.get_named(icon);
+        let loaded = self.cursor_cache.get_named_scaled(icon, scale_f);
         let phys_loc: Point<f64, Physical> = Point::<f64, Logical>::from((
-            local_x - loaded.hotspot.0 as f64,
-            local_y - loaded.hotspot.1 as f64,
+            local_x - loaded.hotspot.0,
+            local_y - loaded.hotspot.1,
         ))
         .to_physical(scale_f);
 
@@ -270,7 +286,7 @@ impl NeonRenderer {
             &loaded.buffer,
             None,
             None,
-            None,
+            loaded.logical_size,
             Kind::Cursor,
         ) {
             Ok(elem) => vec![NeonRenderElement::from(elem)],
@@ -285,6 +301,24 @@ impl NeonRenderer {
         renderer: &mut GlesRenderer,
         scene: &SceneGraph,
         blur: BlurSettings,
+        resolve_window: F,
+    ) -> Vec<NeonRenderElement>
+    where
+        F: FnMut(WindowId) -> Option<&'a Window>,
+    {
+        self.collect_scene_elements_with_popups(output, renderer, scene, blur, &[], resolve_window)
+    }
+
+    /// Collects all front-to-back [`NeonRenderElement`]s including XWayland override-redirect
+    /// popup windows (such as right-click context menus and dropdowns) composited directly above
+    /// regular windows and below `Overlay`/`Top` shell layers.
+    pub fn collect_scene_elements_with_popups<'a, F>(
+        &mut self,
+        output: &Output,
+        renderer: &mut GlesRenderer,
+        scene: &SceneGraph,
+        blur: BlurSettings,
+        override_redirect: &[(&Window, Point<i32, Logical>)],
         mut resolve_window: F,
     ) -> Vec<NeonRenderElement>
     where
@@ -294,7 +328,8 @@ impl NeonRenderer {
         let scale = Scale::from(scale_f);
         let nodes = scene.collect_front_to_back();
 
-        let mut elements: Vec<NeonRenderElement> = Vec::with_capacity(nodes.len() * 3 + 8);
+        let mut elements: Vec<NeonRenderElement> =
+            Vec::with_capacity(nodes.len() * 3 + override_redirect.len() * 2 + 8);
         let mut seen_windows: HashSet<WindowId> = HashSet::new();
 
         // Collect zwlr_layer_shell_v1 surfaces on this output split into upper (Overlay/Top)
@@ -320,13 +355,24 @@ impl NeonRenderer {
             (upper, lower)
         };
 
-        // Front-most: Overlay and Top layer surfaces (Overview, Top Panel, Dock).
+        // Front-most: Overlay and Top layer surfaces (Context Menu, Overview, Top Panel, Dock).
         for (layer, loc) in &upper_layers {
             let phys_loc: Point<i32, Physical> = loc.to_physical_precise_round(scale_f);
             let layer_elements = AsRenderElements::<GlesRenderer>::render_elements::<
                 WaylandSurfaceRenderElement<GlesRenderer>,
             >(layer, renderer, phys_loc, scale, 1.0);
             elements.extend(layer_elements.into_iter().map(NeonRenderElement::from));
+        }
+
+        // XWayland override-redirect popups (context menus, dropdowns, tooltips) above windows.
+        for &(or_win, loc) in override_redirect.iter().rev() {
+            let win_geo = or_win.geometry();
+            let render_loc: Point<i32, Logical> = (loc.x - win_geo.loc.x, loc.y - win_geo.loc.y).into();
+            let phys_loc: Point<i32, Physical> = render_loc.to_physical_precise_round(scale_f);
+            let popup_elements = AsRenderElements::<GlesRenderer>::render_elements::<
+                WaylandSurfaceRenderElement<GlesRenderer>,
+            >(or_win, renderer, phys_loc, scale, 1.0);
+            elements.extend(popup_elements.into_iter().map(NeonRenderElement::from));
         }
 
         let output_logical_size = output
@@ -367,8 +413,17 @@ impl NeonRenderer {
 
                     if let Some(window) = resolve_window(*window_id) {
                         let win_geo = window.geometry();
-                        let render_loc: Point<i32, Logical> =
-                            (eff.loc.x - win_geo.loc.x, eff.loc.y - win_geo.loc.y).into();
+                        let (sx, sy) = node.scale;
+                        let is_scaled = (sx - 1.0).abs() > 0.001 || (sy - 1.0).abs() > 0.001;
+                        let render_loc: Point<i32, Logical> = if is_scaled {
+                            (
+                                node.bounds.loc.x + node.offset.0.round() as i32 - win_geo.loc.x,
+                                node.bounds.loc.y + node.offset.1.round() as i32 - win_geo.loc.y,
+                            )
+                                .into()
+                        } else {
+                            (eff.loc.x - win_geo.loc.x, eff.loc.y - win_geo.loc.y).into()
+                        };
                         let phys_loc: Point<i32, Physical> =
                             render_loc.to_physical_precise_round(scale_f);
 
@@ -377,16 +432,64 @@ impl NeonRenderer {
                         >(
                             window, renderer, phys_loc, scale, node.opacity
                         );
-                        elements.extend(surface_elements.into_iter().map(NeonRenderElement::from));
+                        if is_scaled {
+                            let (cx, cy) = node.effective_center();
+                            let center_phys: Point<i32, Physical> =
+                                Point::<f64, Logical>::from((cx, cy))
+                                    .to_physical_precise_round(scale_f);
+                            let elem_scale = Scale::from((sx, sy));
+                            elements.extend(surface_elements.into_iter().map(|elem| {
+                                NeonRenderElement::from(RescaleRenderElement::from_element(
+                                    elem,
+                                    center_phys,
+                                    elem_scale,
+                                ))
+                            }));
+                        } else {
+                            elements.extend(surface_elements.into_iter().map(NeonRenderElement::from));
+                        }
                     }
 
-                    if blur.enabled
+                    let scaled_titlebar = node.titlebar.map(|mut tb| {
+                        let sy = node.scale.1;
+                        if (sy - 1.0).abs() > 0.001 {
+                            tb.height = (tb.height as f64 * sy).round().max(1.0) as i32;
+                        }
+                        tb
+                    });
+
+                    if let Some(titlebar) = scaled_titlebar
                         && !fullscreen
                         && eff_rect.size.w > 0
                         && eff_rect.size.h > 0
-                        && let Some(elem) = self.get_or_update_glass(
+                        && let Some(elem) = self.get_or_update_titlebar(
                             *window_id,
                             eff_rect,
+                            titlebar,
+                            node.opacity,
+                        )
+                    {
+                        elements.push(NeonRenderElement::from(elem));
+                    }
+
+                    let frame_rect = if let Some(tb) = scaled_titlebar
+                        && !fullscreen
+                    {
+                        Rectangle::new(
+                            (eff_rect.loc.x, eff_rect.loc.y - tb.height).into(),
+                            (eff_rect.size.w, eff_rect.size.h + tb.height).into(),
+                        )
+                    } else {
+                        eff_rect
+                    };
+
+                    if blur.enabled
+                        && !fullscreen
+                        && frame_rect.size.w > 0
+                        && frame_rect.size.h > 0
+                        && let Some(elem) = self.get_or_update_glass(
+                            *window_id,
+                            frame_rect,
                             output_logical_size,
                             blur,
                             node.opacity,
@@ -396,19 +499,19 @@ impl NeonRenderer {
                     }
 
                     if let Some(border) = node.border
-                        && eff_rect.size.w > 0
-                        && eff_rect.size.h > 0
+                        && frame_rect.size.w > 0
+                        && frame_rect.size.h > 0
                         && let Some(elem) =
-                            self.get_or_update_border(*window_id, eff_rect, border, node.opacity)
+                            self.get_or_update_border(*window_id, frame_rect, border, node.opacity)
                     {
                         elements.push(NeonRenderElement::from(elem));
                     }
 
                     if let Some(shadow) = node.shadow
-                        && eff_rect.size.w > 0
-                        && eff_rect.size.h > 0
+                        && frame_rect.size.w > 0
+                        && frame_rect.size.h > 0
                         && let Some(elem) =
-                            self.get_or_update_shadow(*window_id, eff_rect, shadow, node.opacity)
+                            self.get_or_update_shadow(*window_id, frame_rect, shadow, node.opacity)
                     {
                         elements.push(NeonRenderElement::from(elem));
                     }
@@ -448,6 +551,7 @@ impl NeonRenderer {
         self.shadow_cache.retain(|id, _| seen_windows.contains(id));
         self.border_cache.retain(|id, _| seen_windows.contains(id));
         self.glass_cache.retain(|id, _| seen_windows.contains(id));
+        self.titlebar_cache.retain(|id, _| seen_windows.contains(id));
 
         elements
     }
@@ -467,7 +571,33 @@ impl NeonRenderer {
     where
         F: FnMut(WindowId) -> Option<&'a Window>,
     {
-        let elements = self.collect_scene_elements(output, renderer, scene, blur, resolve_window);
+        self.render_scene_with_popups(output, renderer, framebuffer, age, scene, blur, &[], resolve_window)
+    }
+
+    /// Renders the retained [`SceneGraph`] including XWayland override-redirect popup windows.
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_scene_with_popups<'a, F>(
+        &'a mut self,
+        output: &Output,
+        renderer: &mut GlesRenderer,
+        framebuffer: &mut GlesTarget<'_>,
+        age: usize,
+        scene: &SceneGraph,
+        blur: BlurSettings,
+        override_redirect: &[(&Window, Point<i32, Logical>)],
+        resolve_window: F,
+    ) -> Result<RenderOutputResult<'a>, OutputDamageTrackerError<GlesError>>
+    where
+        F: FnMut(WindowId) -> Option<&'a Window>,
+    {
+        let elements = self.collect_scene_elements_with_popups(
+            output,
+            renderer,
+            scene,
+            blur,
+            override_redirect,
+            resolve_window,
+        );
 
         self.damage_tracker.render_output(
             renderer,
@@ -476,6 +606,62 @@ impl NeonRenderer {
             &elements,
             FALLBACK_CLEAR_COLOR,
         )
+    }
+
+    fn get_or_update_titlebar(
+        &mut self,
+        id: WindowId,
+        window_rect: Rectangle<i32, Logical>,
+        style: TitlebarStyle,
+        opacity: f32,
+    ) -> Option<PixelShaderElement> {
+        let program = self.shaders.as_ref()?.titlebar.clone();
+        let area = Rectangle::new(
+            (window_rect.loc.x, window_rect.loc.y - style.height).into(),
+            (window_rect.size.w, style.height).into(),
+        );
+
+        let make_uniforms = || {
+            vec![
+                Uniform::new("u_corner_radius", style.corner_radius),
+                Uniform::new("u_focused", if style.focused { 1.0_f32 } else { 0.0_f32 }),
+                Uniform::new(
+                    "u_light_theme",
+                    if style.light_theme { 1.0_f32 } else { 0.0_f32 },
+                ),
+                Uniform::new(
+                    "u_hover_controls",
+                    if style.hover_controls { 1.0_f32 } else { 0.0_f32 },
+                ),
+                Uniform::new("u_opacity", opacity),
+            ]
+        };
+
+        if let Some(cached) = self.titlebar_cache.get_mut(&id) {
+            if cached.area != area {
+                cached.element.resize(area, None);
+                cached.area = area;
+            }
+            if cached.style != style || (cached.opacity - opacity).abs() > 1e-4 {
+                cached.element.update_uniforms(make_uniforms());
+                cached.style = style;
+                cached.opacity = opacity;
+            }
+            return Some(cached.element.clone());
+        }
+
+        let element =
+            PixelShaderElement::new(program, area, None, 1.0, make_uniforms(), Kind::Unspecified);
+        self.titlebar_cache.insert(
+            id,
+            CachedTitlebar {
+                element: element.clone(),
+                area,
+                style,
+                opacity,
+            },
+        );
+        Some(element)
     }
 
     fn get_or_update_glass(

@@ -5,10 +5,65 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::Command,
+    sync::{Mutex, OnceLock},
 };
 
 use gtk4::{IconTheme, Image, gdk::Display};
 use tracing::{info, warn};
+
+static LIVE_XWAYLAND_DISPLAY: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+static LIVE_CURSOR_CONFIG: OnceLock<Mutex<(String, u32)>> = OnceLock::new();
+
+/// Updates the XWayland `DISPLAY` (e.g. `:0`) discovered from `neon-compositor` IPC.
+pub fn set_live_xwayland_display(display: Option<&str>) {
+    let lock = LIVE_XWAYLAND_DISPLAY.get_or_init(|| Mutex::new(None));
+    if let Ok(mut guard) = lock.lock() {
+        *guard = display.map(str::to_string);
+    }
+}
+
+/// Updates the cursor theme & size propagated to newly launched applications.
+pub fn set_live_cursor_config(theme: Option<&str>, size: Option<u32>) {
+    let lock = LIVE_CURSOR_CONFIG.get_or_init(|| Mutex::new(("macOS".into(), 20)));
+    if let Ok(mut guard) = lock.lock() {
+        if let Some(t) = theme
+            && !t.trim().is_empty()
+        {
+            guard.0 = t.to_string();
+        }
+        if let Some(s) = size {
+            guard.1 = s.clamp(16, 48);
+        }
+    }
+}
+
+fn resolve_x11_display() -> Option<String> {
+    if let Some(lock) = LIVE_XWAYLAND_DISPLAY.get()
+        && let Ok(guard) = lock.lock()
+        && let Some(ref d) = *guard
+    {
+        return Some(d.clone());
+    }
+    if let Ok(env_d) = std::env::var("DISPLAY")
+        && !env_d.trim().is_empty()
+    {
+        return Some(env_d);
+    }
+    if let Ok(entries) = fs::read_dir("/tmp/.X11-unix") {
+        let mut sockets: Vec<String> = entries
+            .flatten()
+            .filter_map(|e| {
+                let name = e.file_name().to_string_lossy().into_owned();
+                name.strip_prefix('X').map(|n| format!(":{n}"))
+            })
+            .collect();
+        sockets.sort();
+        if let Some(first) = sockets.into_iter().next() {
+            return Some(first);
+        }
+    }
+    None
+}
 
 /// Normalized metadata for an installed desktop application parsed from an XDG `.desktop` file.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -19,6 +74,7 @@ pub struct DesktopApp {
     pub comment: Option<String>,
     pub exec_program: String,
     pub exec_args: Vec<String>,
+    pub working_dir: Option<String>,
     pub icon: Option<String>,
     pub categories: Vec<String>,
     pub terminal: bool,
@@ -68,6 +124,21 @@ impl DesktopApp {
     pub fn launch(&self) {
         let mut cmd = Command::new(&self.exec_program);
         cmd.args(&self.exec_args);
+        if let Some(ref dir) = self.working_dir {
+            let p = Path::new(dir);
+            if p.is_dir() {
+                cmd.current_dir(p);
+            }
+        }
+        if let Some(disp) = resolve_x11_display() {
+            cmd.env("DISPLAY", disp);
+        }
+        if let Some(lock) = LIVE_CURSOR_CONFIG.get()
+            && let Ok(guard) = lock.lock()
+        {
+            cmd.env("XCURSOR_THEME", &guard.0);
+            cmd.env("XCURSOR_SIZE", guard.1.to_string());
+        }
         match cmd.spawn() {
             Ok(child) => {
                 info!(
@@ -265,6 +336,7 @@ pub fn parse_desktop_str(content: &str, id: &str) -> Option<DesktopApp> {
     let mut generic_name = None;
     let mut comment = None;
     let mut exec_raw = None;
+    let mut working_dir = None;
     let mut icon = None;
     let mut categories = Vec::new();
     let mut no_display = false;
@@ -294,6 +366,7 @@ pub fn parse_desktop_str(content: &str, id: &str) -> Option<DesktopApp> {
             "GenericName" => generic_name = Some(value.to_string()),
             "Comment" => comment = Some(value.to_string()),
             "Exec" => exec_raw = Some(value.to_string()),
+            "Path" => working_dir = Some(value.to_string()),
             "Icon" => icon = Some(value.to_string()),
             "NoDisplay" => no_display = value.eq_ignore_ascii_case("true"),
             "Hidden" => hidden = value.eq_ignore_ascii_case("true"),
@@ -323,6 +396,7 @@ pub fn parse_desktop_str(content: &str, id: &str) -> Option<DesktopApp> {
         comment,
         exec_program,
         exec_args,
+        working_dir,
         icon,
         categories,
         terminal,
@@ -439,6 +513,7 @@ pub fn select_default_favorites(apps: &[DesktopApp]) -> Vec<DesktopApp> {
                     comment: Some("NEON DE Terminal".into()),
                     exec_program: fallback.into(),
                     exec_args: Vec::new(),
+                    working_dir: None,
                     icon: Some("utilities-terminal".into()),
                     categories: vec!["System".into(), "TerminalEmulator".into()],
                     terminal: false,

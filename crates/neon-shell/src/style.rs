@@ -24,9 +24,13 @@ impl ShellThemeController {
             show_workspaces: true,
             high_contrast: false,
             wallpaper: None,
+            reduce_blur: false,
+            blur_strength: 1.0,
+            cursor_theme: Some("macOS".into()),
+            cursor_size: Some(20),
         };
         provider.load_from_string(&build_shell_css(&default_appearance));
-        apply_gtk_icon_theme(false);
+        apply_gtk_settings(&default_appearance);
         if let Some(display) = Display::default() {
             gtk4::style_context_add_provider_for_display(
                 &display,
@@ -44,14 +48,14 @@ impl ShellThemeController {
         if self.last_applied.as_ref() == Some(appearance) {
             return;
         }
-        let is_light = appearance.theme == "neon_light" || appearance.theme == "light";
-        apply_gtk_icon_theme(is_light);
+        apply_gtk_settings(appearance);
         self.provider.load_from_string(&build_shell_css(appearance));
         self.last_applied = Some(appearance.clone());
     }
 }
 
-fn apply_gtk_icon_theme(is_light: bool) {
+fn apply_gtk_settings(appearance: &AppearanceInfo) {
+    let is_light = appearance.theme == "neon_light" || appearance.theme == "light";
     if let Some(settings) = gtk4::Settings::default() {
         let icon_theme = if is_light {
             "WhiteSur-light"
@@ -60,22 +64,63 @@ fn apply_gtk_icon_theme(is_light: bool) {
         };
         settings.set_gtk_icon_theme_name(Some(icon_theme));
         settings.set_gtk_application_prefer_dark_theme(!is_light);
+        if let Some(ref ct) = appearance.cursor_theme
+            && !ct.trim().is_empty()
+        {
+            settings.set_gtk_cursor_theme_name(Some(ct));
+        }
+        if let Some(cs) = appearance.cursor_size {
+            settings.set_gtk_cursor_theme_size(cs.clamp(16, 48) as i32);
+        }
     }
 }
 
 pub fn build_shell_css(appearance: &AppearanceInfo) -> String {
     let is_light = appearance.theme == "neon_light" || appearance.theme == "light";
     let high_contrast = appearance.high_contrast;
+    let reduce_blur = appearance.reduce_blur || appearance.blur_strength <= 0.05;
+    let blur_s = appearance.blur_strength.clamp(0.0, 2.0);
     let accent = &appearance.accent_color;
     let panel_a = if high_contrast {
         1.0
+    } else if reduce_blur {
+        (appearance.panel_transparency * 0.94).clamp(0.76, 0.96)
     } else {
         (appearance.panel_transparency * 0.76).clamp(0.42, 0.94)
     };
     let dock_a = if high_contrast {
         1.0
+    } else if reduce_blur {
+        (appearance.dock_transparency * 0.92).clamp(0.74, 0.95)
     } else {
         (appearance.dock_transparency * 0.68).clamp(0.36, 0.92)
+    };
+
+    let cc_blur_px = (14.0 * blur_s).clamp(2.0, 24.0);
+    let lp_blur_px = (24.0 * blur_s).clamp(10.0, 34.0);
+    let tahoe_blur_light = if high_contrast || reduce_blur {
+        "none".to_string()
+    } else {
+        format!("blur({cc_blur_px:.0}px) saturate(1.35) brightness(1.10)")
+    };
+    let launchpad_blur_light = if high_contrast {
+        "none".to_string()
+    } else if reduce_blur {
+        "blur(8px) saturate(1.18) brightness(0.94)".to_string()
+    } else {
+        format!("blur({lp_blur_px:.0}px) saturate(1.32) brightness(0.92)")
+    };
+    let tahoe_blur_dark = if high_contrast || reduce_blur {
+        "none".to_string()
+    } else {
+        format!("blur({cc_blur_px:.0}px) saturate(1.40) brightness(0.78)")
+    };
+    let launchpad_blur_dark = if high_contrast {
+        "none".to_string()
+    } else if reduce_blur {
+        "blur(8px) saturate(1.22) brightness(0.80)".to_string()
+    } else {
+        format!("blur({lp_blur_px:.0}px) saturate(1.42) brightness(0.78)")
     };
 
     let (
@@ -98,22 +143,30 @@ pub fn build_shell_css(appearance: &AppearanceInfo) -> String {
         popover_bg,
     ) = if is_light {
         (
-            format!("rgba(246, 248, 253, {panel_a:.2})"),
-            format!("rgba(246, 249, 255, {dock_a:.2})"),
+        format!("rgba(246, 248, 253, {panel_a:.2})"),
+        format!("rgba(246, 249, 255, {dock_a:.2})"),
             if high_contrast {
                 "#FFFFFF"
+            } else if reduce_blur {
+                "rgba(244, 247, 253, 0.94)"
             } else {
-                "rgba(244, 247, 253, 0.62)"
+                "rgba(244, 247, 253, 0.68)"
             },
             if high_contrast {
                 "#F1F5F9"
+            } else if reduce_blur {
+                "rgba(255, 255, 255, 0.86)"
             } else {
                 "rgba(255, 255, 255, 0.56)"
             },
             "rgba(255, 255, 255, 0.76)",
-            "blur(40px) saturate(1.55) brightness(1.14)",
-            "blur(36px) saturate(1.30) brightness(0.95)",
-            "rgba(236, 242, 252, 0.36)",
+            tahoe_blur_light,
+            launchpad_blur_light,
+            if high_contrast {
+                "rgba(232, 238, 248, 0.94)"
+            } else {
+                "rgba(14, 18, 30, 0.14)"
+            },
             "#0B1220",
             if high_contrast { "#0F172A" } else { "#475569" },
             if high_contrast {
@@ -130,26 +183,34 @@ pub fn build_shell_css(appearance: &AppearanceInfo) -> String {
             "rgba(15, 23, 42, 0.28)",
             "rgba(15, 23, 42, 0.14)",
             "#FFFFFF",
-            "rgba(246, 248, 253, 0.86)",
+            "rgba(246, 248, 253, 0.92)",
         )
     } else {
         (
-            format!("rgba(16, 18, 26, {panel_a:.2})"),
-            format!("rgba(20, 23, 34, {dock_a:.2})"),
+        format!("rgba(16, 18, 26, {panel_a:.2})"),
+        format!("rgba(20, 23, 34, {dock_a:.2})"),
             if high_contrast {
                 "#0B1120"
+            } else if reduce_blur {
+                "rgba(22, 25, 36, 0.94)"
             } else {
-                "rgba(24, 28, 42, 0.56)"
+                "rgba(24, 28, 42, 0.62)"
             },
             if high_contrast {
                 "#111827"
+            } else if reduce_blur {
+                "rgba(255, 255, 255, 0.09)"
             } else {
                 "rgba(255, 255, 255, 0.11)"
             },
             "rgba(255, 255, 255, 0.17)",
-            "blur(42px) saturate(1.65) brightness(0.76)",
-            "blur(38px) saturate(1.35) brightness(0.62)",
-            "rgba(10, 13, 22, 0.34)",
+            tahoe_blur_dark,
+            launchpad_blur_dark,
+            if high_contrast {
+                "rgba(12, 15, 24, 0.94)"
+            } else {
+                "rgba(10, 14, 24, 0.22)"
+            },
             if high_contrast { "#FFFFFF" } else { "#F8FAFC" },
             if high_contrast { "#E2E8F0" } else { "#CBD5E1" },
             if high_contrast {
@@ -166,9 +227,78 @@ pub fn build_shell_css(appearance: &AppearanceInfo) -> String {
             "rgba(255, 255, 255, 0.36)",
             "rgba(255, 255, 255, 0.18)",
             "rgba(255, 255, 255, 0.94)",
-            "rgba(22, 26, 38, 0.84)",
+            "rgba(22, 26, 38, 0.90)",
         )
     };
+
+    let (
+        cc_glass_bg,
+        cc_glass_grad,
+        cc_glass_hover,
+        cc_glass_border,
+        cc_glass_shadow,
+        cc_badge_idle,
+        cc_slider_trough,
+        cc_slider_fill,
+        cc_active_circle_bg,
+        cc_active_circle_fg,
+    ) = if is_light {
+        (
+            if high_contrast {
+                "#FFFFFF"
+            } else if reduce_blur {
+                "rgba(242, 246, 255, 0.92)"
+            } else {
+                "rgba(242, 247, 255, 0.68)"
+            },
+            if high_contrast {
+                "none"
+            } else {
+                "linear-gradient(180deg, rgba(255, 255, 255, 0.56) 0%, rgba(255, 255, 255, 0.18) 100%)"
+            },
+            "rgba(255, 255, 255, 0.84)",
+            if high_contrast {
+                "#0F172A"
+            } else {
+                "rgba(255, 255, 255, 0.88)"
+            },
+            "0 8px 22px rgba(15, 23, 42, 0.14), inset 0 1px 0 rgba(255, 255, 255, 0.96), inset 0 -1px 0 rgba(15, 23, 42, 0.06)",
+            "rgba(15, 23, 42, 0.11)",
+            "rgba(15, 23, 42, 0.16)",
+            "#0A84FF",
+            "rgba(255, 255, 255, 0.97)",
+            "#0A84FF",
+        )
+    } else {
+        (
+            if high_contrast {
+                "#0F172A"
+            } else if reduce_blur {
+                "rgba(22, 28, 42, 0.86)"
+            } else {
+                "rgba(22, 32, 50, 0.54)"
+            },
+            if high_contrast {
+                "none"
+            } else {
+                "linear-gradient(180deg, rgba(255, 255, 255, 0.16) 0%, rgba(255, 255, 255, 0.04) 55%, rgba(255, 255, 255, 0.10) 100%)"
+            },
+            "rgba(255, 255, 255, 0.19)",
+            if high_contrast {
+                "#F8FAFC"
+            } else {
+                "rgba(255, 255, 255, 0.34)"
+            },
+            "0 8px 22px rgba(0, 0, 0, 0.28), inset 0 1px 0 rgba(255, 255, 255, 0.40), inset 0 -1px 0 rgba(255, 255, 255, 0.10)",
+            "rgba(255, 255, 255, 0.18)",
+            "rgba(255, 255, 255, 0.24)",
+            "#FFFFFF",
+            "rgba(255, 255, 255, 0.94)",
+            "#0A84FF",
+        )
+    };
+
+    let _ = (tahoe_glass_bg, tahoe_blur_filter, launchpad_blur_filter, slider_fill);
 
     format!(
         r#"
@@ -181,8 +311,13 @@ window.neon-dock-window,
 window.neon-overview-window,
 window.neon-quicksettings-window,
 window.neon-toast-window,
-window.neon-screenshot-window {{
+window.neon-screenshot-window,
+window.neon-contextmenu-window {{
     background-color: transparent;
+    background-image: none;
+    box-shadow: none;
+    border: none;
+    outline: none;
 }}
 
 window.neon-wallpaper-window {{
@@ -199,6 +334,25 @@ window.neon-wallpaper-window {{
     min-height: 30px;
     color: {fg_primary};
     font-size: 13px;
+    transition: background-color 280ms cubic-bezier(0.22, 1.0, 0.36, 1.0),
+                border-color 280ms cubic-bezier(0.22, 1.0, 0.36, 1.0),
+                box-shadow 280ms cubic-bezier(0.22, 1.0, 0.36, 1.0),
+                color 280ms cubic-bezier(0.22, 1.0, 0.36, 1.0);
+}}
+
+.neon-top-panel.drawer-open {{
+    background-color: transparent;
+    border-bottom-color: transparent;
+    box-shadow: none;
+    color: #FFFFFF;
+}}
+
+.neon-top-panel.drawer-open button.neon-brand-button,
+.neon-top-panel.drawer-open button.neon-clock-btn,
+.neon-top-panel.drawer-open button.neon-tray-btn,
+.neon-top-panel.drawer-open .neon-app-title {{
+    color: #FFFFFF;
+    text-shadow: 0 1px 4px rgba(0, 0, 0, 0.45);
 }}
 
 button.neon-brand-button {{
@@ -297,8 +451,8 @@ button.neon-tray-btn.active {{
 }}
 
 button.neon-cc-toggle-btn {{
-    padding: 2px 8px;
-    border-radius: 8px;
+    padding: 2px 10px;
+    border-radius: 999px;
 }}
 
 button.neon-cc-toggle-btn.active {{
@@ -316,12 +470,33 @@ button.neon-cc-toggle-btn.active {{
 
 /* ===================== FLOATING LIQUID GLASS DOCK (macOS Tahoe) ===================== */
 
+.neon-dock-wrapper {{
+    background-color: transparent;
+    background-image: none;
+    border: none;
+    box-shadow: none;
+    padding: 16px 24px 16px 24px;
+}}
+
 .neon-dock-container {{
     background-color: {dock_bg};
     border: 1px solid {border_glass};
-    border-radius: 24px;
-    padding: 6px 11px 4px 11px;
-    box-shadow: 0 18px 46px rgba(0, 0, 0, 0.44), {specular_inset};
+    border-radius: 22px;
+    padding: 6px 12px 5px 12px;
+    box-shadow: 0 3px 10px rgba(0, 0, 0, 0.28), {specular_inset};
+    transition: background-color 280ms cubic-bezier(0.22, 1.0, 0.36, 1.0),
+                border-color 280ms cubic-bezier(0.22, 1.0, 0.36, 1.0),
+                box-shadow 280ms cubic-bezier(0.22, 1.0, 0.36, 1.0);
+}}
+
+.neon-dock-container.drawer-open {{
+    background-color: transparent;
+    border-color: transparent;
+    box-shadow: none;
+}}
+
+.neon-dock-container.drawer-open .neon-dock-separator {{
+    background-color: rgba(255, 255, 255, 0.26);
 }}
 
 button.neon-dock-item {{
@@ -374,135 +549,192 @@ button.neon-dock-item.focused {{
     margin: 8px 5px 10px 5px;
 }}
 
-/* ===================== MACOS TAHOE ("LIQUID GLASS") CONTROL CENTER ===================== */
+/* ===================== LIQUID GLASS FLOATING CONTROL CENTER ===================== */
 
-.neon-tahoe-wrapper {{
-    padding: 8px 12px 24px 24px;
+.neon-cc-backdrop {{
+    background-color: transparent;
+    background-image: none;
+    border: none;
+    box-shadow: none;
 }}
 
-.neon-tahoe-shell {{
-    border-radius: 26px;
-    border: 1px solid {border_glass};
-    box-shadow: 0 24px 58px rgba(0, 0, 0, 0.48), {specular_inset};
-    transition: opacity 200ms cubic-bezier(0.22, 1.0, 0.36, 1.0),
-                transform 240ms cubic-bezier(0.22, 1.0, 0.36, 1.0);
+.neon-cc-surface {{
+    background-color: transparent;
+    background-image: none;
+    border: none;
+    box-shadow: none;
+    padding: 8px 10px 22px 22px;
+    transition: opacity 220ms cubic-bezier(0.22, 1.0, 0.36, 1.0),
+                transform 260ms cubic-bezier(0.22, 1.0, 0.36, 1.0);
 }}
 
-.neon-tahoe-shell.cc-closed {{
+.neon-cc-surface.cc-closed {{
     opacity: 0;
-    transform: translateY(-16px) scale(0.93);
+    transform: translateY(-18px) scale(0.92);
 }}
 
-.neon-tahoe-shell.cc-open {{
+.neon-cc-surface.cc-open {{
     opacity: 1;
     transform: translateY(0px) scale(1.0);
 }}
 
-.neon-tahoe-blur-bg {{
-    filter: {tahoe_blur_filter};
-    transform: scale(1.18);
-}}
-
-.neon-tahoe-glass {{
-    background-color: {tahoe_glass_bg};
-    padding: 14px;
+/* Shared floating Liquid Glass lens surface */
+.neon-cc-glass {{
+    background-color: {cc_glass_bg};
+    background-image: {cc_glass_grad};
+    border: 1px solid {cc_glass_border};
+    box-shadow: {cc_glass_shadow};
     color: {fg_primary};
-    min-width: 344px;
 }}
 
-.neon-tahoe-card {{
-    background-color: {tahoe_card_bg};
-    border: 1px solid {border_subtle};
-    border-radius: 20px;
-    padding: 11px 13px;
+/* 2×1 Stadium Pills (Wi-Fi & Focus: exact 152 × 70 px border-box = 126+24+2 × 68+2) */
+button.neon-cc-stadium-pill {{
+    background-color: {cc_glass_bg};
+    background-image: {cc_glass_grad};
+    border: 1px solid {cc_glass_border};
+    box-shadow: {cc_glass_shadow};
+    border-radius: 999px;
+    min-width: 126px;
+    min-height: 68px;
+    padding: 0 12px 0 12px;
     color: {fg_primary};
-    box-shadow: {specular_inset};
+    transition: background-color 160ms ease, border-color 160ms ease, transform 150ms cubic-bezier(0.22, 1.0, 0.36, 1.0);
 }}
 
-.neon-tahoe-sep {{
-    background-color: {border_subtle};
-    min-height: 1px;
-    margin: 3px 4px;
+button.neon-cc-stadium-pill:hover {{
+    background-color: {cc_glass_hover};
+    transform: scale(1.02);
 }}
 
-button.neon-tahoe-conn-row {{
+button.neon-cc-stadium-pill:active {{
+    transform: scale(0.97);
+}}
+
+.neon-cc-pill-badge {{
+    background-color: {cc_badge_idle};
+    color: {fg_primary};
+    border-radius: 999px;
+    min-width: 42px;
+    min-height: 42px;
+    padding: 0;
+    transition: background-color 180ms ease, color 180ms ease, box-shadow 180ms ease;
+}}
+
+button.neon-cc-stadium-pill.wifi-style.active .neon-cc-pill-badge {{
+    background-color: {cc_active_circle_bg};
+    color: {cc_active_circle_fg};
+    box-shadow: 0 3px 10px rgba(0, 0, 0, 0.16);
+}}
+
+button.neon-cc-stadium-pill.active:not(.wifi-style) {{
+    border-color: alpha({accent}, 0.65);
+    background-color: alpha({accent}, 0.28);
+}}
+
+button.neon-cc-stadium-pill.active:not(.wifi-style) .neon-cc-pill-badge {{
+    background-color: {cc_active_circle_bg};
+    color: #5E5CE6;
+    box-shadow: 0 3px 10px rgba(0, 0, 0, 0.16);
+}}
+
+/* 1×1 Floating Circular Buttons (68 × 68 px) */
+button.neon-cc-circle-btn {{
+    background-color: {cc_glass_bg};
+    background-image: {cc_glass_grad};
+    border: 1px solid {cc_glass_border};
+    box-shadow: {cc_glass_shadow};
+    border-radius: 999px;
+    min-width: 68px;
+    min-height: 68px;
+    padding: 0;
+    color: {fg_primary};
+    transition: background-color 180ms ease, color 180ms ease, border-color 180ms ease, transform 150ms cubic-bezier(0.22, 1.0, 0.36, 1.0);
+}}
+
+button.neon-cc-circle-btn:hover {{
+    background-color: {cc_glass_hover};
+    transform: scale(1.04);
+}}
+
+button.neon-cc-circle-btn:active {{
+    transform: scale(0.95);
+}}
+
+button.neon-cc-circle-btn.active {{
+    background-image: none;
+    background-color: {cc_active_circle_bg};
+    color: {cc_active_circle_fg};
+    border-color: rgba(255, 255, 255, 0.96);
+    box-shadow: 0 6px 18px rgba(0, 0, 0, 0.22), inset 0 1px 0 #FFFFFF;
+}}
+
+button.neon-cc-circle-btn.active:hover {{
+    background-color: #FFFFFF;
+}}
+
+/* 2×2 Now Playing Liquid Glass Card (exact 152 × 152 px border-box = 124+26+2 × 128+22+2) */
+.neon-cc-media-card {{
+    border-radius: 26px;
+    padding: 12px 13px 10px 13px;
+    min-width: 124px;
+    min-height: 128px;
+}}
+
+.neon-cc-media-art {{
+    border-radius: 12px;
+    border: 1px solid rgba(255, 255, 255, 0.24);
+    box-shadow: 0 3px 10px rgba(0, 0, 0, 0.24);
+}}
+
+.neon-cc-media-art-placeholder {{
+    background-image: linear-gradient(135deg, alpha({accent}, 0.55) 0%, rgba(99, 102, 241, 0.65) 100%);
+    color: #FFFFFF;
+}}
+
+button.neon-cc-media-btn {{
     background-image: none;
     background-color: transparent;
     border: none;
     box-shadow: none;
-    border-radius: 14px;
-    padding: 6px 6px;
-    color: {fg_primary};
-    transition: background-color 150ms ease, transform 140ms ease;
-}}
-
-button.neon-tahoe-conn-row:hover {{
-    background-color: {tahoe_card_hover};
-}}
-
-button.neon-tahoe-conn-row:active {{
-    transform: scale(0.97);
-}}
-
-button.neon-tahoe-focus-pill {{
-    background-image: none;
-    background-color: {tahoe_card_bg};
-    border: 1px solid {border_subtle};
-    box-shadow: {specular_inset};
-    border-radius: 20px;
-    padding: 10px 12px;
-    color: {fg_primary};
-    transition: background-color 160ms ease, border-color 160ms ease, transform 140ms ease;
-}}
-
-button.neon-tahoe-focus-pill:hover {{
-    background-color: {tahoe_card_hover};
-    border-color: {border_glass};
-}}
-
-button.neon-tahoe-focus-pill.active {{
-    border-color: alpha({accent}, 0.60);
-    background-color: alpha({accent}, 0.22);
-}}
-
-button.neon-tahoe-mini-tile {{
-    background-image: none;
-    background-color: {tahoe_card_bg};
-    border: 1px solid {border_subtle};
-    box-shadow: {specular_inset};
-    border-radius: 20px;
-    padding: 10px 6px;
-    min-height: 58px;
-    color: {fg_primary};
-    transition: background-color 160ms ease, border-color 160ms ease, transform 140ms ease;
-}}
-
-button.neon-tahoe-mini-tile:hover {{
-    background-color: {tahoe_card_hover};
-    border-color: {border_glass};
-    transform: translateY(-1px);
-}}
-
-button.neon-tahoe-mini-tile.active {{
-    border-color: alpha({accent}, 0.55);
-    background-color: alpha({accent}, 0.20);
-}}
-
-.neon-cc-badge {{
-    background-color: {slider_trough};
-    color: {fg_primary};
     border-radius: 999px;
-    min-width: 34px;
-    min-height: 34px;
     padding: 0;
-    transition: background-color 180ms ease, color 180ms ease;
+    min-width: 30px;
+    min-height: 30px;
+    color: {fg_primary};
+    transition: background-color 140ms ease, transform 130ms ease;
 }}
 
-button.neon-tahoe-conn-row.active .neon-cc-badge,
-button.neon-tahoe-focus-pill.active .neon-cc-badge {{
-    background-color: {accent};
-    color: #FFFFFF;
-    box-shadow: 0 4px 12px alpha({accent}, 0.45);
+button.neon-cc-media-btn:hover {{
+    background-color: {cc_badge_idle};
+    transform: scale(1.08);
+}}
+
+button.neon-cc-media-btn:active {{
+    transform: scale(0.92);
+}}
+
+button.neon-cc-media-btn:disabled {{
+    opacity: 0.42;
+}}
+
+/* Full-width Display & Sound Liquid Glass Cards (exact 316 px border-box = 282+32+2) */
+.neon-cc-slider-card {{
+    border-radius: 26px;
+    padding: 11px 16px 12px 16px;
+    min-width: 282px;
+}}
+
+.neon-cc-title {{
+    color: {fg_primary};
+    font-weight: 700;
+    font-size: 13px;
+    letter-spacing: 0.1px;
+}}
+
+.neon-cc-sub {{
+    color: {fg_muted};
+    font-weight: 500;
+    font-size: 11px;
 }}
 
 .neon-qs-title {{
@@ -516,67 +748,195 @@ button.neon-tahoe-focus-pill.active .neon-cc-badge {{
     font-size: 11px;
 }}
 
-.neon-tahoe-slider-icon {{
+.neon-cc-slider-icon {{
     color: {fg_primary};
-    margin: 0 6px 0 4px;
 }}
 
-/* macOS Tahoe Thick Liquid Glass Capsule Sliders (Display & Sound) */
-scale.neon-tahoe-capsule trough {{
-    background-color: {slider_trough};
-    border: 1px solid {border_subtle};
-    border-radius: 999px;
-    min-height: 22px;
-    box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.16);
+.neon-cc-slider-icon-muted {{
+    color: {fg_primary};
+    opacity: 0.78;
 }}
 
-scale.neon-tahoe-capsule highlight {{
-    background-color: {slider_fill};
-    border-radius: 999px;
-}}
-
-scale.neon-tahoe-capsule slider {{
-    background-color: #FFFFFF;
-    border: 1px solid rgba(0, 0, 0, 0.12);
+button.neon-cc-inline-icon-btn {{
+    background-image: none;
+    background-color: transparent;
+    border: none;
+    box-shadow: none;
     border-radius: 999px;
     min-width: 22px;
     min-height: 22px;
-    margin: -1px 0;
-    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.32);
-    transition: transform 140ms ease;
+    padding: 0;
+    margin: 0;
+    color: {fg_primary};
+    transition: background-color 140ms ease, opacity 140ms ease;
 }}
 
-scale.neon-tahoe-capsule:hover slider {{
+button.neon-cc-inline-icon-btn:hover {{
+    background-color: {cc_badge_idle};
+}}
+
+button.neon-cc-inline-icon-btn.muted {{
+    color: #F87171;
+}}
+
+button.neon-cc-output-circle {{
+    background-image: none;
+    background-color: {cc_badge_idle};
+    border: 1px solid {border_subtle};
+    box-shadow: none;
+    border-radius: 999px;
+    min-width: 28px;
+    min-height: 28px;
+    padding: 0;
+    margin: 0 0 0 2px;
+    color: {fg_primary};
+    transition: background-color 150ms ease, transform 140ms ease;
+}}
+
+button.neon-cc-output-circle:hover {{
+    background-color: {cc_glass_hover};
     transform: scale(1.06);
 }}
 
-.neon-tahoe-notif-item {{
-    background-color: {tahoe_card_bg};
-    border-radius: 12px;
-    padding: 7px 10px;
+/* Sleek Liquid Glass Sliders (Thin translucent track + crisp white fill + round white knob) */
+scale.neon-cc-slider {{
+    padding: 7px 0;
+    margin: 0;
 }}
 
-button.neon-tahoe-footer-btn {{
+scale.neon-cc-slider trough {{
+    background-color: {cc_slider_trough};
+    border: none;
+    border-radius: 999px;
+    min-height: 6px;
+    box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.16);
+}}
+
+scale.neon-cc-slider highlight {{
+    background-color: {cc_slider_fill};
+    border-radius: 999px;
+}}
+
+scale.neon-cc-slider slider {{
     background-image: none;
-    background-color: {tahoe_card_bg};
-    color: {fg_primary};
-    border: 1px solid {border_subtle};
-    box-shadow: {specular_inset};
-    border-radius: 16px;
-    padding: 8px 10px;
-    min-height: 32px;
-    font-size: 12px;
-    font-weight: 600;
-    transition: background-color 150ms ease, border-color 150ms ease, transform 140ms ease;
+    background-color: #FFFFFF;
+    border: 1px solid rgba(0, 0, 0, 0.08);
+    border-radius: 999px;
+    min-width: 18px;
+    min-height: 18px;
+    margin: -6px 0;
+    box-shadow: 0 2px 7px rgba(0, 0, 0, 0.30);
+    transition: transform 140ms ease;
 }}
 
-button.neon-tahoe-footer-btn:hover {{
-    background-color: {tahoe_card_hover};
-    border-color: {border_glass};
+scale.neon-cc-slider:hover slider {{
+    transform: scale(1.12);
+}}
+
+/* Compact System Power Glass Pill (exact 316 px border-box = 302+12+2) */
+.neon-cc-power-pill {{
+    border-radius: 26px;
+    padding: 5px 6px;
+    min-width: 302px;
+}}
+
+button.neon-cc-power-btn {{
+    background-image: none;
+    background-color: transparent;
+    border: none;
+    box-shadow: none;
+    border-radius: 20px;
+    padding: 6px 4px;
+    min-height: 40px;
+    color: {fg_primary};
+    transition: background-color 150ms ease, color 150ms ease, transform 130ms ease;
+}}
+
+button.neon-cc-power-btn:hover {{
+    background-color: {cc_badge_idle};
     transform: translateY(-1px);
 }}
 
-button.neon-tahoe-footer-btn:active {{
+button.neon-cc-power-btn.danger:hover {{
+    background-color: alpha(#EF4444, 0.26);
+    color: #FCA5A5;
+}}
+
+button.neon-cc-power-btn:active {{
+    transform: scale(0.95);
+}}
+
+.neon-cc-power-lbl {{
+    font-size: 10px;
+    font-weight: 600;
+    color: {fg_muted};
+}}
+
+.neon-cc-confirm-card {{
+    border-radius: 20px;
+    border-color: alpha({accent}, 0.60);
+    padding: 9px 13px;
+}}
+
+button.neon-cc-small-btn {{
+    background-image: none;
+    background-color: {cc_badge_idle};
+    color: {fg_primary};
+    border: none;
+    border-radius: 999px;
+    padding: 4px 11px;
+    font-size: 11px;
+    font-weight: 600;
+    transition: background-color 140ms ease;
+}}
+
+button.neon-cc-small-btn:hover {{
+    background-color: {cc_glass_hover};
+}}
+
+button.neon-power-confirm-btn {{
+    background-image: none;
+    background-color: {accent};
+    color: #FFFFFF;
+    border: none;
+    border-radius: 999px;
+    padding: 4px 12px;
+    font-size: 11px;
+    font-weight: 700;
+}}
+
+button.neon-power-confirm-btn.danger {{
+    background-color: #DC2626;
+}}
+
+.neon-cc-notif-item {{
+    background-color: {cc_badge_idle};
+    border-radius: 14px;
+    padding: 7px 10px;
+}}
+
+/* Centered bottom Liquid Glass capsule pill ("Open Settings") */
+button.neon-cc-bottom-pill {{
+    background-color: {cc_glass_bg};
+    background-image: {cc_glass_grad};
+    border: 1px solid {cc_glass_border};
+    box-shadow: {cc_glass_shadow};
+    border-radius: 999px;
+    padding: 6px 20px;
+    min-height: 28px;
+    color: {fg_primary};
+    font-size: 12px;
+    font-weight: 600;
+    letter-spacing: 0.1px;
+    transition: background-color 150ms ease, transform 140ms ease;
+}}
+
+button.neon-cc-bottom-pill:hover {{
+    background-color: {cc_glass_hover};
+    transform: scale(1.03);
+}}
+
+button.neon-cc-bottom-pill:active {{
     transform: scale(0.96);
 }}
 
@@ -629,10 +989,10 @@ button.neon-pill-button:hover {{
     background-color: {tahoe_card_hover};
 }}
 
-/* ===================== MACOS LAUNCHPAD (GPU BLUR + ZOOM ANIMATION) ===================== */
+/* ===================== MACOS LAUNCHPAD (FULLSCREEN BLUR + ZOOM ANIMATION) ===================== */
 
 .neon-launchpad-overlay {{
-    transition: opacity 210ms cubic-bezier(0.22, 1.0, 0.36, 1.0);
+    transition: opacity 280ms cubic-bezier(0.22, 1.0, 0.36, 1.0);
 }}
 
 .neon-launchpad-overlay.lp-closed {{
@@ -644,24 +1004,24 @@ button.neon-pill-button:hover {{
 }}
 
 .neon-launchpad-blur-bg {{
-    filter: {launchpad_blur_filter};
-    transform: scale(1.12);
+    filter: none;
+    transform: none;
 }}
 
 .neon-launchpad-scrim {{
     background-color: {scrim_bg};
-    padding: 20px 44px 16px 44px;
-    color: {fg_primary};
+    padding: 36px 64px 88px 64px;
+    color: #FFFFFF;
 }}
 
 .neon-launchpad-content {{
-    transition: transform 240ms cubic-bezier(0.22, 1.0, 0.36, 1.0),
-                opacity 200ms cubic-bezier(0.22, 1.0, 0.36, 1.0);
+    transition: transform 280ms cubic-bezier(0.22, 1.0, 0.36, 1.0),
+                opacity 280ms cubic-bezier(0.22, 1.0, 0.36, 1.0);
 }}
 
 .neon-launchpad-overlay.lp-closed .neon-launchpad-content {{
     opacity: 0;
-    transform: scale(1.07);
+    transform: scale(1.09);
 }}
 
 .neon-launchpad-overlay.lp-open .neon-launchpad-content {{
@@ -670,18 +1030,47 @@ button.neon-pill-button:hover {{
 }}
 
 .neon-launchpad-search {{
-    background-color: {tahoe_card_bg};
-    color: {fg_primary};
-    border: 1px solid {border_glass};
-    border-radius: 14px;
-    padding: 6px 16px;
-    font-size: 14px;
-    min-width: 290px;
-    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.25), {specular_inset};
+    background-image: none;
+    background-color: rgba(255, 255, 255, 0.12);
+    color: #FFFFFF;
+    caret-color: #FFFFFF;
+    border: 1px solid rgba(255, 255, 255, 0.30);
+    border-radius: 10px;
+    padding: 4px 14px;
+    font-size: 13px;
+    min-width: 256px;
+    min-height: 28px;
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.14), inset 0 1px 0 rgba(255, 255, 255, 0.22);
+    transition: background-color 180ms ease, border-color 180ms ease;
 }}
 
 .neon-launchpad-search:focus-within {{
-    border-color: {accent};
+    background-color: rgba(255, 255, 255, 0.18);
+    border-color: rgba(255, 255, 255, 0.58);
+}}
+
+.neon-launchpad-search text placeholder {{
+    color: rgba(255, 255, 255, 0.68);
+}}
+
+button.neon-launchpad-ghost-btn {{
+    background-image: none;
+    background-color: rgba(255, 255, 255, 0.10);
+    color: rgba(255, 255, 255, 0.78);
+    border: 1px solid rgba(255, 255, 255, 0.18);
+    box-shadow: none;
+    border-radius: 999px;
+    padding: 4px 13px;
+    min-height: 24px;
+    font-size: 11px;
+    font-weight: 600;
+    transition: background-color 160ms ease, color 160ms ease, border-color 160ms ease;
+}}
+
+button.neon-launchpad-ghost-btn:hover {{
+    background-color: rgba(255, 255, 255, 0.20);
+    color: #FFFFFF;
+    border-color: rgba(255, 255, 255, 0.38);
 }}
 
 button.neon-launchpad-tile {{
@@ -691,50 +1080,51 @@ button.neon-launchpad-tile {{
     box-shadow: none;
     outline: none;
     border-radius: 22px;
-    padding: 10px 10px;
-    min-width: 118px;
+    padding: 8px 10px;
+    min-width: 112px;
     min-height: 108px;
-    color: {fg_primary};
+    color: #FFFFFF;
     transition: transform 180ms cubic-bezier(0.22, 1.0, 0.36, 1.0), background-color 150ms ease;
 }}
 
 button.neon-launchpad-tile:hover {{
-    background-color: rgba(255, 255, 255, 0.13);
-    transform: scale(1.08);
+    background-color: rgba(255, 255, 255, 0.12);
+    transform: scale(1.09);
 }}
 
 button.neon-launchpad-tile:active {{
-    transform: scale(0.96);
+    transform: scale(0.95);
 }}
 
 .neon-launchpad-label {{
     color: #FFFFFF;
     font-size: 12px;
     font-weight: 500;
-    text-shadow: 0 1px 5px rgba(0, 0, 0, 0.78);
+    text-shadow: 0 1px 5px rgba(0, 0, 0, 0.72);
 }}
 
 button.neon-page-dot {{
     background-image: none;
-    background-color: rgba(255, 255, 255, 0.34);
+    background-color: rgba(255, 255, 255, 0.36);
     border: none;
     box-shadow: none;
     border-radius: 999px;
     min-width: 8px;
     min-height: 8px;
     padding: 0;
-    transition: background-color 180ms ease, min-width 180ms ease, transform 180ms ease;
+    transition: background-color 180ms ease, transform 180ms ease;
 }}
 
 button.neon-page-dot:hover {{
     background-color: rgba(255, 255, 255, 0.72);
-    transform: scale(1.15);
+    transform: scale(1.20);
 }}
 
 button.neon-page-dot.active {{
     background-color: #FFFFFF;
-    min-width: 22px;
+    min-width: 8px;
     min-height: 8px;
+    transform: scale(1.12);
 }}
 
 button.neon-workspace-card {{
@@ -789,6 +1179,140 @@ button.neon-close-button {{
 button.neon-close-button:hover {{
     background-color: rgba(239, 68, 68, 0.88);
     color: #FFFFFF;
+}}
+
+/* ===================== WORKSPACES & DESKTOPS PANEL (TOP BAR NEON BUTTON) ===================== */
+
+.neon-ws-panel-surface {{
+    background-color: {cc_glass_bg};
+    background-image: {cc_glass_grad};
+    border: 1px solid {cc_glass_border};
+    border-radius: 26px;
+    padding: 16px 18px 18px 18px;
+    box-shadow: {cc_glass_shadow};
+    color: {fg_primary};
+    min-width: 460px;
+    transition: opacity 220ms cubic-bezier(0.22, 1.0, 0.36, 1.0),
+                transform 260ms cubic-bezier(0.22, 1.0, 0.36, 1.0);
+}}
+
+.neon-ws-panel-surface.ws-closed {{
+    opacity: 0;
+    transform: translateY(-16px) scale(0.93);
+}}
+
+.neon-ws-panel-surface.ws-open {{
+    opacity: 1;
+    transform: translateY(0px) scale(1.0);
+}}
+
+.neon-ws-panel-title {{
+    color: {fg_primary};
+    font-size: 15px;
+    font-weight: 700;
+}}
+
+button.neon-ws-add-btn {{
+    background-image: none;
+    background-color: {accent};
+    color: #FFFFFF;
+    border: none;
+    box-shadow: 0 4px 14px alpha({accent}, 0.36);
+    border-radius: 999px;
+    padding: 6px 14px;
+    font-size: 12px;
+    font-weight: 700;
+    transition: transform 140ms ease, opacity 140ms ease;
+}}
+
+button.neon-ws-add-btn:hover {{
+    transform: scale(1.03);
+}}
+
+button.neon-ws-add-btn:active {{
+    transform: scale(0.96);
+}}
+
+button.neon-ws-add-btn:disabled {{
+    opacity: 0.42;
+}}
+
+.neon-ws-desktop-card {{
+    background-color: {cc_badge_idle};
+    border: 1px solid {border_subtle};
+    border-radius: 16px;
+    padding: 10px 12px;
+    transition: background-color 160ms ease, border-color 160ms ease, transform 150ms cubic-bezier(0.22, 1.0, 0.36, 1.0);
+}}
+
+.neon-ws-desktop-card:hover {{
+    background-color: {cc_glass_hover};
+    border-color: {cc_glass_border};
+    transform: translateY(-2px);
+}}
+
+.neon-ws-desktop-card.active {{
+    background-color: alpha({accent}, 0.24);
+    border-color: {accent};
+    box-shadow: 0 4px 14px alpha({accent}, 0.25);
+}}
+
+button.neon-ws-plus-card {{
+    background-image: none;
+    background-color: transparent;
+    border: 1px dashed {cc_glass_border};
+    box-shadow: none;
+    border-radius: 16px;
+    padding: 10px 12px;
+    color: {fg_primary};
+    transition: background-color 160ms ease, border-color 160ms ease, transform 150ms ease;
+}}
+
+button.neon-ws-plus-card:hover {{
+    background-color: {cc_badge_idle};
+    border-color: {accent};
+    transform: translateY(-2px);
+}}
+
+button.neon-ws-remove-btn {{
+    background-image: none;
+    background-color: transparent;
+    color: {fg_muted};
+    border: none;
+    box-shadow: none;
+    border-radius: 999px;
+    min-width: 20px;
+    min-height: 20px;
+    padding: 0;
+    font-size: 13px;
+    font-weight: 700;
+    transition: background-color 140ms ease, color 140ms ease;
+}}
+
+button.neon-ws-remove-btn:hover {{
+    background-color: rgba(239, 68, 68, 0.85);
+    color: #FFFFFF;
+}}
+
+.neon-ws-window-card {{
+    background-color: {cc_badge_idle};
+    border: 1px solid {border_subtle};
+    border-radius: 16px;
+    padding: 10px 12px;
+    color: {fg_primary};
+}}
+
+.neon-ws-window-card.focused {{
+    border-color: {accent};
+}}
+
+.neon-ws-badge {{
+    background-color: alpha({accent}, 0.22);
+    color: {fg_primary};
+    border-radius: 6px;
+    padding: 1px 6px;
+    font-size: 10px;
+    font-weight: 700;
 }}
 
 /* ===================== NOTIFICATION TOASTS ===================== */
@@ -857,6 +1381,66 @@ button.neon-shot-shutter {{
 button.neon-shot-shutter:hover {{
     background-color: #E2E8F0;
     transform: scale(1.05);
+}}
+
+/* ===================== MACOS RIGHT-CLICK CONTEXT MENU ===================== */
+
+.neon-ctx-menu {{
+    background-color: {popover_bg};
+    border: 1px solid {border_glass};
+    border-radius: 14px;
+    padding: 6px;
+    box-shadow: 0 18px 42px rgba(0, 0, 0, 0.48), {specular_inset};
+    color: {fg_primary};
+}}
+
+button.neon-ctx-item {{
+    background-image: none;
+    background-color: transparent;
+    color: {fg_primary};
+    border: none;
+    box-shadow: none;
+    border-radius: 8px;
+    padding: 6px 10px;
+    min-height: 24px;
+    font-size: 13px;
+    font-weight: 500;
+    transition: background-color 90ms ease, color 90ms ease;
+}}
+
+button.neon-ctx-item:hover {{
+    background-color: {accent};
+    color: #FFFFFF;
+}}
+
+button.neon-ctx-item:hover .neon-ctx-shortcut {{
+    color: rgba(255, 255, 255, 0.82);
+}}
+
+button.neon-ctx-item.destructive {{
+    color: #F87171;
+}}
+
+button.neon-ctx-item.destructive:hover {{
+    background-color: #EF4444;
+    color: #FFFFFF;
+}}
+
+.neon-ctx-icon {{
+    opacity: 0.90;
+}}
+
+.neon-ctx-shortcut {{
+    color: {fg_muted};
+    font-size: 11px;
+    font-weight: 500;
+    margin-left: 14px;
+}}
+
+.neon-ctx-sep {{
+    background-color: {border_subtle};
+    min-height: 1px;
+    margin: 4px 8px;
 }}
 "#
     )

@@ -154,3 +154,105 @@ pub fn set_device_connected(object_path: &str, connect: bool) -> Result<(), Stri
     debug!(object_path, connect, "Updated BlueZ device connection");
     Ok(())
 }
+
+/// Lists ALL BlueZ devices (paired, connected, and newly discovered nearby devices).
+pub fn list_all_bluetooth_devices() -> Vec<BluetoothDevice> {
+    let Ok(conn) = Connection::system() else {
+        return Vec::new();
+    };
+    let Ok(mgr) = Proxy::new(&conn, BLUEZ_DEST, "/", OBJ_MANAGER_IFACE) else {
+        return Vec::new();
+    };
+    let Ok(objects) = mgr.call::<_, _, ManagedObjects>("GetManagedObjects", &()) else {
+        return Vec::new();
+    };
+    let mut devices = Vec::new();
+    for (path, ifaces) in &objects {
+        let Some(dev) = ifaces.get(DEVICE_IFACE) else {
+            continue;
+        };
+        let paired = dev
+            .get("Paired")
+            .and_then(|v| bool::try_from(v).ok())
+            .unwrap_or(false);
+        let connected = dev
+            .get("Connected")
+            .and_then(|v| bool::try_from(v).ok())
+            .unwrap_or(false);
+        let address = dev
+            .get("Address")
+            .and_then(|v| String::try_from(v.clone()).ok())
+            .unwrap_or_default();
+        let name = dev
+            .get("Alias")
+            .or_else(|| dev.get("Name"))
+            .and_then(|v| String::try_from(v.clone()).ok())
+            .unwrap_or_else(|| address.clone());
+        let icon = dev
+            .get("Icon")
+            .and_then(|v| String::try_from(v.clone()).ok());
+        devices.push(BluetoothDevice {
+            object_path: path.as_str().to_string(),
+            name,
+            address,
+            paired,
+            connected,
+            icon,
+        });
+    }
+    devices.sort_by(|a, b| {
+        b.connected
+            .cmp(&a.connected)
+            .then_with(|| b.paired.cmp(&a.paired))
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
+    devices
+}
+
+/// Starts or stops BlueZ nearby device discovery on the primary adapter.
+pub fn set_bluetooth_discovery(enable: bool) -> Result<(), String> {
+    let conn = Connection::system().map_err(|e| format!("system D-Bus unavailable: {e}"))?;
+    let current = query_bluetooth_with_connection(&conn);
+    let adapter_path = current
+        .adapter_path
+        .ok_or_else(|| "no Bluetooth adapter detected".to_string())?;
+    let adapter = Proxy::new(&conn, BLUEZ_DEST, adapter_path.as_str(), ADAPTER_IFACE)
+        .map_err(|e| format!("BlueZ adapter proxy failed: {e}"))?;
+    let method = if enable {
+        "StartDiscovery"
+    } else {
+        "StopDiscovery"
+    };
+    adapter
+        .call::<_, _, ()>(method, &())
+        .map_err(|e| format!("BlueZ {method} failed: {e}"))?;
+    Ok(())
+}
+
+/// Pairs a discovered Bluetooth device via BlueZ D-Bus.
+pub fn pair_device(object_path: &str) -> Result<(), String> {
+    let conn = Connection::system().map_err(|e| format!("system D-Bus unavailable: {e}"))?;
+    let device = Proxy::new(&conn, BLUEZ_DEST, object_path, DEVICE_IFACE)
+        .map_err(|e| format!("BlueZ device proxy failed: {e}"))?;
+    device
+        .call::<_, _, ()>("Pair", &())
+        .map_err(|e| format!("BlueZ Pair failed: {e}"))?;
+    Ok(())
+}
+
+/// Removes a paired Bluetooth device from the primary BlueZ adapter.
+pub fn remove_device(object_path: &str) -> Result<(), String> {
+    let conn = Connection::system().map_err(|e| format!("system D-Bus unavailable: {e}"))?;
+    let current = query_bluetooth_with_connection(&conn);
+    let adapter_path = current
+        .adapter_path
+        .ok_or_else(|| "no Bluetooth adapter detected".to_string())?;
+    let adapter = Proxy::new(&conn, BLUEZ_DEST, adapter_path.as_str(), ADAPTER_IFACE)
+        .map_err(|e| format!("BlueZ adapter proxy failed: {e}"))?;
+    let dev_path = OwnedObjectPath::try_from(object_path.to_string())
+        .map_err(|e| format!("invalid device path: {e}"))?;
+    adapter
+        .call::<_, _, ()>("RemoveDevice", &(dev_path,))
+        .map_err(|e| format!("BlueZ RemoveDevice failed: {e}"))?;
+    Ok(())
+}

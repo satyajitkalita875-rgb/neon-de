@@ -32,6 +32,20 @@ pub enum SceneLayer {
     Cursor = 7,
 }
 
+/// Standard logical height (in px) of NEON DE's macOS server-side window titlebar.
+pub const MACOS_TITLEBAR_HEIGHT: i32 = 28;
+
+/// Visual parameters for a macOS-style server-side titlebar with traffic-light buttons.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TitlebarStyle {
+    pub height: i32,
+    pub corner_radius: f32,
+    pub focused: bool,
+    pub light_theme: bool,
+    /// `true` when the pointer hovers over the traffic-light button cluster (reveals ×, −, + glyphs).
+    pub hover_controls: bool,
+}
+
 /// Visual drop-shadow parameters attached to a floating window node.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ShadowStyle {
@@ -109,35 +123,56 @@ pub struct SceneNode {
     pub visible: bool,
     pub opacity: f32,
     pub offset: (f64, f64),
+    pub scale: (f64, f64),
     pub clip: Option<Rect>,
     pub shadow: Option<ShadowStyle>,
     pub border: Option<BorderStyle>,
+    pub titlebar: Option<TitlebarStyle>,
     pub content: NodeContent,
 }
 
 impl SceneNode {
-    /// Computes the animated logical bounding box (bounds shifted by animation offset).
-    pub fn effective_bounds(&self) -> Rect {
-        Rect::new(
-            Point::new(
-                self.bounds.loc.x + self.offset.0.round() as i32,
-                self.bounds.loc.y + self.offset.1.round() as i32,
-            ),
-            self.bounds.size,
+    /// Returns the animated logical center point of this node (`bounds.center + offset`).
+    pub fn effective_center(&self) -> (f64, f64) {
+        (
+            self.bounds.loc.x as f64 + self.offset.0 + self.bounds.size.w as f64 * 0.5,
+            self.bounds.loc.y as f64 + self.offset.1 + self.bounds.size.h as f64 * 0.5,
         )
     }
 
-    /// Computes the outer damage envelope including shadow spread and border thickness.
+    /// Computes the animated logical bounding box (bounds shifted by offset and scaled around center).
+    pub fn effective_bounds(&self) -> Rect {
+        let (sx, sy) = self.scale;
+        if (sx - 1.0).abs() <= 0.001 && (sy - 1.0).abs() <= 0.001 {
+            return Rect::new(
+                Point::new(
+                    self.bounds.loc.x + self.offset.0.round() as i32,
+                    self.bounds.loc.y + self.offset.1.round() as i32,
+                ),
+                self.bounds.size,
+            );
+        }
+        let (cx, cy) = self.effective_center();
+        let w = (self.bounds.size.w as f64 * sx).round().max(1.0) as i32;
+        let h = (self.bounds.size.h as f64 * sy).round().max(1.0) as i32;
+        Rect::new(
+            Point::new((cx - w as f64 * 0.5).round() as i32, (cy - h as f64 * 0.5).round() as i32),
+            Size::new(w, h),
+        )
+    }
+
+    /// Computes the outer damage envelope including shadow spread, border thickness, and SSD titlebar.
     pub fn damage_bounds(&self) -> Rect {
         let base = self.effective_bounds();
+        let tb_h = self.titlebar.map(|t| t.height).unwrap_or(0);
         let pad = self
             .shadow
             .map(|s| (s.spread.ceil() as i32) + (s.offset_y.abs().ceil() as i32) + 4)
             .unwrap_or(0)
             .max(self.border.map(|b| b.width.ceil() as i32 + 2).unwrap_or(0));
         Rect::new(
-            Point::new(base.loc.x - pad, base.loc.y - pad),
-            Size::new(base.size.w + pad * 2, base.size.h + pad * 2),
+            Point::new(base.loc.x - pad, base.loc.y - tb_h - pad),
+            Size::new(base.size.w + pad * 2, base.size.h + tb_h + pad * 2),
         )
     }
 }
@@ -215,9 +250,11 @@ impl SceneGraph {
                 visible: true,
                 opacity: 1.0,
                 offset: (0.0, 0.0),
+                scale: (1.0, 1.0),
                 clip: None,
                 shadow: None,
                 border: None,
+                titlebar: None,
                 content,
             },
         );
@@ -237,12 +274,18 @@ impl SceneGraph {
         visible: bool,
         opacity: f32,
         offset: (f64, f64),
+        scale: (f64, f64),
         focused: bool,
         focus_progress: f32,
         fullscreen: bool,
         shadow: Option<ShadowStyle>,
         border: Option<BorderStyle>,
     ) -> NodeId {
+        let existing_titlebar = self
+            .window_nodes
+            .get(&window_id)
+            .and_then(|nid| self.nodes.get(nid))
+            .and_then(|n| n.titlebar);
         let new_node = |id| SceneNode {
             id,
             layer: SceneLayer::Windows,
@@ -251,9 +294,11 @@ impl SceneGraph {
             visible,
             opacity: opacity.clamp(0.0, 1.0),
             offset,
+            scale: (scale.0.clamp(0.05, 4.0), scale.1.clamp(0.05, 4.0)),
             clip: None,
             shadow: if fullscreen { None } else { shadow },
             border: if fullscreen { None } else { border },
+            titlebar: if fullscreen { None } else { existing_titlebar },
             content: NodeContent::Window {
                 window_id,
                 focused,
@@ -285,6 +330,26 @@ impl SceneGraph {
         self.dirty = true;
         self.dirty_regions.push(dmg);
         id
+    }
+
+    /// Updates the optional macOS server-side titlebar for an existing managed window node.
+    pub fn set_window_titlebar(&mut self, window_id: WindowId, titlebar: Option<TitlebarStyle>) {
+        if let Some(&id) = self.window_nodes.get(&window_id)
+            && let Some(node) = self.nodes.get_mut(&id)
+        {
+            let target = match &node.content {
+                NodeContent::Window { fullscreen: true, .. } => None,
+                _ => titlebar,
+            };
+            if node.titlebar != target {
+                let old_dmg = node.damage_bounds();
+                node.titlebar = target;
+                let new_dmg = node.damage_bounds();
+                self.dirty = true;
+                self.dirty_regions.push(old_dmg);
+                self.dirty_regions.push(new_dmg);
+            }
+        }
     }
 
     /// Removes the retained node for a destroyed or unmapped window.
@@ -366,6 +431,7 @@ mod tests {
             true,
             1.0,
             (0.0, 0.0),
+            (1.0, 1.0),
             false,
             0.0,
             false,
@@ -379,6 +445,7 @@ mod tests {
             true,
             1.0,
             (0.0, 0.0),
+            (1.0, 1.0),
             true,
             1.0,
             false,
@@ -393,9 +460,11 @@ mod tests {
             visible: true,
             opacity: 1.0,
             offset: (0.0, 0.0),
+            scale: (1.0, 1.0),
             clip: None,
             shadow: None,
             border: None,
+            titlebar: None,
             content: NodeContent::SolidRect {
                 color: [0.1, 0.1, 0.1, 0.9],
             },
@@ -430,6 +499,7 @@ mod tests {
             true,
             1.0,
             (0.0, 0.0),
+            (1.0, 1.0),
             true,
             1.0,
             true,
