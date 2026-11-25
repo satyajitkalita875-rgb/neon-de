@@ -1,133 +1,133 @@
-//! NEON DE Liquid Glass Control Center (`zwlr_layer_shell_v1` `Layer::Overlay`).
+//! NEON DE Frosted-Glass Quick Settings Panel (`zwlr_layer_shell_v1` `Layer::Overlay`).
 //!
-//! Built on a strict 4-column floating Liquid Glass grid (`CELL = 68px`, `GAP = 12px`, `FULL = 308px`)
-//! with no heavy outer box, smooth spring open/close animations synchronized to GTK's frame clock,
-//! and a transparent fullscreen click-catcher backdrop so clicking anywhere outside immediately
-//! dismisses Control Center.
+//! Architecture:
+//! - Uses a dedicated tight-fitting `"neon-quick-settings"` layer surface anchored Top+Right
+//!   so `neon-renderer` renders a true real-time GPU Gaussian-blurred desktop backdrop strictly
+//!   inside Quick Settings' exact rounded bounds (auto-resizing when dropdowns expand!).
+//! - Paired with a transparent `"neon-quick-settings-backdrop"` click-catcher so clicking
+//!   anywhere outside or pressing `Esc` dismisses Quick Settings cleanly.
+//! - Clean, zero-clutter layout:
+//!   1. Header: Battery indicator (left) + Power Menu trigger (right -> fullscreen centered Power Menu)
+//!   2. Equal-length Wi-Fi & Bluetooth split pills with live expandable nearby networks / devices dropdowns
+//!   3. Unified pixel-aligned Display Brightness & Sound Volume slider stack
+//!   4. 3-button Power Mode segmented bar (`Power Saver | Balanced | Performance`)
+//!   5. Equal-length `Dark Mode` toggle + `Screenshot` trigger
+//!   6. Dynamic Notifications card (hidden when empty)
 
 use std::{
     cell::{Cell, RefCell},
-    f64::consts::PI,
-    path::Path,
     rc::Rc,
-    sync::Arc,
+    sync::{Arc, mpsc},
     time::Duration,
 };
 
 use gtk4::{
-    Align, Application, ApplicationWindow, Box as GtkBox, Button, ContentFit, DrawingArea,
-    EventControllerKey, GestureClick, Image, Label, Orientation, Overflow, Picture, Scale,
-    ScrolledWindow, gdk, glib, prelude::*,
+    Align, Application, ApplicationWindow, Box as GtkBox, Button, EventControllerKey, GestureClick,
+    Image, Label, Orientation, PasswordEntry, Revealer, RevealerTransitionType, Scale,
+    ScrolledWindow, Separator, gdk, glib, prelude::*,
 };
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 use neon_ipc::{AppearanceInfo, IpcRequest};
 use neon_system::{
-    SystemAction, SystemActionSender, SystemSnapshot, notifications::NotificationStore,
-    power::read_backlight_percent,
+    SystemAction, SystemActionSender, SystemSnapshot,
+    bluetooth::{BluetoothDevice, list_all_bluetooth_devices, pair_device, set_bluetooth_discovery, set_device_connected},
+    network::{WifiAccessPoint, connect_wifi, list_wifi_networks},
+    notifications::NotificationStore,
+    power::{BatteryState, read_backlight_percent},
 };
 
 use crate::{
     ipc_bridge::IpcCommandSender,
     notifications::NotificationOverlay,
-    panel::{launch_sibling_binary, launch_sibling_binary_with_args},
-    wallpaper::load_scaled_texture,
+    power_menu::PowerMenuOverlay,
 };
 
-const CC_CELL: i32 = 70;
-const CC_GAP: i32 = 12;
-const CC_HALF: i32 = CC_CELL * 2 + CC_GAP; // 152px
-const CC_FULL: i32 = CC_CELL * 4 + CC_GAP * 3; // 316px
+const QS_WIDTH: i32 = 348;
 
 type StateChangeCallback = Rc<RefCell<Option<Box<dyn Fn(bool)>>>>;
 
-/// Live floating Liquid Glass Control Center anchored under the top-right status cluster.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActiveDropdown {
+    None,
+    Wifi,
+    Bluetooth,
+}
+
+enum DropdownBgEvent {
+    WifiList(Vec<WifiAccessPoint>),
+    WifiConnectResult {
+        ssid: String,
+        secured: bool,
+        res: Result<(), String>,
+    },
+    BtList(Vec<BluetoothDevice>),
+    BtActionResult {
+        name: String,
+        res: Result<(), String>,
+    },
+}
+
+/// Live frosted-glass Quick Settings panel anchored beneath the top-right status cluster.
 #[derive(Clone)]
 pub struct QuickSettingsPanel {
+    backdrop_window: ApplicationWindow,
     window: ApplicationWindow,
-    cc_surface: GtkBox,
+    ipc: IpcCommandSender,
     is_open: Rc<Cell<bool>>,
     anim_gen: Rc<Cell<u64>>,
     on_state_change: StateChangeCallback,
     syncing: Rc<Cell<bool>>,
-    // Row 1–2 Left: Connectivity cluster
-    wifi_btn: Button,
+    // Header
+    header_battery_box: GtkBox,
+    header_battery_icon: Image,
+    header_battery_lbl: Label,
+    header_title_lbl: Label,
+    // Row 1: Equal-length Wi-Fi & Bluetooth split pills
+    wifi_pill: GtkBox,
+    wifi_main_btn: Button,
     wifi_sub: Label,
+    wifi_arrow_icon: Image,
     wifi_enabled_state: Rc<Cell<bool>>,
-    bt_btn: Button,
+    bt_pill: GtkBox,
+    bt_main_btn: Button,
+    bt_sub: Label,
+    bt_arrow_icon: Image,
     bt_powered_state: Rc<Cell<bool>>,
-    net_share_btn: Button,
-    // Row 1–2 Right: MPRIS Now Playing (2×2)
-    media_bus: Rc<RefCell<Option<String>>>,
-    media_art_path: Rc<RefCell<Option<String>>>,
-    media_art_pic: Picture,
-    media_art_fallback: GtkBox,
-    media_title: Label,
-    media_artist: Label,
-    media_prev_btn: Button,
-    media_play_btn: Button,
-    media_play_icon: Image,
-    media_next_btn: Button,
-    // Row 3: Focus + Overview + Displays
-    dnd_btn: Button,
-    dnd_sub: Label,
-    // Row 4: Display Brightness
+    // Expandable dropdown drawer (Material 3 Expressive Revealer + spring card)
+    active_dropdown: Rc<Cell<ActiveDropdown>>,
+    dropdown_revealer: Revealer,
+    dropdown_box: GtkBox,
+    dropdown_title: Label,
+    dropdown_status: Label,
+    dropdown_list_box: GtkBox,
+    wifi_pw_revealer: Revealer,
+    wifi_pw_entry: PasswordEntry,
+    wifi_pw_ssid: Rc<RefCell<Option<String>>>,
+    bg_tx: mpsc::Sender<DropdownBgEvent>,
+    // Row 2: Unified Display & Sound stack
     brightness_card: GtkBox,
+    sliders_divider: Separator,
     brightness_pct_label: Label,
     brightness_scale: Scale,
-    // Row 5: Sound
     audio_card: GtkBox,
     vol_pct_label: Label,
     volume_scale: Scale,
     mute_btn: Button,
     mute_icon: Image,
-    // Row 6: 4 Utility Circles (Theme, Lock, Power Mode, Screenshot)
-    theme_btn: Button,
-    theme_icon_area: DrawingArea,
+    // Row 3: 3-button Power Mode segmented bar
+    pm_saver_btn: Button,
+    pm_balanced_btn: Button,
+    pm_perf_btn: Button,
+    // Row 4: Dark Mode + Screenshot
+    dark_mode_btn: Button,
+    dark_mode_icon: Image,
     is_light_theme: Rc<Cell<bool>>,
-    power_mode_btn: Button,
-    power_mode_icon: Image,
-    active_power_profile: Rc<RefCell<String>>,
-    // Row 7: Power confirmation
-    power_confirm_card: GtkBox,
-    pending_power_action: Rc<RefCell<Option<PendingPowerAction>>>,
     // Optional Notifications (auto-hidden when empty)
     notif_card: GtkBox,
     notif_list_box: GtkBox,
     store: Arc<NotificationStore>,
     sys_tx: SystemActionSender,
     toast_overlay: NotificationOverlay,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PendingPowerAction {
-    Suspend,
-    LogOut,
-    Restart,
-    ShutDown,
-}
-
-impl PendingPowerAction {
-    fn prompt(self) -> &'static str {
-        match self {
-            Self::Suspend => "Suspend computer now?",
-            Self::LogOut => "Log out of NEON DE?",
-            Self::Restart => "Restart computer now?",
-            Self::ShutDown => "Shut down computer now?",
-        }
-    }
-
-    fn confirm_label(self) -> &'static str {
-        match self {
-            Self::Suspend => "Suspend",
-            Self::LogOut => "Log Out",
-            Self::Restart => "Restart",
-            Self::ShutDown => "Shut Down",
-        }
-    }
-
-    fn is_destructive(self) -> bool {
-        matches!(self, Self::Restart | Self::ShutDown)
-    }
 }
 
 impl QuickSettingsPanel {
@@ -137,23 +137,50 @@ impl QuickSettingsPanel {
         sys_tx: SystemActionSender,
         store: Arc<NotificationStore>,
         toast_overlay: NotificationOverlay,
+        power_menu: PowerMenuOverlay,
     ) -> Self {
-        // Fullscreen transparent overlay window so clicks anywhere outside immediately close Control Center.
-        let window = ApplicationWindow::builder()
+        // 1. Fullscreen transparent click-catcher backdrop
+        let backdrop_window = ApplicationWindow::builder()
             .application(app)
-            .title("NEON DE Control Center")
+            .title("NEON DE Quick Settings Backdrop")
             .decorated(false)
             .build();
-        window.add_css_class("neon-quicksettings-window");
+        backdrop_window.add_css_class("neon-quicksettings-window");
+        if gtk4_layer_shell::is_supported() {
+            backdrop_window.init_layer_shell();
+            backdrop_window.set_namespace(Some("neon-quick-settings-backdrop"));
+            backdrop_window.set_layer(Layer::Overlay);
+            backdrop_window.set_anchor(Edge::Top, true);
+            backdrop_window.set_anchor(Edge::Bottom, true);
+            backdrop_window.set_anchor(Edge::Left, true);
+            backdrop_window.set_anchor(Edge::Right, true);
+            backdrop_window.set_exclusive_zone(-1);
+            backdrop_window.set_keyboard_mode(KeyboardMode::None);
+        }
+        let backdrop_box = GtkBox::new(Orientation::Vertical, 0);
+        backdrop_box.add_css_class("neon-cc-backdrop");
+        backdrop_box.set_hexpand(true);
+        backdrop_box.set_vexpand(true);
+        backdrop_window.set_child(Some(&backdrop_box));
+        backdrop_window.set_visible(false);
 
+        // 2. Tight-fitting Quick Settings surface anchored Top+Right so neon-renderer blurs
+        //    its exact rounded rectangle in real time (even as dropdowns expand/collapse!).
+        let window = ApplicationWindow::builder()
+            .application(app)
+            .title("NEON DE Quick Settings")
+            .decorated(false)
+            .resizable(false)
+            .build();
+        window.add_css_class("neon-quicksettings-window");
         if gtk4_layer_shell::is_supported() {
             window.init_layer_shell();
             window.set_namespace(Some("neon-quick-settings"));
             window.set_layer(Layer::Overlay);
             window.set_anchor(Edge::Top, true);
-            window.set_anchor(Edge::Bottom, true);
-            window.set_anchor(Edge::Left, true);
             window.set_anchor(Edge::Right, true);
+            window.set_margin(Edge::Top, 38);
+            window.set_margin(Edge::Right, 12);
             window.set_exclusive_zone(-1);
             window.set_keyboard_mode(KeyboardMode::None);
         }
@@ -165,222 +192,166 @@ impl QuickSettingsPanel {
         let is_open = Rc::new(Cell::new(false));
         let anim_gen = Rc::new(Cell::new(0u64));
         let on_state_change: StateChangeCallback = Rc::new(RefCell::new(None));
-        let media_bus: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
-        let media_art_path: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
-        let active_power_profile = Rc::new(RefCell::new("balanced".to_string()));
+        let active_dropdown = Rc::new(Cell::new(ActiveDropdown::None));
+        let wifi_pw_ssid: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+        let (bg_tx, bg_rx) = mpsc::channel::<DropdownBgEvent>();
 
-        // Transparent fullscreen click-catcher backdrop
-        let backdrop = GtkBox::new(Orientation::Vertical, 0);
-        backdrop.add_css_class("neon-cc-backdrop");
-        backdrop.set_hexpand(true);
-        backdrop.set_vexpand(true);
-
-        // Animated floating Control Center container anchored top-right below the menu bar
-        let cc_surface = GtkBox::new(Orientation::Vertical, CC_GAP);
-        cc_surface.add_css_class("neon-cc-surface");
-        cc_surface.add_css_class("cc-closed");
-        cc_surface.set_halign(Align::End);
-        cc_surface.set_valign(Align::Start);
-        cc_surface.set_hexpand(true);
-        cc_surface.set_vexpand(false);
-        cc_surface.set_margin_top(38);
-        cc_surface.set_margin_end(12);
-        cc_surface.set_size_request(CC_FULL, -1);
+        // Unified frosted-glass container card (open/close Material 3 Expressive spring is
+        // driven at locked 60 FPS on the GPU by `neon-renderer` with zero GTK buffer reallocation).
+        let card = GtkBox::new(Orientation::Vertical, 12);
+        card.add_css_class("neon-qs-panel-card");
+        card.set_size_request(QS_WIDTH, -1);
 
         // =========================================================================
-        // ROWS 1–2: Top 2×2 Block (Left: Wi-Fi pill + BT/Network circles | Right: Now Playing 2×2)
+        // HEADER: Battery Status (left) + Power Menu Button (right)
         // =========================================================================
-        let top_block = GtkBox::new(Orientation::Horizontal, CC_GAP);
-        top_block.set_size_request(CC_FULL, CC_HALF);
-        top_block.set_halign(Align::Center);
+        let header_row = GtkBox::new(Orientation::Horizontal, 8);
+        header_row.set_valign(Align::Center);
 
-        // Left half (148 × 148): Wi-Fi 2×1 stadium pill on top + two 68×68 circles below
-        let left_half = GtkBox::new(Orientation::Vertical, CC_GAP);
-        left_half.set_size_request(CC_HALF, CC_HALF);
+        let header_battery_box = GtkBox::new(Orientation::Horizontal, 6);
+        header_battery_box.add_css_class("neon-qs-status-pill");
+        header_battery_box.set_valign(Align::Center);
+        let header_battery_icon = Image::from_icon_name("battery-full-symbolic");
+        header_battery_icon.set_pixel_size(15);
+        let header_battery_lbl = Label::new(Some("100%"));
+        header_battery_lbl.add_css_class("neon-cc-title");
+        header_battery_box.append(&header_battery_icon);
+        header_battery_box.append(&header_battery_lbl);
 
-        let (wifi_btn, wifi_sub) = build_stadium_pill(
-            "network-wireless-symbolic",
-            "Wi-Fi",
-            Some("Checking..."),
-            true,
-        );
+        let header_title_lbl = Label::new(Some("Quick Settings"));
+        header_title_lbl.add_css_class("neon-cc-title");
+        header_title_lbl.set_visible(false);
+
+        let header_spacer = GtkBox::new(Orientation::Horizontal, 0);
+        header_spacer.set_hexpand(true);
+
+        let power_menu_btn = Button::new();
+        power_menu_btn.add_css_class("neon-qs-header-power-btn");
+        power_menu_btn.set_tooltip_text(Some("Power Menu"));
+        let pm_btn_inner = GtkBox::new(Orientation::Horizontal, 6);
+        pm_btn_inner.set_valign(Align::Center);
+        let pm_btn_icon = Image::from_icon_name("system-shutdown-symbolic");
+        pm_btn_icon.set_pixel_size(15);
+        let pm_btn_lbl = Label::new(Some("Power"));
+        pm_btn_lbl.add_css_class("neon-qs-header-btn-lbl");
+        pm_btn_inner.append(&pm_btn_icon);
+        pm_btn_inner.append(&pm_btn_lbl);
+        power_menu_btn.set_child(Some(&pm_btn_inner));
+
+        header_row.append(&header_battery_box);
+        header_row.append(&header_title_lbl);
+        header_row.append(&header_spacer);
+        header_row.append(&power_menu_btn);
+        card.append(&header_row);
+
+        // =========================================================================
+        // ROW 1: Equal-Length Wi-Fi & Bluetooth Split Pills with Dropdown Arrows
+        // =========================================================================
+        let conn_row = GtkBox::new(Orientation::Horizontal, 10);
+        conn_row.set_homogeneous(true);
+        conn_row.set_hexpand(true);
+
+        let (wifi_pill, wifi_main_btn, wifi_sub, wifi_arrow_btn, wifi_arrow_icon) =
+            build_split_connectivity_pill("network-wireless-symbolic", "Wi-Fi", "Checking…");
         {
-            let sys_tx = sys_tx.clone();
+            let sys_tx_w = sys_tx.clone();
             let wifi_state = Rc::clone(&wifi_enabled_state);
-            wifi_btn.connect_clicked(move |_| {
-                sys_tx.send(SystemAction::SetWifiEnabled(!wifi_state.get()));
+            wifi_main_btn.connect_clicked(move |_| {
+                sys_tx_w.send(SystemAction::SetWifiEnabled(!wifi_state.get()));
             });
         }
 
-        let circle_pair = GtkBox::new(Orientation::Horizontal, CC_GAP);
-        circle_pair.set_size_request(CC_HALF, CC_CELL);
-
-        let (bt_btn, _) = build_circle_icon_button("bluetooth-active-symbolic", 24, "Bluetooth");
+        let (bt_pill, bt_main_btn, bt_sub, bt_arrow_btn, bt_arrow_icon) =
+            build_split_connectivity_pill("bluetooth-active-symbolic", "Bluetooth", "Checking…");
         {
-            let sys_tx = sys_tx.clone();
+            let sys_tx_b = sys_tx.clone();
             let bt_state = Rc::clone(&bt_powered_state);
-            bt_btn.connect_clicked(move |_| {
-                sys_tx.send(SystemAction::SetBluetoothPowered(!bt_state.get()));
+            bt_main_btn.connect_clicked(move |_| {
+                sys_tx_b.send(SystemAction::SetBluetoothPowered(!bt_state.get()));
             });
         }
 
-        let (net_share_btn, _) = build_circle_icon_button(
-            "network-wireless-hotspot-symbolic",
-            24,
-            "Network & Wi-Fi Settings",
-        );
-
-        circle_pair.append(&bt_btn);
-        circle_pair.append(&net_share_btn);
-
-        left_half.append(&wifi_btn);
-        left_half.append(&circle_pair);
-
-        // Right half (148 × 148): Real MPRIS Now Playing 2×2 Liquid Glass square
-        let media_card = GtkBox::new(Orientation::Vertical, 6);
-        media_card.add_css_class("neon-cc-glass");
-        media_card.add_css_class("neon-cc-media-card");
-        media_card.set_size_request(CC_HALF, CC_HALF);
-
-        let media_art_frame = GtkBox::new(Orientation::Vertical, 0);
-        media_art_frame.add_css_class("neon-cc-media-art");
-        media_art_frame.set_size_request(46, 46);
-        media_art_frame.set_halign(Align::Start);
-        media_art_frame.set_valign(Align::Start);
-        media_art_frame.set_overflow(Overflow::Hidden);
-
-        let media_art_pic = Picture::new();
-        media_art_pic.set_content_fit(ContentFit::Cover);
-        media_art_pic.set_can_shrink(true);
-        media_art_pic.set_size_request(46, 46);
-        media_art_pic.set_visible(false);
-
-        let media_art_fallback = GtkBox::new(Orientation::Horizontal, 0);
-        media_art_fallback.add_css_class("neon-cc-media-art-placeholder");
-        media_art_fallback.set_size_request(46, 46);
-        media_art_fallback.set_halign(Align::Fill);
-        media_art_fallback.set_vexpand(true);
-        let note_icon = Image::from_icon_name("audio-x-generic-symbolic");
-        note_icon.set_pixel_size(22);
-        note_icon.set_hexpand(true);
-        note_icon.set_vexpand(true);
-        note_icon.set_halign(Align::Center);
-        note_icon.set_valign(Align::Center);
-        media_art_fallback.append(&note_icon);
-
-        media_art_frame.append(&media_art_pic);
-        media_art_frame.append(&media_art_fallback);
-
-        let media_text = GtkBox::new(Orientation::Vertical, 1);
-        media_text.set_vexpand(true);
-        media_text.set_valign(Align::Center);
-
-        let media_title = Label::new(Some("Not Playing"));
-        media_title.add_css_class("neon-cc-title");
-        media_title.set_halign(Align::Start);
-        media_title.set_ellipsize(gtk4::pango::EllipsizeMode::End);
-        media_title.set_max_width_chars(12);
-
-        let media_artist = Label::new(Some("No media active"));
-        media_artist.add_css_class("neon-cc-sub");
-        media_artist.set_halign(Align::Start);
-        media_artist.set_ellipsize(gtk4::pango::EllipsizeMode::End);
-        media_artist.set_max_width_chars(14);
-
-        media_text.append(&media_title);
-        media_text.append(&media_artist);
-
-        let media_controls = GtkBox::new(Orientation::Horizontal, 4);
-        media_controls.set_homogeneous(true);
-        media_controls.set_halign(Align::Fill);
-        media_controls.set_valign(Align::End);
-
-        let (media_prev_btn, _) = build_media_transport_btn("media-skip-backward-symbolic", 16, "Previous");
-        let (media_play_btn, media_play_icon) =
-            build_media_transport_btn("media-playback-start-symbolic", 20, "Play / Pause");
-        let (media_next_btn, _) = build_media_transport_btn("media-skip-forward-symbolic", 16, "Next");
-
-        for (btn, method) in [
-            (&media_prev_btn, "Previous"),
-            (&media_play_btn, "PlayPause"),
-            (&media_next_btn, "Next"),
-        ] {
-            let sys_tx = sys_tx.clone();
-            let bus_ref = Rc::clone(&media_bus);
-            let m = method.to_string();
-            btn.connect_clicked(move |_| {
-                sys_tx.send(SystemAction::MediaCommand {
-                    bus_name: bus_ref.borrow().clone(),
-                    method: m.clone(),
-                });
-            });
-        }
-
-        media_controls.append(&media_prev_btn);
-        media_controls.append(&media_play_btn);
-        media_controls.append(&media_next_btn);
-
-        media_card.append(&media_art_frame);
-        media_card.append(&media_text);
-        media_card.append(&media_controls);
-
-        top_block.append(&left_half);
-        top_block.append(&media_card);
-        cc_surface.append(&top_block);
+        conn_row.append(&wifi_pill);
+        conn_row.append(&bt_pill);
+        card.append(&conn_row);
 
         // =========================================================================
-        // ROW 3: Focus 2×1 Pill | Overview Circle | Displays Circle (exact 4-col grid)
+        // EXPANDABLE DROPDOWN DRAWER (Nearby Wi-Fi Networks / Bluetooth Devices)
         // =========================================================================
-        let row3 = GtkBox::new(Orientation::Horizontal, CC_GAP);
-        row3.set_size_request(CC_FULL, CC_CELL);
-        row3.set_halign(Align::Center);
+        let dropdown_revealer = Revealer::new();
+        dropdown_revealer.set_transition_type(RevealerTransitionType::SlideDown);
+        dropdown_revealer.set_transition_duration(210);
+        dropdown_revealer.set_reveal_child(false);
 
-        let (dnd_btn, dnd_sub) =
-            build_stadium_pill("weather-clear-night-symbolic", "Focus", None, false);
-        {
-            let store = Arc::clone(&store);
-            let btn_c = dnd_btn.clone();
-            let sub_c = dnd_sub.clone();
-            dnd_btn.connect_clicked(move |_| {
-                let next = !store.is_do_not_disturb();
-                store.set_do_not_disturb(next);
-                if next {
-                    btn_c.add_css_class("active");
-                    sub_c.set_text("On");
-                    sub_c.set_visible(true);
-                } else {
-                    btn_c.remove_css_class("active");
-                    sub_c.set_text("");
-                    sub_c.set_visible(false);
-                }
-            });
-        }
+        let dropdown_box = GtkBox::new(Orientation::Vertical, 8);
+        dropdown_box.add_css_class("neon-qs-dropdown-card");
+        dropdown_box.add_css_class("dd-closed");
 
-        let (overview_btn, _) = build_circle_icon_button(
-            "sidebar-show-symbolic",
-            24,
-            "Overview & Workspaces",
-        );
-        let (displays_btn, _) = build_circle_icon_button(
-            "video-joined-displays-symbolic",
-            24,
-            "Display Settings",
-        );
+        let dd_head = GtkBox::new(Orientation::Horizontal, 8);
+        dd_head.set_valign(Align::Center);
 
-        row3.append(&dnd_btn);
-        row3.append(&overview_btn);
-        row3.append(&displays_btn);
-        cc_surface.append(&row3);
+        let dropdown_title = Label::new(Some("Wi-Fi Networks"));
+        dropdown_title.add_css_class("neon-cc-title");
+        dropdown_title.set_halign(Align::Start);
+
+        let dropdown_status = Label::new(Some(""));
+        dropdown_status.add_css_class("neon-cc-sub");
+        dropdown_status.set_hexpand(true);
+        dropdown_status.set_halign(Align::End);
+        dropdown_status.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+
+        let dd_refresh_btn = Button::new();
+        dd_refresh_btn.add_css_class("neon-cc-inline-icon-btn");
+        dd_refresh_btn.set_tooltip_text(Some("Rescan"));
+        let refresh_icon = Image::from_icon_name("view-refresh-symbolic");
+        refresh_icon.set_pixel_size(14);
+        dd_refresh_btn.set_child(Some(&refresh_icon));
+
+        dd_head.append(&dropdown_title);
+        dd_head.append(&dropdown_status);
+        dd_head.append(&dd_refresh_btn);
+        dropdown_box.append(&dd_head);
+
+        // Inline Wi-Fi password bar wrapped in a smooth Revealer
+        let wifi_pw_revealer = Revealer::new();
+        wifi_pw_revealer.set_transition_type(RevealerTransitionType::SlideDown);
+        wifi_pw_revealer.set_transition_duration(240);
+        wifi_pw_revealer.set_reveal_child(false);
+
+        let wifi_pw_box = GtkBox::new(Orientation::Horizontal, 6);
+        let wifi_pw_entry = PasswordEntry::new();
+        wifi_pw_entry.add_css_class("neon-qs-pw-entry");
+        wifi_pw_entry.set_hexpand(true);
+        wifi_pw_entry.set_show_peek_icon(true);
+        wifi_pw_entry.set_placeholder_text(Some("Wi-Fi Password"));
+        let wifi_pw_connect_btn = Button::with_label("Connect");
+        wifi_pw_connect_btn.add_css_class("neon-power-confirm-btn");
+        wifi_pw_box.append(&wifi_pw_entry);
+        wifi_pw_box.append(&wifi_pw_connect_btn);
+        wifi_pw_revealer.set_child(Some(&wifi_pw_box));
+        dropdown_box.append(&wifi_pw_revealer);
+
+        let dd_scroller = ScrolledWindow::builder()
+            .max_content_height(192)
+            .propagate_natural_height(true)
+            .hscrollbar_policy(gtk4::PolicyType::Never)
+            .build();
+        let dropdown_list_box = GtkBox::new(Orientation::Vertical, 4);
+        dd_scroller.set_child(Some(&dropdown_list_box));
+        dropdown_box.append(&dd_scroller);
+        dropdown_revealer.set_child(Some(&dropdown_box));
+        card.append(&dropdown_revealer);
 
         // =========================================================================
-        // ROW 4: Display Brightness Liquid Glass Card (sleek white track & round thumb)
+        // ROW 2: Unified Pixel-Aligned Display & Sound Sliders Stack
         // =========================================================================
-        let brightness_card = GtkBox::new(Orientation::Vertical, 6);
-        brightness_card.add_css_class("neon-cc-glass");
-        brightness_card.add_css_class("neon-cc-slider-card");
-        brightness_card.set_size_request(CC_FULL, -1);
+        let sliders_stack = GtkBox::new(Orientation::Vertical, 10);
+        sliders_stack.add_css_class("neon-qs-inner-card");
 
+        // --- Display Brightness ---
+        let brightness_card = GtkBox::new(Orientation::Vertical, 5);
         let bright_head = GtkBox::new(Orientation::Horizontal, 8);
+        bright_head.set_valign(Align::Center);
         let bright_title = Label::new(Some("Display"));
         bright_title.add_css_class("neon-cc-title");
         bright_title.set_hexpand(true);
@@ -395,8 +366,7 @@ impl QuickSettingsPanel {
 
         let bright_row = GtkBox::new(Orientation::Horizontal, 8);
         bright_row.set_valign(Align::Center);
-
-        let dim_sun = centered_slot_icon("display-brightness-symbolic", 14, 22, true);
+        let dim_sun = centered_slot_icon("display-brightness-symbolic", 15, 24, true);
         let brightness_scale = Scale::with_range(Orientation::Horizontal, 5.0, 100.0, 1.0);
         brightness_scale.add_css_class("neon-cc-slider");
         brightness_scale.set_draw_value(false);
@@ -404,20 +374,19 @@ impl QuickSettingsPanel {
         brightness_scale.set_valign(Align::Center);
         brightness_scale.set_value(f64::from(initial_brightness.unwrap_or(100)));
         {
-            let sys_tx = sys_tx.clone();
-            let syncing = Rc::clone(&syncing);
+            let sys_tx_br = sys_tx.clone();
+            let syncing_c = Rc::clone(&syncing);
             let pct_lbl = brightness_pct_label.clone();
             brightness_scale.connect_value_changed(move |s| {
                 let pct = s.value().round() as u32;
                 pct_lbl.set_text(&format!("{pct}%"));
-                if syncing.get() {
+                if syncing_c.get() {
                     return;
                 }
-                sys_tx.send(SystemAction::SetBrightness(pct));
+                sys_tx_br.send(SystemAction::SetBrightness(pct));
             });
         }
-        let max_sun = centered_slot_icon("display-brightness-symbolic", 18, 22, false);
-
+        let max_sun = centered_slot_icon("display-brightness-symbolic", 17, 24, false);
         bright_row.append(&dim_sun);
         bright_row.append(&brightness_scale);
         bright_row.append(&max_sun);
@@ -425,17 +394,15 @@ impl QuickSettingsPanel {
         brightness_card.append(&bright_head);
         brightness_card.append(&bright_row);
         brightness_card.set_visible(initial_brightness.is_some());
-        cc_surface.append(&brightness_card);
 
-        // =========================================================================
-        // ROW 5: Sound Liquid Glass Card (aligned slider + circular Audio Output button)
-        // =========================================================================
-        let audio_card = GtkBox::new(Orientation::Vertical, 6);
-        audio_card.add_css_class("neon-cc-glass");
-        audio_card.add_css_class("neon-cc-slider-card");
-        audio_card.set_size_request(CC_FULL, -1);
+        let sliders_divider = Separator::new(Orientation::Horizontal);
+        sliders_divider.add_css_class("neon-cc-slider-divider");
+        sliders_divider.set_visible(initial_brightness.is_some());
 
+        // --- Sound (exact same 24px icon slots for pixel-perfect slider alignment) ---
+        let audio_card = GtkBox::new(Orientation::Vertical, 5);
         let audio_head = GtkBox::new(Orientation::Horizontal, 8);
+        audio_head.set_valign(Align::Center);
         let sound_title = Label::new(Some("Sound"));
         sound_title.add_css_class("neon-cc-title");
         sound_title.set_hexpand(true);
@@ -455,15 +422,17 @@ impl QuickSettingsPanel {
         mute_icon.set_valign(Align::Center);
         let mute_btn = Button::new();
         mute_btn.add_css_class("neon-cc-inline-icon-btn");
-        mute_btn.set_size_request(22, 22);
+        mute_btn.set_size_request(24, 24);
+        mute_btn.set_hexpand(false);
+        mute_btn.set_vexpand(false);
         mute_btn.set_halign(Align::Center);
         mute_btn.set_valign(Align::Center);
         mute_btn.set_child(Some(&mute_icon));
         mute_btn.set_tooltip_text(Some("Mute / Unmute"));
         {
-            let sys_tx = sys_tx.clone();
+            let sys_tx_m = sys_tx.clone();
             mute_btn.connect_clicked(move |_| {
-                sys_tx.send(SystemAction::ToggleSinkMute);
+                sys_tx_m.send(SystemAction::ToggleSinkMute);
             });
         }
 
@@ -474,240 +443,113 @@ impl QuickSettingsPanel {
         volume_scale.set_valign(Align::Center);
         volume_scale.set_value(70.0);
         {
-            let sys_tx = sys_tx.clone();
-            let syncing = Rc::clone(&syncing);
+            let sys_tx_v = sys_tx.clone();
+            let syncing_c = Rc::clone(&syncing);
             let pct_lbl = vol_pct_label.clone();
             volume_scale.connect_value_changed(move |s| {
                 pct_lbl.set_text(&format!("{:.0}%", s.value()));
-                if syncing.get() {
+                if syncing_c.get() {
                     return;
                 }
                 let vol = (s.value() as f32) / 100.0;
-                sys_tx.send(SystemAction::SetSinkVolume(vol));
+                sys_tx_v.send(SystemAction::SetSinkVolume(vol));
             });
         }
-
-        let max_vol = centered_slot_icon("audio-volume-high-symbolic", 16, 20, false);
-
-        let audio_out_btn = Button::new();
-        audio_out_btn.add_css_class("neon-cc-output-circle");
-        audio_out_btn.set_size_request(28, 28);
-        audio_out_btn.set_halign(Align::Center);
-        audio_out_btn.set_valign(Align::Center);
-        audio_out_btn.set_tooltip_text(Some("Sound Output Devices"));
-        let out_icon = Image::from_icon_name("audio-speakers-symbolic");
-        out_icon.set_pixel_size(14);
-        out_icon.set_halign(Align::Center);
-        out_icon.set_valign(Align::Center);
-        audio_out_btn.set_child(Some(&out_icon));
+        let max_vol = centered_slot_icon("audio-volume-high-symbolic", 16, 24, false);
 
         sound_row.append(&mute_btn);
         sound_row.append(&volume_scale);
         sound_row.append(&max_vol);
-        sound_row.append(&audio_out_btn);
 
         audio_card.append(&audio_head);
         audio_card.append(&sound_row);
-        cc_surface.append(&audio_card);
+
+        sliders_stack.append(&brightness_card);
+        sliders_stack.append(&sliders_divider);
+        sliders_stack.append(&audio_card);
+        card.append(&sliders_stack);
 
         // =========================================================================
-        // ROW 6: 4 Quick Utility Circles (Dark/Light, Lock, Power Profile, Screenshot)
+        // ROW 3: Power Mode — 3-Button Segmented Pill (matching Settings)
         // =========================================================================
-        let row6 = GtkBox::new(Orientation::Horizontal, CC_GAP);
-        row6.set_size_request(CC_FULL, CC_CELL);
-        row6.set_halign(Align::Center);
+        let pm_section = GtkBox::new(Orientation::Vertical, 6);
+        pm_section.add_css_class("neon-qs-inner-card");
 
-        // Circle 1: Crisp Cairo half-circle contrast icon (Light / Dark Mode)
-        let theme_btn = Button::new();
-        theme_btn.add_css_class("neon-cc-circle-btn");
-        theme_btn.set_size_request(CC_CELL, CC_CELL);
-        theme_btn.set_halign(Align::Center);
-        theme_btn.set_valign(Align::Center);
-        theme_btn.set_tooltip_text(Some("Appearance: Dark Mode (Click to switch)"));
+        let pm_hdr = Label::new(Some("Power Mode"));
+        pm_hdr.add_css_class("neon-cc-title");
+        pm_hdr.set_halign(Align::Start);
 
-        let theme_icon_area = DrawingArea::new();
-        theme_icon_area.set_content_width(24);
-        theme_icon_area.set_content_height(24);
-        theme_icon_area.set_halign(Align::Center);
-        theme_icon_area.set_valign(Align::Center);
-        {
-            let light_flag = Rc::clone(&is_light_theme);
-            theme_icon_area.set_draw_func(move |_, cr, w, h| {
-                let cx = f64::from(w) * 0.5;
-                let cy = f64::from(h) * 0.5;
-                let r = (f64::from(w.min(h)) * 0.5) - 2.0;
-                let is_light = light_flag.get();
-                if is_light {
-                    cr.set_source_rgba(0.06, 0.10, 0.18, 0.94);
-                } else {
-                    cr.set_source_rgba(0.98, 0.99, 1.0, 0.95);
-                }
-                cr.set_line_width(1.9);
-                cr.arc(cx, cy, r, 0.0, 2.0 * PI);
-                let _ = cr.stroke();
+        let pm_track = GtkBox::new(Orientation::Horizontal, 4);
+        pm_track.add_css_class("neon-qs-seg-track");
+        pm_track.set_homogeneous(true);
 
-                // Fill right half (or left half in light mode) for classic appearance contrast icon
-                let (a0, a1) = if is_light {
-                    (PI * 0.5, PI * 1.5)
-                } else {
-                    (-PI * 0.5, PI * 0.5)
-                };
-                cr.move_to(cx, cy);
-                cr.arc(cx, cy, r - 0.5, a0, a1);
-                cr.close_path();
-                let _ = cr.fill();
+        let pm_saver_btn = build_power_seg_btn("Power Saver");
+        let pm_balanced_btn = build_power_seg_btn("Balanced");
+        pm_balanced_btn.add_css_class("active");
+        let pm_perf_btn = build_power_seg_btn("Performance");
+
+        for (btn, profile) in [
+            (&pm_saver_btn, "power-saver"),
+            (&pm_balanced_btn, "balanced"),
+            (&pm_perf_btn, "performance"),
+        ] {
+            let tx = sys_tx.clone();
+            let b_saver = pm_saver_btn.clone();
+            let b_bal = pm_balanced_btn.clone();
+            let b_perf = pm_perf_btn.clone();
+            let prof = profile.to_string();
+            btn.connect_clicked(move |_| {
+                set_active_power_seg(&b_saver, &b_bal, &b_perf, &prof);
+                tx.send(SystemAction::SetPowerProfile(prof.clone()));
             });
         }
-        theme_btn.set_child(Some(&theme_icon_area));
+
+        pm_track.append(&pm_saver_btn);
+        pm_track.append(&pm_balanced_btn);
+        pm_track.append(&pm_perf_btn);
+
+        pm_section.append(&pm_hdr);
+        pm_section.append(&pm_track);
+        card.append(&pm_section);
+
+        // =========================================================================
+        // ROW 4: Equal-Length Dark Mode Toggle + Screenshot Pill
+        // =========================================================================
+        let actions_row = GtkBox::new(Orientation::Horizontal, 10);
+        actions_row.set_homogeneous(true);
+        actions_row.set_hexpand(true);
+
+        let (dark_mode_btn, dark_mode_icon) =
+            build_action_pill("weather-clear-night-symbolic", "Dark Mode");
+        dark_mode_btn.add_css_class("active");
         {
-            let ipc = ipc.clone();
+            let ipc_t = ipc.clone();
             let is_light = Rc::clone(&is_light_theme);
-            theme_btn.connect_clicked(move |_| {
+            dark_mode_btn.connect_clicked(move |_| {
                 let next_theme = if is_light.get() {
                     "neon_dark"
                 } else {
                     "neon_light"
                 };
-                ipc.send(IpcRequest::UpdateAppearance {
+                ipc_t.send(IpcRequest::from(neon_ipc::AppearanceUpdate {
                     theme: Some(next_theme.to_string()),
-                    accent_color: None,
-                    dock_transparency: None,
-                    panel_transparency: None,
-                    panel_visible: None,
-                    show_clock: None,
-                    show_workspaces: None,
-                    high_contrast: None,
-                    wallpaper: None,
-                    reduce_blur: None,
-                    blur_strength: None,
-                    cursor_theme: None,
-                    cursor_size: None,
-                });
+                    ..Default::default()
+                }));
             });
         }
 
-        // Circle 2: Lock Screen
-        let (lock_btn, _) =
-            build_circle_icon_button("system-lock-screen-symbolic", 22, "Lock Screen");
+        let (shot_btn, _) = build_action_pill("camera-photo-symbolic", "Screenshot");
+        shot_btn.set_tooltip_text(Some("Screenshot & Screen Record"));
 
-        // Circle 3: Power Profile cycle (Saver -> Balanced -> Performance)
-        let (power_mode_btn, power_mode_icon) = build_circle_icon_button(
-            "power-profile-balanced-symbolic",
-            22,
-            "Power Mode: Balanced (Click to cycle)",
-        );
-        {
-            let sys_tx = sys_tx.clone();
-            let prof_ref = Rc::clone(&active_power_profile);
-            power_mode_btn.connect_clicked(move |_| {
-                let next = match prof_ref.borrow().as_str() {
-                    "power-saver" => "balanced",
-                    "balanced" => "performance",
-                    _ => "power-saver",
-                };
-                *prof_ref.borrow_mut() = next.to_string();
-                sys_tx.send(SystemAction::SetPowerProfile(next.to_string()));
-            });
-        }
-
-        // Circle 4: Screenshot
-        let (shot_btn, _) =
-            build_circle_icon_button("applets-screenshooter-symbolic", 23, "Screenshot");
-
-        row6.append(&theme_btn);
-        row6.append(&lock_btn);
-        row6.append(&power_mode_btn);
-        row6.append(&shot_btn);
-        cc_surface.append(&row6);
-
-        // =========================================================================
-        // ROW 7: Compact System Power Pill (Sleep · Log Out · Restart · Shut Down)
-        // =========================================================================
-        let power_pill = GtkBox::new(Orientation::Horizontal, 4);
-        power_pill.add_css_class("neon-cc-glass");
-        power_pill.add_css_class("neon-cc-power-pill");
-        power_pill.set_homogeneous(true);
-        power_pill.set_size_request(CC_FULL, -1);
-
-        let suspend_btn = build_power_action_btn("weather-clear-night-symbolic", "Sleep", false);
-        let logout_btn = build_power_action_btn("system-log-out-symbolic", "Log Out", false);
-        let restart_btn = build_power_action_btn("system-reboot-symbolic", "Restart", false);
-        let shutdown_btn = build_power_action_btn("system-shutdown-symbolic", "Shut Down", true);
-
-        power_pill.append(&suspend_btn);
-        power_pill.append(&logout_btn);
-        power_pill.append(&restart_btn);
-        power_pill.append(&shutdown_btn);
-        cc_surface.append(&power_pill);
-
-        // Inline confirmation strip for power actions (prevents accidental shutdown/reboot)
-        let pending_power_action: Rc<RefCell<Option<PendingPowerAction>>> =
-            Rc::new(RefCell::new(None));
-        let power_confirm_card = GtkBox::new(Orientation::Horizontal, 8);
-        power_confirm_card.add_css_class("neon-cc-glass");
-        power_confirm_card.add_css_class("neon-cc-confirm-card");
-        power_confirm_card.set_size_request(CC_FULL, -1);
-        power_confirm_card.set_valign(Align::Center);
-        power_confirm_card.set_visible(false);
-
-        let power_confirm_lbl = Label::new(Some("Shut down computer now?"));
-        power_confirm_lbl.add_css_class("neon-cc-title");
-        power_confirm_lbl.set_hexpand(true);
-        power_confirm_lbl.set_halign(Align::Start);
-        power_confirm_lbl.set_valign(Align::Center);
-
-        let power_cancel_btn = Button::with_label("Cancel");
-        power_cancel_btn.add_css_class("neon-cc-small-btn");
-        power_cancel_btn.set_valign(Align::Center);
-
-        let power_ok_btn = Button::with_label("Confirm");
-        power_ok_btn.add_css_class("neon-power-confirm-btn");
-        power_ok_btn.set_valign(Align::Center);
-
-        power_confirm_card.append(&power_confirm_lbl);
-        power_confirm_card.append(&power_cancel_btn);
-        power_confirm_card.append(&power_ok_btn);
-        cc_surface.append(&power_confirm_card);
-
-        for (btn, action) in [
-            (&suspend_btn, PendingPowerAction::Suspend),
-            (&logout_btn, PendingPowerAction::LogOut),
-            (&restart_btn, PendingPowerAction::Restart),
-            (&shutdown_btn, PendingPowerAction::ShutDown),
-        ] {
-            let pending = Rc::clone(&pending_power_action);
-            let card = power_confirm_card.clone();
-            let lbl = power_confirm_lbl.clone();
-            let ok_btn = power_ok_btn.clone();
-            btn.connect_clicked(move |_| {
-                *pending.borrow_mut() = Some(action);
-                lbl.set_text(action.prompt());
-                ok_btn.set_label(action.confirm_label());
-                if action.is_destructive() {
-                    ok_btn.add_css_class("danger");
-                } else {
-                    ok_btn.remove_css_class("danger");
-                }
-                card.set_visible(true);
-            });
-        }
-
-        {
-            let pending = Rc::clone(&pending_power_action);
-            let card = power_confirm_card.clone();
-            power_cancel_btn.connect_clicked(move |_| {
-                *pending.borrow_mut() = None;
-                card.set_visible(false);
-            });
-        }
+        actions_row.append(&dark_mode_btn);
+        actions_row.append(&shot_btn);
+        card.append(&actions_row);
 
         // =========================================================================
         // Dynamic Notifications Card (auto-hidden when empty)
         // =========================================================================
         let notif_card = GtkBox::new(Orientation::Vertical, 6);
-        notif_card.add_css_class("neon-cc-glass");
-        notif_card.add_css_class("neon-cc-slider-card");
-        notif_card.set_size_request(CC_FULL, -1);
+        notif_card.add_css_class("neon-qs-inner-card");
         notif_card.set_visible(false);
 
         let notif_head = GtkBox::new(Orientation::Horizontal, 6);
@@ -719,9 +561,9 @@ impl QuickSettingsPanel {
         let clear_btn = Button::with_label("Clear");
         clear_btn.add_css_class("neon-cc-small-btn");
         {
-            let store = Arc::clone(&store);
+            let store_c = Arc::clone(&store);
             clear_btn.connect_clicked(move |_| {
-                store.clear_all();
+                store_c.clear_all();
             });
         }
 
@@ -730,52 +572,51 @@ impl QuickSettingsPanel {
         notif_card.append(&notif_head);
 
         let notif_scroller = ScrolledWindow::builder()
-            .max_content_height(116)
+            .max_content_height(110)
             .propagate_natural_height(true)
             .build();
         let notif_list_box = GtkBox::new(Orientation::Vertical, 6);
         notif_scroller.set_child(Some(&notif_list_box));
         notif_card.append(&notif_scroller);
-        cc_surface.append(&notif_card);
+        card.append(&notif_card);
 
-        // =========================================================================
-        // ROW 8: Centered Bottom Liquid Glass Pill ("Open Settings")
-        // =========================================================================
-        let settings_pill = Button::with_label("Open Settings");
-        settings_pill.add_css_class("neon-cc-bottom-pill");
-        settings_pill.set_halign(Align::Center);
-        cc_surface.append(&settings_pill);
-
-        backdrop.append(&cc_surface);
-        window.set_child(Some(&backdrop));
+        window.set_child(Some(&card));
         window.set_visible(false);
 
         let panel = Self {
+            backdrop_window,
             window,
-            cc_surface,
+            ipc: ipc.clone(),
             is_open,
             anim_gen,
             on_state_change,
             syncing,
-            wifi_btn,
+            header_battery_box,
+            header_battery_icon,
+            header_battery_lbl,
+            header_title_lbl,
+            wifi_pill,
+            wifi_main_btn,
             wifi_sub,
+            wifi_arrow_icon,
             wifi_enabled_state,
-            bt_btn,
+            bt_pill,
+            bt_main_btn,
+            bt_sub,
+            bt_arrow_icon,
             bt_powered_state,
-            net_share_btn,
-            media_bus,
-            media_art_path,
-            media_art_pic,
-            media_art_fallback,
-            media_title,
-            media_artist,
-            media_prev_btn,
-            media_play_btn,
-            media_play_icon,
-            media_next_btn,
-            dnd_btn,
-            dnd_sub,
+            active_dropdown,
+            dropdown_revealer,
+            dropdown_box,
+            dropdown_title,
+            dropdown_status,
+            dropdown_list_box,
+            wifi_pw_revealer,
+            wifi_pw_entry,
+            wifi_pw_ssid,
+            bg_tx,
             brightness_card,
+            sliders_divider,
             brightness_pct_label,
             brightness_scale,
             audio_card,
@@ -783,14 +624,12 @@ impl QuickSettingsPanel {
             volume_scale,
             mute_btn,
             mute_icon,
-            theme_btn,
-            theme_icon_area,
+            pm_saver_btn,
+            pm_balanced_btn,
+            pm_perf_btn,
+            dark_mode_btn,
+            dark_mode_icon,
             is_light_theme,
-            power_mode_btn,
-            power_mode_icon,
-            active_power_profile,
-            power_confirm_card,
-            pending_power_action,
             notif_card,
             notif_list_box,
             store,
@@ -798,117 +637,84 @@ impl QuickSettingsPanel {
             toast_overlay,
         };
 
-        // Wire click-anywhere-outside backdrop dismissal
-        {
-            let outside_click = GestureClick::new();
-            outside_click.set_button(0);
-            let p = panel.clone();
-            let surface = panel.cc_surface.clone();
-            outside_click.connect_pressed(move |gesture, _, x, y| {
-                if !p.is_open.get() {
-                    return;
-                }
-                let inside = gesture
-                    .widget()
-                    .and_then(|w| w.pick(x, y, gtk4::PickFlags::DEFAULT))
-                    .is_some_and(|picked| {
-                        picked == surface.clone().upcast::<gtk4::Widget>()
-                            || picked.is_ancestor(&surface)
-                    });
-                if !inside {
-                    p.close();
-                }
-            });
-            backdrop.add_controller(outside_click);
-        }
-
-        // Wire Power Confirmation button -> real systemd-logind action
+        // Wire Power Menu button -> closes Quick Settings and opens Fullscreen Centered Power Menu
         {
             let p = panel.clone();
-            let pending = Rc::clone(&panel.pending_power_action);
-            let sys_tx_pwr = panel.sys_tx.clone();
-            power_ok_btn.connect_clicked(move |_| {
-                let Some(action) = pending.borrow_mut().take() else {
-                    return;
-                };
-                p.power_confirm_card.set_visible(false);
+            let pm = power_menu;
+            power_menu_btn.connect_clicked(move |_| {
                 p.close();
-                match action {
-                    PendingPowerAction::Suspend => {
-                        sys_tx_pwr.send(SystemAction::InvokePowerAction("Suspend".into()));
-                    }
-                    PendingPowerAction::LogOut => {
-                        sys_tx_pwr.send(SystemAction::LogOut);
-                    }
-                    PendingPowerAction::Restart => {
-                        sys_tx_pwr.send(SystemAction::InvokePowerAction("Reboot".into()));
-                    }
-                    PendingPowerAction::ShutDown => {
-                        sys_tx_pwr.send(SystemAction::InvokePowerAction("PowerOff".into()));
-                    }
-                }
+                let pm_c = pm.clone();
+                glib::timeout_add_local_once(Duration::from_millis(80), move || {
+                    pm_c.open();
+                });
             });
         }
 
-        // Wire Network / Displays / Audio Output / Settings / Overview / Lock / Screenshot
+        // Wire Screenshot button -> closes Quick Settings and opens Screenshot & Screen Record UI
         {
             let p = panel.clone();
-            panel.net_share_btn.connect_clicked(move |_| {
-                p.close();
-                launch_sibling_binary_with_args("neon-settings", &["--page", "network"]);
-            });
-        }
-        {
-            let p = panel.clone();
-            let ipc = ipc.clone();
-            overview_btn.connect_clicked(move |_| {
-                p.close();
-                ipc.send(IpcRequest::ToggleOverview);
-            });
-        }
-        {
-            let p = panel.clone();
-            displays_btn.connect_clicked(move |_| {
-                p.close();
-                launch_sibling_binary_with_args("neon-settings", &["--page", "displays"]);
-            });
-        }
-        {
-            let p = panel.clone();
-            audio_out_btn.connect_clicked(move |_| {
-                p.close();
-                launch_sibling_binary_with_args("neon-settings", &["--page", "sound"]);
-            });
-        }
-        {
-            let p = panel.clone();
-            let ipc = ipc.clone();
-            lock_btn.connect_clicked(move |_| {
-                p.close();
-                ipc.send(IpcRequest::LockSession);
-            });
-        }
-        {
-            let p = panel.clone();
-            let ipc = ipc.clone();
+            let ipc_s = ipc;
             shot_btn.connect_clicked(move |_| {
                 p.close();
-                let ipc_c = ipc.clone();
-                glib::timeout_add_local_once(Duration::from_millis(220), move || {
+                let ipc_c = ipc_s.clone();
+                glib::timeout_add_local_once(Duration::from_millis(160), move || {
                     ipc_c.send(IpcRequest::OpenScreenshotUi);
                 });
             });
         }
+
+        // Wire Wi-Fi & Bluetooth dropdown toggle arrows
         {
             let p = panel.clone();
-            settings_pill.connect_clicked(move |_| {
-                p.close();
-                launch_sibling_binary("neon-settings");
+            wifi_arrow_btn.connect_clicked(move |_| {
+                p.toggle_dropdown(ActiveDropdown::Wifi);
+            });
+        }
+        {
+            let p = panel.clone();
+            bt_arrow_btn.connect_clicked(move |_| {
+                p.toggle_dropdown(ActiveDropdown::Bluetooth);
             });
         }
 
-        // Escape key smoothly closes Control Center
+        // Wire dropdown refresh / scan button
         {
+            let p = panel.clone();
+            dd_refresh_btn.connect_clicked(move |_| match p.active_dropdown.get() {
+                ActiveDropdown::Wifi => p.load_wifi_networks(true),
+                ActiveDropdown::Bluetooth => p.load_bluetooth_devices(true),
+                ActiveDropdown::None => {}
+            });
+        }
+
+        // Wire inline Wi-Fi password submit (button click + Enter key)
+        {
+            let p = panel.clone();
+            wifi_pw_connect_btn.connect_clicked(move |_| p.submit_wifi_password());
+        }
+        {
+            let p = panel.clone();
+            panel
+                .wifi_pw_entry
+                .connect_activate(move |_| p.submit_wifi_password());
+        }
+
+        // Clicking anywhere on the fullscreen backdrop closes Quick Settings immediately
+        {
+            let outside_click = GestureClick::new();
+            outside_click.set_button(0);
+            outside_click.set_propagation_phase(gtk4::PropagationPhase::Capture);
+            let p = panel.clone();
+            outside_click.connect_pressed(move |_, _, _, _| {
+                if p.is_open.get() {
+                    p.close();
+                }
+            });
+            panel.backdrop_window.add_controller(outside_click);
+        }
+
+        // Escape key on either window closes Quick Settings
+        for w in [&panel.window, &panel.backdrop_window] {
             let key_ctrl = EventControllerKey::new();
             let p = panel.clone();
             key_ctrl.connect_key_pressed(move |_, key, _, _| {
@@ -918,14 +724,24 @@ impl QuickSettingsPanel {
                 }
                 glib::Propagation::Proceed
             });
-            panel.window.add_controller(key_ctrl);
+            w.add_controller(key_ctrl);
+        }
+
+        // Poll background Wi-Fi / Bluetooth worker responses cleanly on the GTK main loop
+        {
+            let p = panel.clone();
+            glib::timeout_add_local(Duration::from_millis(80), move || {
+                while let Ok(evt) = bg_rx.try_recv() {
+                    p.handle_bg_event(evt);
+                }
+                glib::ControlFlow::Continue
+            });
         }
 
         panel.refresh_notifications();
         panel
     }
 
-    /// Registers a listener notified whenever Control Center opens (`true`) or closes (`false`).
     pub fn set_on_state_change<F: Fn(bool) + 'static>(&self, cb: F) {
         *self.on_state_change.borrow_mut() = Some(Box::new(cb));
     }
@@ -953,45 +769,18 @@ impl QuickSettingsPanel {
         self.refresh_notifications();
         self.refresh_brightness();
 
-        // Start cleanly in closed transform state, present the overlay, then transition into
-        // `.cc-open` after GTK commits its first frame tick so the spring animation always plays.
-        self.cc_surface.remove_css_class("cc-open");
-        self.cc_surface.add_css_class("cc-closed");
+        // Trigger compositor-driven 60 FPS GPU Material 3 Expressive entrance spring.
+        self.ipc.send(IpcRequest::AnimateOverlay {
+            namespace: "neon-quick-settings".into(),
+            opening: true,
+        });
+
+        // Always map backdrop first, then Quick Settings surface on top at fixed size (zero resize churn).
+        self.backdrop_window.set_visible(true);
+        self.backdrop_window.present();
+        self.backdrop_window.queue_draw();
         self.window.set_visible(true);
         self.window.present();
-
-        let triggered = Rc::new(Cell::new(false));
-        let ticks = Rc::new(Cell::new(0u8));
-        {
-            let gen_cell = Rc::clone(&self.anim_gen);
-            let trig = Rc::clone(&triggered);
-            let ticks_c = Rc::clone(&ticks);
-            self.cc_surface.add_tick_callback(move |widget, _| {
-                if gen_cell.get() != epoch || trig.get() {
-                    return glib::ControlFlow::Break;
-                }
-                let next = ticks_c.get().saturating_add(1);
-                ticks_c.set(next);
-                if next >= 2 {
-                    trig.set(true);
-                    widget.remove_css_class("cc-closed");
-                    widget.add_css_class("cc-open");
-                    return glib::ControlFlow::Break;
-                }
-                glib::ControlFlow::Continue
-            });
-        }
-
-        // Fallback timer guarantees reveal even if frame clock pauses briefly on initial map
-        let surface_c = self.cc_surface.clone();
-        let gen_cell = Rc::clone(&self.anim_gen);
-        glib::timeout_add_local_once(Duration::from_millis(55), move || {
-            if gen_cell.get() == epoch && !triggered.get() {
-                triggered.set(true);
-                surface_c.remove_css_class("cc-closed");
-                surface_c.add_css_class("cc-open");
-            }
-        });
     }
 
     pub fn close(&self) {
@@ -1001,25 +790,418 @@ impl QuickSettingsPanel {
         let epoch = self.anim_gen.get().wrapping_add(1);
         self.anim_gen.set(epoch);
         self.is_open.set(false);
-        *self.pending_power_action.borrow_mut() = None;
-        self.power_confirm_card.set_visible(false);
         self.notify_state_change(false);
 
-        self.cc_surface.remove_css_class("cc-open");
-        self.cc_surface.add_css_class("cc-closed");
+        // Immediately release the fullscreen click-catcher backdrop so desktop/app clicks
+        // aren't blocked while the Quick Settings card finishes its 155ms exit glide.
+        self.backdrop_window.set_visible(false);
 
-        let win = self.window.clone();
-        let toast = self.toast_overlay.clone();
-        let gen_cell = Rc::clone(&self.anim_gen);
-        glib::timeout_add_local_once(Duration::from_millis(200), move || {
-            if gen_cell.get() == epoch {
+        // Trigger smooth 60 FPS GPU glide + fade exit in neon-renderer (155ms).
+        self.ipc.send(IpcRequest::AnimateOverlay {
+            namespace: "neon-quick-settings".into(),
+            opening: false,
+        });
+
+        let this = self.clone();
+        let gen_c = Rc::clone(&self.anim_gen);
+        glib::timeout_add_local_once(Duration::from_millis(175), move || {
+            if gen_c.get() == epoch {
+                this.collapse_dropdown_immediate();
                 if gtk4_layer_shell::is_supported() {
-                    win.set_keyboard_mode(KeyboardMode::None);
+                    this.window.set_keyboard_mode(KeyboardMode::None);
                 }
-                win.set_visible(false);
-                toast.set_suppressed(false);
+                this.window.set_visible(false);
+                this.backdrop_window.set_visible(false);
+                this.toast_overlay.set_suppressed(false);
             }
         });
+    }
+
+    fn collapse_dropdown_immediate(&self) {
+        self.active_dropdown.set(ActiveDropdown::None);
+        self.dropdown_revealer.set_transition_duration(0);
+        self.dropdown_revealer.set_reveal_child(false);
+        self.dropdown_box.remove_css_class("dd-open");
+        self.dropdown_box.remove_css_class("dd-swap");
+        self.dropdown_box.add_css_class("dd-closed");
+        self.wifi_pw_revealer.set_reveal_child(false);
+        *self.wifi_pw_ssid.borrow_mut() = None;
+        self.wifi_arrow_icon.remove_css_class("expanded");
+        self.bt_arrow_icon.remove_css_class("expanded");
+    }
+
+    fn collapse_dropdown(&self) {
+        self.active_dropdown.set(ActiveDropdown::None);
+        self.dropdown_revealer.set_transition_duration(170);
+        self.dropdown_revealer.set_reveal_child(false);
+        self.dropdown_box.remove_css_class("dd-open");
+        self.dropdown_box.remove_css_class("dd-swap");
+        self.dropdown_box.add_css_class("dd-closed");
+        self.wifi_pw_revealer.set_reveal_child(false);
+        *self.wifi_pw_ssid.borrow_mut() = None;
+        self.wifi_arrow_icon.remove_css_class("expanded");
+        self.bt_arrow_icon.remove_css_class("expanded");
+        if gtk4_layer_shell::is_supported() && self.is_open.get() {
+            self.window.set_keyboard_mode(KeyboardMode::OnDemand);
+        }
+    }
+
+    fn toggle_dropdown(&self, target: ActiveDropdown) {
+        let prev = self.active_dropdown.get();
+        if prev == target {
+            self.collapse_dropdown();
+            return;
+        }
+
+        let was_open = prev != ActiveDropdown::None;
+        self.active_dropdown.set(target);
+        self.wifi_pw_revealer.set_reveal_child(false);
+        *self.wifi_pw_ssid.borrow_mut() = None;
+
+        match target {
+            ActiveDropdown::Wifi => {
+                self.wifi_arrow_icon.add_css_class("expanded");
+                self.bt_arrow_icon.remove_css_class("expanded");
+                self.dropdown_title.set_text("Wi-Fi Networks");
+                self.load_wifi_networks(false);
+                self.load_wifi_networks(true);
+            }
+            ActiveDropdown::Bluetooth => {
+                self.bt_arrow_icon.add_css_class("expanded");
+                self.wifi_arrow_icon.remove_css_class("expanded");
+                self.dropdown_title.set_text("Bluetooth Devices");
+                self.load_bluetooth_devices(false);
+            }
+            ActiveDropdown::None => {
+                self.collapse_dropdown();
+                return;
+            }
+        }
+
+        self.dropdown_revealer.set_transition_duration(210);
+        self.dropdown_revealer.set_reveal_child(true);
+
+        if was_open {
+            // Quick expressive swap pulse when switching directly between Wi-Fi and Bluetooth
+            self.dropdown_box.remove_css_class("dd-open");
+            self.dropdown_box.add_css_class("dd-swap");
+            let dd = self.dropdown_box.clone();
+            glib::timeout_add_local_once(Duration::from_millis(24), move || {
+                dd.remove_css_class("dd-swap");
+                dd.add_css_class("dd-open");
+            });
+        } else {
+            self.dropdown_box.remove_css_class("dd-open");
+            self.dropdown_box.add_css_class("dd-closed");
+            let dd = self.dropdown_box.clone();
+            glib::timeout_add_local_once(Duration::from_millis(18), move || {
+                dd.remove_css_class("dd-closed");
+                dd.add_css_class("dd-open");
+            });
+        }
+    }
+
+    /// Programmatically opens the Wi-Fi or Bluetooth dropdown (used for UI verification).
+    pub fn open_dropdown_for_test(&self, which: &str) {
+        match which {
+            "wifi" => self.toggle_dropdown(ActiveDropdown::Wifi),
+            "bluetooth" => self.toggle_dropdown(ActiveDropdown::Bluetooth),
+            _ => {}
+        }
+    }
+
+    fn load_wifi_networks(&self, rescan: bool) {
+        if !rescan {
+            self.clear_dropdown_list();
+            self.append_dropdown_placeholder("Loading nearby networks…");
+        }
+        self.dropdown_status.set_text(if rescan {
+            "Scanning…"
+        } else {
+            "Loading…"
+        });
+        let tx = self.bg_tx.clone();
+        std::thread::spawn(move || {
+            let nets = list_wifi_networks(rescan);
+            let _ = tx.send(DropdownBgEvent::WifiList(nets));
+        });
+    }
+
+    fn load_bluetooth_devices(&self, discover: bool) {
+        if !discover {
+            self.clear_dropdown_list();
+            self.append_dropdown_placeholder("Loading Bluetooth devices…");
+        }
+        self.dropdown_status.set_text(if discover {
+            "Scanning…"
+        } else {
+            "Loading…"
+        });
+        let tx = self.bg_tx.clone();
+        std::thread::spawn(move || {
+            if discover {
+                let _ = set_bluetooth_discovery(true);
+                std::thread::sleep(Duration::from_millis(1600));
+            }
+            let devs = list_all_bluetooth_devices();
+            let _ = tx.send(DropdownBgEvent::BtList(devs));
+            if discover {
+                std::thread::sleep(Duration::from_millis(2800));
+                let devs2 = list_all_bluetooth_devices();
+                let _ = tx.send(DropdownBgEvent::BtList(devs2));
+                let _ = set_bluetooth_discovery(false);
+            }
+        });
+    }
+
+    fn submit_wifi_password(&self) {
+        let Some(ssid) = self.wifi_pw_ssid.borrow().clone() else {
+            return;
+        };
+        let pw = self.wifi_pw_entry.text().to_string();
+        if pw.is_empty() {
+            return;
+        }
+        self.wifi_pw_entry.set_text("");
+        self.wifi_pw_revealer.set_reveal_child(false);
+        if gtk4_layer_shell::is_supported() {
+            self.window.set_keyboard_mode(KeyboardMode::OnDemand);
+        }
+        self.dropdown_status.set_text(&format!("Connecting to {ssid}…"));
+        let tx = self.bg_tx.clone();
+        std::thread::spawn(move || {
+            let res = connect_wifi(&ssid, Some(&pw));
+            let _ = tx.send(DropdownBgEvent::WifiConnectResult {
+                ssid,
+                secured: true,
+                res,
+            });
+        });
+    }
+
+    fn handle_bg_event(&self, evt: DropdownBgEvent) {
+        match evt {
+            DropdownBgEvent::WifiList(aps) => {
+                if self.active_dropdown.get() != ActiveDropdown::Wifi {
+                    return;
+                }
+                self.dropdown_status.set_text(&format!("{} found", aps.len()));
+                self.clear_dropdown_list();
+                if !self.wifi_enabled_state.get() {
+                    self.append_dropdown_placeholder("Wi-Fi is turned off");
+                    return;
+                }
+                if aps.is_empty() {
+                    self.append_dropdown_placeholder("No nearby Wi-Fi networks found");
+                    return;
+                }
+                for ap in aps {
+                    let row_btn = Button::new();
+                    row_btn.add_css_class("neon-qs-dd-item");
+                    if ap.in_use {
+                        row_btn.add_css_class("connected");
+                    }
+
+                    let hbox = GtkBox::new(Orientation::Horizontal, 8);
+                    hbox.set_valign(Align::Center);
+
+                    let sig_icon = Image::from_icon_name(wifi_signal_icon(ap.strength));
+                    sig_icon.set_pixel_size(15);
+
+                    let ssid_lbl = Label::new(Some(&ap.ssid));
+                    ssid_lbl.add_css_class("neon-qs-dd-name");
+                    ssid_lbl.set_hexpand(true);
+                    ssid_lbl.set_halign(Align::Start);
+                    ssid_lbl.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+                    ssid_lbl.set_max_width_chars(22);
+
+                    hbox.append(&sig_icon);
+                    hbox.append(&ssid_lbl);
+
+                    let secured = !ap.security.eq_ignore_ascii_case("open");
+                    if secured && !ap.in_use {
+                        let lock_ic = Image::from_icon_name("network-wireless-encrypted-symbolic");
+                        lock_ic.set_pixel_size(12);
+                        lock_ic.set_opacity(0.70);
+                        hbox.append(&lock_ic);
+                    }
+
+                    if ap.in_use {
+                        let badge = Label::new(Some("Connected"));
+                        badge.add_css_class("neon-qs-dd-badge");
+                        hbox.append(&badge);
+                    }
+
+                    row_btn.set_child(Some(&hbox));
+
+                    let ssid = ap.ssid.clone();
+                    let in_use = ap.in_use;
+                    let p = self.clone();
+                    row_btn.connect_clicked(move |_| {
+                        if in_use {
+                            return;
+                        }
+                        p.wifi_pw_revealer.set_reveal_child(false);
+                        p.dropdown_status.set_text(&format!("Connecting to {ssid}…"));
+                        let tx = p.bg_tx.clone();
+                        let s_clone = ssid.clone();
+                        std::thread::spawn(move || {
+                            let res = connect_wifi(&s_clone, None);
+                            let _ = tx.send(DropdownBgEvent::WifiConnectResult {
+                                ssid: s_clone,
+                                secured,
+                                res,
+                            });
+                        });
+                    });
+
+                    self.dropdown_list_box.append(&row_btn);
+                }
+            }
+            DropdownBgEvent::WifiConnectResult { ssid, secured, res } => {
+                if self.active_dropdown.get() != ActiveDropdown::Wifi {
+                    return;
+                }
+                match res {
+                    Ok(()) => {
+                        self.dropdown_status.set_text(&format!("Connected to {ssid}"));
+                        self.wifi_pw_revealer.set_reveal_child(false);
+                        *self.wifi_pw_ssid.borrow_mut() = None;
+                        self.sys_tx.send(SystemAction::RefreshNow);
+                        self.load_wifi_networks(false);
+                    }
+                    Err(err) => {
+                        if secured {
+                            *self.wifi_pw_ssid.borrow_mut() = Some(ssid.clone());
+                            self.wifi_pw_entry
+                                .set_placeholder_text(Some(&format!("Password for {ssid}")));
+                            self.wifi_pw_revealer.set_reveal_child(true);
+                            if gtk4_layer_shell::is_supported() {
+                                self.window.set_keyboard_mode(KeyboardMode::Exclusive);
+                            }
+                            self.wifi_pw_entry.grab_focus();
+                            self.dropdown_status.set_text("Enter password");
+                        } else {
+                            let short: String = err.chars().take(28).collect();
+                            self.dropdown_status.set_text(&short);
+                        }
+                    }
+                }
+            }
+            DropdownBgEvent::BtList(devs) => {
+                if self.active_dropdown.get() != ActiveDropdown::Bluetooth {
+                    return;
+                }
+                self.dropdown_status.set_text(&format!("{} devices", devs.len()));
+                self.clear_dropdown_list();
+                if !self.bt_powered_state.get() {
+                    self.append_dropdown_placeholder("Bluetooth is turned off");
+                    return;
+                }
+                if devs.is_empty() {
+                    self.append_dropdown_placeholder("No Bluetooth devices — click refresh to scan");
+                    return;
+                }
+                for dev in devs {
+                    let row_btn = Button::new();
+                    row_btn.add_css_class("neon-qs-dd-item");
+                    if dev.connected {
+                        row_btn.add_css_class("connected");
+                    }
+
+                    let hbox = GtkBox::new(Orientation::Horizontal, 8);
+                    hbox.set_valign(Align::Center);
+
+                    let icon_name = bt_device_icon(dev.icon.as_deref());
+                    let ic = Image::from_icon_name(icon_name);
+                    ic.set_pixel_size(15);
+
+                    let name_lbl = Label::new(Some(&dev.name));
+                    name_lbl.add_css_class("neon-qs-dd-name");
+                    name_lbl.set_hexpand(true);
+                    name_lbl.set_halign(Align::Start);
+                    name_lbl.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+                    name_lbl.set_max_width_chars(20);
+
+                    let state_text = if dev.connected {
+                        "Connected"
+                    } else if dev.paired {
+                        "Paired"
+                    } else {
+                        "Pair"
+                    };
+                    let state_lbl = Label::new(Some(state_text));
+                    state_lbl.add_css_class(if dev.connected {
+                        "neon-qs-dd-badge"
+                    } else {
+                        "neon-cc-sub"
+                    });
+
+                    hbox.append(&ic);
+                    hbox.append(&name_lbl);
+                    hbox.append(&state_lbl);
+                    row_btn.set_child(Some(&hbox));
+
+                    let obj_path = dev.object_path.clone();
+                    let name = dev.name.clone();
+                    let connected = dev.connected;
+                    let paired = dev.paired;
+                    let p = self.clone();
+                    row_btn.connect_clicked(move |_| {
+                        let verb = if connected {
+                            "Disconnecting"
+                        } else if paired {
+                            "Connecting"
+                        } else {
+                            "Pairing"
+                        };
+                        p.dropdown_status.set_text(&format!("{verb} {name}…"));
+                        let tx = p.bg_tx.clone();
+                        let path_c = obj_path.clone();
+                        let name_c = name.clone();
+                        std::thread::spawn(move || {
+                            let res = if connected {
+                                set_device_connected(&path_c, false)
+                            } else if paired {
+                                set_device_connected(&path_c, true)
+                            } else {
+                                pair_device(&path_c)
+                                    .and_then(|()| set_device_connected(&path_c, true))
+                            };
+                            let _ = tx.send(DropdownBgEvent::BtActionResult { name: name_c, res });
+                        });
+                    });
+
+                    self.dropdown_list_box.append(&row_btn);
+                }
+            }
+            DropdownBgEvent::BtActionResult { name, res } => {
+                if self.active_dropdown.get() != ActiveDropdown::Bluetooth {
+                    return;
+                }
+                match res {
+                    Ok(()) => self.dropdown_status.set_text(&format!("Updated {name}")),
+                    Err(_) => self.dropdown_status.set_text("Connection failed"),
+                }
+                self.sys_tx.send(SystemAction::RefreshNow);
+                self.load_bluetooth_devices(false);
+            }
+        }
+    }
+
+    fn clear_dropdown_list(&self) {
+        while let Some(child) = self.dropdown_list_box.first_child() {
+            self.dropdown_list_box.remove(&child);
+        }
+    }
+
+    fn append_dropdown_placeholder(&self, text: &str) {
+        let lbl = Label::new(Some(text));
+        lbl.add_css_class("neon-cc-sub");
+        lbl.set_margin_top(6);
+        lbl.set_margin_bottom(6);
+        lbl.set_halign(Align::Center);
+        self.dropdown_list_box.append(&lbl);
     }
 
     fn notify_state_change(&self, open: bool) {
@@ -1031,123 +1213,94 @@ impl QuickSettingsPanel {
     fn refresh_brightness(&self) {
         if let Some(pct) = read_backlight_percent() {
             self.brightness_card.set_visible(true);
+            self.sliders_divider.set_visible(true);
             self.syncing.set(true);
             self.brightness_scale.set_value(f64::from(pct));
             self.brightness_pct_label.set_text(&format!("{pct}%"));
             self.syncing.set(false);
         } else {
             self.brightness_card.set_visible(false);
+            self.sliders_divider.set_visible(false);
         }
     }
 
     pub fn update_appearance(&self, appearance: &AppearanceInfo) {
         let light = appearance.theme == "neon_light" || appearance.theme == "light";
         self.is_light_theme.set(light);
-        self.theme_btn.set_tooltip_text(Some(if light {
-            "Appearance: Light Mode (Click for Dark)"
+        if light {
+            self.dark_mode_btn.remove_css_class("active");
+            self.dark_mode_icon
+                .set_icon_name(Some("weather-clear-night-symbolic"));
         } else {
-            "Appearance: Dark Mode (Click for Light)"
-        }));
-        self.theme_icon_area.queue_draw();
+            self.dark_mode_btn.add_css_class("active");
+            self.dark_mode_icon
+                .set_icon_name(Some("weather-clear-night-symbolic"));
+        }
+        self.dark_mode_btn.set_tooltip_text(Some("Dark Mode"));
     }
 
     pub fn update_system(&self, snap: &SystemSnapshot) {
         self.syncing.set(true);
 
+        // Header battery
+        if snap.power.has_battery {
+            let pct = snap.power.battery_percentage.round() as u32;
+            let charging = matches!(
+                snap.power.battery_state,
+                BatteryState::Charging | BatteryState::PendingCharge
+            );
+            let bat_icon = match (pct, charging) {
+                (90..=100, true) => "battery-full-charging-symbolic",
+                (90..=100, false) => "battery-full-symbolic",
+                (50..=89, true) => "battery-good-charging-symbolic",
+                (50..=89, false) => "battery-good-symbolic",
+                (20..=49, true) => "battery-low-charging-symbolic",
+                (20..=49, false) => "battery-low-symbolic",
+                (_, true) => "battery-caution-charging-symbolic",
+                (_, false) => "battery-caution-symbolic",
+            };
+            self.header_battery_icon.set_icon_name(Some(bat_icon));
+            self.header_battery_lbl.set_text(&format!("{pct}%"));
+            self.header_battery_box.set_visible(true);
+            self.header_title_lbl.set_visible(false);
+        } else {
+            self.header_battery_box.set_visible(false);
+            self.header_title_lbl.set_visible(true);
+        }
+
         // Wi-Fi pill
         self.wifi_enabled_state.set(snap.network.wifi_enabled);
-        self.wifi_btn.set_sensitive(snap.network.available);
+        self.wifi_main_btn.set_sensitive(snap.network.available);
         if snap.network.wifi_enabled {
-            self.wifi_btn.add_css_class("active");
+            self.wifi_pill.add_css_class("active");
             let sub = snap.network.primary_name.as_deref().unwrap_or("On");
             self.wifi_sub.set_text(sub);
         } else {
-            self.wifi_btn.remove_css_class("active");
+            self.wifi_pill.remove_css_class("active");
             self.wifi_sub.set_text("Off");
         }
 
-        // Bluetooth circle
+        // Bluetooth pill
         self.bt_powered_state.set(snap.bluetooth.powered);
-        self.bt_btn.set_sensitive(snap.bluetooth.available);
+        self.bt_main_btn.set_sensitive(snap.bluetooth.available);
         if snap.bluetooth.powered {
-            self.bt_btn.add_css_class("active");
-            let n = snap.bluetooth.connected_count();
-            let tip = if n > 0 {
-                format!("Bluetooth · {n} Connected")
-            } else {
-                "Bluetooth · On".to_string()
+            self.bt_pill.add_css_class("active");
+            let connected: Vec<&str> = snap
+                .bluetooth
+                .devices
+                .iter()
+                .filter(|d| d.connected)
+                .map(|d| d.name.as_str())
+                .collect();
+            let sub = match connected.len() {
+                0 => "On".to_string(),
+                1 => connected[0].to_string(),
+                n => format!("{n} Connected"),
             };
-            self.bt_btn.set_tooltip_text(Some(&tip));
+            self.bt_sub.set_text(&sub);
         } else {
-            self.bt_btn.remove_css_class("active");
-            self.bt_btn.set_tooltip_text(Some("Bluetooth · Off"));
-        }
-
-        // Network share / quick settings circle lights up when network is online
-        if snap.network.wifi_enabled || snap.network.primary_name.is_some() {
-            self.net_share_btn.add_css_class("active");
-        } else {
-            self.net_share_btn.remove_css_class("active");
-        }
-
-        // MPRIS Now Playing 2×2 card
-        *self.media_bus.borrow_mut() = snap.media.bus_name.clone();
-        if snap.media.available {
-            let title = snap
-                .media
-                .title
-                .as_deref()
-                .or(snap.media.player_name.as_deref())
-                .unwrap_or("Media");
-            let artist = snap
-                .media
-                .artist
-                .as_deref()
-                .or(snap.media.player_name.as_deref())
-                .unwrap_or("Ready");
-            self.media_title.set_text(title);
-            self.media_artist.set_text(artist);
-            self.media_play_icon.set_icon_name(Some(if snap.media.playing {
-                "media-playback-pause-symbolic"
-            } else {
-                "media-playback-start-symbolic"
-            }));
-            self.media_prev_btn.set_sensitive(true);
-            self.media_play_btn.set_sensitive(true);
-            self.media_next_btn.set_sensitive(true);
-        } else {
-            self.media_title.set_text("Not Playing");
-            self.media_artist.set_text("No media active");
-            self.media_play_icon
-                .set_icon_name(Some("media-playback-start-symbolic"));
-            self.media_prev_btn.set_sensitive(false);
-            self.media_play_btn.set_sensitive(false);
-            self.media_next_btn.set_sensitive(false);
-        }
-
-        if *self.media_art_path.borrow() != snap.media.art_path {
-            *self.media_art_path.borrow_mut() = snap.media.art_path.clone();
-            if let Some(ref art) = snap.media.art_path
-                && let Some(tex) = load_scaled_texture(Path::new(art), 96, 96)
-            {
-                self.media_art_pic.set_paintable(Some(&tex));
-                self.media_art_pic.set_visible(true);
-                self.media_art_fallback.set_visible(false);
-            } else {
-                self.media_art_pic.set_visible(false);
-                self.media_art_fallback.set_visible(true);
-            }
-        }
-
-        // Focus / DND pill
-        if self.store.is_do_not_disturb() {
-            self.dnd_btn.add_css_class("active");
-            self.dnd_sub.set_text("On");
-            self.dnd_sub.set_visible(true);
-        } else {
-            self.dnd_btn.remove_css_class("active");
-            self.dnd_sub.set_text("");
-            self.dnd_sub.set_visible(false);
+            self.bt_pill.remove_css_class("active");
+            self.bt_sub.set_text("Off");
         }
 
         // Audio
@@ -1176,34 +1329,18 @@ impl QuickSettingsPanel {
             self.vol_pct_label.set_text("—");
         }
 
-        // Power Mode utility circle + live Battery tooltip
+        // 3-Button Power Mode Segmented Control
         let active_prof = snap
             .power
             .active_profile
             .as_deref()
             .unwrap_or("balanced");
-        *self.active_power_profile.borrow_mut() = active_prof.to_string();
-        let (prof_icon, prof_label) = match active_prof {
-            "power-saver" => ("power-profile-power-saver-symbolic", "Power Saver"),
-            "performance" => ("power-profile-performance-symbolic", "Performance"),
-            _ => ("power-profile-balanced-symbolic", "Balanced"),
-        };
-        self.power_mode_icon.set_icon_name(Some(prof_icon));
-        if active_prof == "performance" {
-            self.power_mode_btn.add_css_class("active");
-        } else {
-            self.power_mode_btn.remove_css_class("active");
-        }
-        let power_tip = if snap.power.has_battery {
-            format!(
-                "Power Mode: {prof_label} (Click to cycle)\nBattery: {:.0}% ({})",
-                snap.power.battery_percentage,
-                snap.power.battery_state.label()
-            )
-        } else {
-            format!("Power Mode: {prof_label} (Click to cycle)")
-        };
-        self.power_mode_btn.set_tooltip_text(Some(&power_tip));
+        set_active_power_seg(
+            &self.pm_saver_btn,
+            &self.pm_balanced_btn,
+            &self.pm_perf_btn,
+            active_prof,
+        );
 
         self.syncing.set(false);
     }
@@ -1234,7 +1371,7 @@ impl QuickSettingsPanel {
                 body.add_css_class("neon-cc-sub");
                 body.set_halign(Align::Start);
                 body.set_wrap(true);
-                body.set_max_width_chars(34);
+                body.set_max_width_chars(36);
                 row.append(&body);
             }
             self.notif_list_box.append(&row);
@@ -1242,116 +1379,121 @@ impl QuickSettingsPanel {
     }
 }
 
-/// Builds a 2×1 stadium Liquid Glass pill (`148 × 68 px`, `border-radius: 999px`) matching
-/// the Wi-Fi and Focus pills in the 4-column grid.
-fn build_stadium_pill(
+/// Builds an equal-width split connectivity pill (left toggle + divider + right dropdown arrow).
+fn build_split_connectivity_pill(
     icon_name: &str,
     title: &str,
-    subtitle: Option<&str>,
-    accent_white_badge: bool,
-) -> (Button, Label) {
-    let btn = Button::new();
-    btn.add_css_class("neon-cc-stadium-pill");
-    if accent_white_badge {
-        btn.add_css_class("wifi-style");
-    }
-    btn.set_size_request(CC_HALF, CC_CELL);
-    btn.set_halign(Align::Center);
-    btn.set_valign(Align::Center);
+    subtitle: &str,
+) -> (GtkBox, Button, Label, Button, Image) {
+    let pill = GtkBox::new(Orientation::Horizontal, 0);
+    pill.add_css_class("neon-qs-split-pill");
+    pill.set_hexpand(true);
 
-    let row = GtkBox::new(Orientation::Horizontal, 10);
-    row.set_hexpand(true);
-    row.set_vexpand(true);
-    row.set_valign(Align::Center);
+    let main_btn = Button::new();
+    main_btn.add_css_class("neon-qs-split-main");
+    main_btn.set_hexpand(true);
 
-    let badge = GtkBox::new(Orientation::Horizontal, 0);
-    badge.add_css_class("neon-cc-pill-badge");
-    badge.set_size_request(42, 42);
-    badge.set_hexpand(false);
-    badge.set_vexpand(false);
-    badge.set_halign(Align::Center);
-    badge.set_valign(Align::Center);
+    let main_row = GtkBox::new(Orientation::Horizontal, 8);
+    main_row.set_valign(Align::Center);
 
     let icon = Image::from_icon_name(icon_name);
-    icon.set_pixel_size(19);
-    icon.set_hexpand(true);
-    icon.set_vexpand(true);
-    icon.set_halign(Align::Center);
-    icon.set_valign(Align::Center);
-    badge.append(&icon);
+    icon.set_pixel_size(18);
+    icon.add_css_class("neon-qs-split-icon");
 
     let text = GtkBox::new(Orientation::Vertical, 1);
     text.set_hexpand(true);
     text.set_valign(Align::Center);
 
     let title_lbl = Label::new(Some(title));
-    title_lbl.add_css_class("neon-cc-title");
+    title_lbl.add_css_class("neon-qs-pill-title");
     title_lbl.set_halign(Align::Start);
 
-    let sub_lbl = Label::new(Some(subtitle.unwrap_or("")));
-    sub_lbl.add_css_class("neon-cc-sub");
+    let sub_lbl = Label::new(Some(subtitle));
+    sub_lbl.add_css_class("neon-qs-pill-sub");
     sub_lbl.set_halign(Align::Start);
     sub_lbl.set_ellipsize(gtk4::pango::EllipsizeMode::End);
-    sub_lbl.set_max_width_chars(8);
-    sub_lbl.set_visible(subtitle.is_some());
+    sub_lbl.set_max_width_chars(10);
 
     text.append(&title_lbl);
     text.append(&sub_lbl);
 
-    row.append(&badge);
-    row.append(&text);
+    main_row.append(&icon);
+    main_row.append(&text);
+    main_btn.set_child(Some(&main_row));
+
+    let sep = Separator::new(Orientation::Vertical);
+    sep.add_css_class("neon-qs-split-sep");
+
+    let arrow_btn = Button::new();
+    arrow_btn.add_css_class("neon-qs-split-arrow");
+    arrow_btn.set_tooltip_text(Some(&format!("Show {title} menu")));
+    let arrow_icon = Image::from_icon_name("pan-down-symbolic");
+    arrow_icon.add_css_class("neon-qs-chevron");
+    arrow_icon.set_pixel_size(14);
+    arrow_btn.set_child(Some(&arrow_icon));
+
+    pill.append(&main_btn);
+    pill.append(&sep);
+    pill.append(&arrow_btn);
+
+    (pill, main_btn, sub_lbl, arrow_btn, arrow_icon)
+}
+
+fn build_action_pill(icon_name: &str, label: &str) -> (Button, Image) {
+    let btn = Button::new();
+    btn.add_css_class("neon-qs-action-pill");
+    btn.set_hexpand(true);
+
+    let row = GtkBox::new(Orientation::Horizontal, 8);
+    row.set_halign(Align::Center);
+    row.set_valign(Align::Center);
+
+    let icon = Image::from_icon_name(icon_name);
+    icon.set_pixel_size(16);
+    let lbl = Label::new(Some(label));
+    lbl.add_css_class("neon-qs-pill-title");
+
+    row.append(&icon);
+    row.append(&lbl);
     btn.set_child(Some(&row));
 
-    (btn, sub_lbl)
-}
-
-/// Builds a 1×1 circular Liquid Glass button (`68 × 68 px`, `border-radius: 999px`) with a
-/// dead-center symbolic icon.
-fn build_circle_icon_button(icon_name: &str, pixel_size: i32, tooltip: &str) -> (Button, Image) {
-    let btn = Button::new();
-    btn.add_css_class("neon-cc-circle-btn");
-    btn.set_size_request(CC_CELL, CC_CELL);
-    btn.set_halign(Align::Center);
-    btn.set_valign(Align::Center);
-    btn.set_tooltip_text(Some(tooltip));
-
-    let icon = Image::from_icon_name(icon_name);
-    icon.set_pixel_size(pixel_size);
-    icon.set_hexpand(true);
-    icon.set_vexpand(true);
-    icon.set_halign(Align::Center);
-    icon.set_valign(Align::Center);
-    btn.set_child(Some(&icon));
-
     (btn, icon)
 }
 
-fn build_media_transport_btn(icon_name: &str, pixel_size: i32, tooltip: &str) -> (Button, Image) {
-    let btn = Button::new();
-    btn.add_css_class("neon-cc-media-btn");
-    btn.set_size_request(34, 30);
-    btn.set_halign(Align::Center);
-    btn.set_valign(Align::Center);
-    btn.set_tooltip_text(Some(tooltip));
+fn build_power_seg_btn(label: &str) -> Button {
+    let btn = Button::with_label(label);
+    btn.add_css_class("neon-qs-seg-btn");
+    btn.set_hexpand(true);
+    btn
+}
 
-    let icon = Image::from_icon_name(icon_name);
-    icon.set_pixel_size(pixel_size);
-    icon.set_halign(Align::Center);
-    icon.set_valign(Align::Center);
-    btn.set_child(Some(&icon));
-    (btn, icon)
+fn set_active_power_seg(saver: &Button, balanced: &Button, perf: &Button, active: &str) {
+    for (btn, key) in [
+        (saver, "power-saver"),
+        (balanced, "balanced"),
+        (perf, "performance"),
+    ] {
+        if active == key {
+            btn.add_css_class("active");
+        } else {
+            btn.remove_css_class("active");
+        }
+    }
 }
 
 fn centered_slot_icon(icon_name: &str, pixel_size: i32, slot_px: i32, muted: bool) -> GtkBox {
     let slot = GtkBox::new(Orientation::Horizontal, 0);
     slot.set_size_request(slot_px, slot_px);
+    slot.set_hexpand(false);
+    slot.set_vexpand(false);
     slot.set_halign(Align::Center);
     slot.set_valign(Align::Center);
 
     let icon = Image::from_icon_name(icon_name);
     icon.set_pixel_size(pixel_size);
-    icon.set_hexpand(true);
-    icon.set_vexpand(true);
+    icon.set_size_request(slot_px, slot_px);
+    icon.set_hexpand(false);
+    icon.set_vexpand(false);
     icon.set_halign(Align::Center);
     icon.set_valign(Align::Center);
     icon.add_css_class(if muted {
@@ -1363,31 +1505,23 @@ fn centered_slot_icon(icon_name: &str, pixel_size: i32, slot_px: i32, muted: boo
     slot
 }
 
-fn build_power_action_btn(icon_name: &str, label: &str, danger: bool) -> Button {
-    let btn = Button::new();
-    btn.add_css_class("neon-cc-power-btn");
-    if danger {
-        btn.add_css_class("danger");
+fn wifi_signal_icon(strength: u8) -> &'static str {
+    match strength {
+        75..=100 => "network-wireless-signal-excellent-symbolic",
+        50..=74 => "network-wireless-signal-good-symbolic",
+        25..=49 => "network-wireless-signal-ok-symbolic",
+        _ => "network-wireless-signal-weak-symbolic",
     }
-    btn.set_tooltip_text(Some(label));
+}
 
-    let col = GtkBox::new(Orientation::Vertical, 3);
-    col.set_hexpand(true);
-    col.set_halign(Align::Center);
-    col.set_valign(Align::Center);
-
-    let icon = Image::from_icon_name(icon_name);
-    icon.set_pixel_size(15);
-    icon.set_halign(Align::Center);
-    icon.set_valign(Align::Center);
-
-    let lbl = Label::new(Some(label));
-    lbl.add_css_class("neon-cc-power-lbl");
-    lbl.set_halign(Align::Center);
-    lbl.set_valign(Align::Center);
-
-    col.append(&icon);
-    col.append(&lbl);
-    btn.set_child(Some(&col));
-    btn
+fn bt_device_icon(icon: Option<&str>) -> &'static str {
+    match icon.unwrap_or("") {
+        "audio-headphones" | "audio-headset" => "audio-headphones-symbolic",
+        "audio-card" | "audio-speakers" => "audio-speakers-symbolic",
+        "input-mouse" => "input-mouse-symbolic",
+        "input-keyboard" => "input-keyboard-symbolic",
+        "input-gaming" => "input-gaming-symbolic",
+        "phone" => "phone-symbolic",
+        _ => "bluetooth-active-symbolic",
+    }
 }

@@ -4,11 +4,16 @@
 //! cached custom GLSL elements (analytical soft shadows, rounded accent focus rings, and
 //! NEON DE ambient backdrop) so idle frames generate zero spurious damage.
 
+pub mod backdrop_blur;
 pub mod cursor;
+pub mod rounded;
 pub mod screenshot;
 pub mod shaders;
 
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    time::Instant,
+};
 
 use neon_scene::{BorderStyle, NodeContent, SceneGraph, ShadowStyle, TitlebarStyle};
 use neon_window_manager::WindowId;
@@ -17,28 +22,38 @@ use smithay::{
         Color32F,
         damage::{Error as OutputDamageTrackerError, OutputDamageTracker, RenderOutputResult},
         element::{
-            AsRenderElements, Kind,
+            AsRenderElements, Element, Id, Kind, RenderElement, UnderlyingStorage,
             memory::MemoryRenderBufferRenderElement,
             solid::{SolidColorBuffer, SolidColorRenderElement},
             surface::{WaylandSurfaceRenderElement, render_elements_from_surface_tree},
             utils::RescaleRenderElement,
         },
         gles::{
-            GlesError, GlesRenderer, GlesTarget, GlesTexture, Uniform, element::PixelShaderElement,
+            GlesError, GlesFrame, GlesRenderer, GlesTarget, GlesTexture, Uniform,
+            element::PixelShaderElement,
         },
+        utils::{CommitCounter, DamageSet, OpaqueRegions},
     },
-    desktop::{Window, layer_map_for_output},
+    desktop::{PopupManager, Window, WindowSurface, layer_map_for_output},
     input::pointer::{CursorIcon, CursorImageAttributes, CursorImageStatus},
     output::Output,
     render_elements,
-    utils::{Buffer as BufferCoord, Logical, Physical, Point, Rectangle, Scale, Size},
+    utils::{Buffer as BufferCoord, Logical, Physical, Point, Rectangle, Scale, Size, Transform},
     wayland::{
         compositor::with_states, session_lock::LockSurface, shell::wlr_layer::Layer as WlrLayer,
     },
+    xwayland::xwm::WmWindowType,
 };
 use tracing::{info, warn};
 
-use crate::{cursor::CursorCache, shaders::NeonShaders};
+use crate::{
+    backdrop_blur::{
+        BlurTargets, BlurredBackdropElement, CHROME_BLUR_CACHE_TTL, OVERLAY_BLUR_CACHE_TTL,
+    },
+    cursor::CursorCache,
+    rounded::RoundedSurfaceElement,
+    shaders::NeonShaders,
+};
 
 /// Fallback clear color (`#0C0F17`) used if shaders are unavailable.
 pub const FALLBACK_CLEAR_COLOR: Color32F = Color32F::new(0.047, 0.059, 0.090, 1.0);
@@ -64,11 +79,94 @@ impl Default for BlurSettings {
     }
 }
 
+/// Wraps a [`WaylandSurfaceRenderElement`] with a dedicated stable [`Id`] so the same layer
+/// surface (Wallpaper or Dock) can be composited at both outgoing and incoming desktop offsets
+/// simultaneously during a full-desktop Hyprland workspace slide without `OutputDamageTracker`
+/// element ID collisions.
+#[derive(Debug)]
+pub struct TaggedWaylandElement {
+    id: Id,
+    inner: WaylandSurfaceRenderElement<GlesRenderer>,
+}
+
+impl TaggedWaylandElement {
+    fn new(id: Id, inner: WaylandSurfaceRenderElement<GlesRenderer>) -> Self {
+        Self { id, inner }
+    }
+}
+
+impl Element for TaggedWaylandElement {
+    fn id(&self) -> &Id {
+        &self.id
+    }
+
+    fn current_commit(&self) -> CommitCounter {
+        self.inner.current_commit()
+    }
+
+    fn location(&self, scale: Scale<f64>) -> Point<i32, Physical> {
+        self.inner.location(scale)
+    }
+
+    fn src(&self) -> Rectangle<f64, BufferCoord> {
+        self.inner.src()
+    }
+
+    fn transform(&self) -> Transform {
+        self.inner.transform()
+    }
+
+    fn geometry(&self, scale: Scale<f64>) -> Rectangle<i32, Physical> {
+        self.inner.geometry(scale)
+    }
+
+    fn damage_since(
+        &self,
+        scale: Scale<f64>,
+        commit: Option<CommitCounter>,
+    ) -> DamageSet<i32, Physical> {
+        self.inner.damage_since(scale, commit)
+    }
+
+    fn opaque_regions(&self, scale: Scale<f64>) -> OpaqueRegions<i32, Physical> {
+        self.inner.opaque_regions(scale)
+    }
+
+    fn alpha(&self) -> f32 {
+        self.inner.alpha()
+    }
+
+    fn kind(&self) -> Kind {
+        self.inner.kind()
+    }
+}
+
+impl RenderElement<GlesRenderer> for TaggedWaylandElement {
+    fn underlying_storage(&self, _renderer: &mut GlesRenderer) -> Option<UnderlyingStorage<'_>> {
+        None
+    }
+
+    fn draw(
+        &self,
+        frame: &mut GlesFrame<'_, '_>,
+        src: Rectangle<f64, BufferCoord>,
+        dst: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
+        opaque_regions: &[Rectangle<i32, Physical>],
+    ) -> Result<(), GlesError> {
+        self.inner.draw(frame, src, dst, damage, opaque_regions)
+    }
+}
+
 render_elements! {
     /// Unified render element type composited by [`NeonRenderer`].
     pub NeonRenderElement<=GlesRenderer>;
     Wayland=WaylandSurfaceRenderElement<GlesRenderer>,
+    TaggedWayland=TaggedWaylandElement,
     RescaledWayland=RescaleRenderElement<WaylandSurfaceRenderElement<GlesRenderer>>,
+    RoundedWayland=RoundedSurfaceElement,
+    RescaledRoundedWayland=RescaleRenderElement<RoundedSurfaceElement>,
+    BlurredBackdrop=BlurredBackdropElement,
     Memory=MemoryRenderBufferRenderElement<GlesRenderer>,
     Shader=PixelShaderElement,
     Solid=SolidColorRenderElement,
@@ -118,6 +216,15 @@ struct CachedTitlebar {
     opacity: f32,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum OverlayAnim {
+    /// Queued via IPC before GTK commits its first painted buffer; promoted to `Opening` on the
+    /// exact first committed frame so animations always start cleanly at `t = 0.0` (zero jump).
+    PendingOpen { queued: Instant },
+    Opening { started: Instant },
+    Closing { started: Instant },
+}
+
 /// Stateful per-output GPU renderer with compiled custom shaders and cached damage-aware elements.
 #[derive(Debug)]
 pub struct NeonRenderer {
@@ -127,8 +234,19 @@ pub struct NeonRenderer {
     border_cache: HashMap<WindowId, CachedBorder>,
     glass_cache: HashMap<WindowId, CachedGlass>,
     titlebar_cache: HashMap<WindowId, CachedTitlebar>,
+    rounded_radii_cache: HashMap<WindowId, (i32, i32)>,
     backdrop_cache: Option<CachedBackdrop>,
     cursor_cache: CursorCache,
+    chrome_blur_targets: BlurTargets,
+    blur_targets: BlurTargets,
+    blur_element_ids: HashMap<String, Id>,
+    ws_slide_layer_ids: HashMap<String, Vec<Id>>,
+    mapped_blur_overlays: HashSet<String>,
+    overlay_anims: HashMap<String, OverlayAnim>,
+    blur_anim_commit: CommitCounter,
+    last_blur_tex_commit: CommitCounter,
+    chrome_blur_commit: CommitCounter,
+    last_chrome_blur_tex_commit: CommitCounter,
     pub(crate) screencopy_offscreen: Option<(Size<i32, BufferCoord>, GlesTexture)>,
 }
 
@@ -141,7 +259,7 @@ impl NeonRenderer {
         let shaders = match NeonShaders::compile(renderer) {
             Ok(compiled) => {
                 info!(
-                    "Compiled NEON DE custom GLES shaders (shadow, border, backdrop, frosted-glass)"
+                    "Compiled NEON DE custom GLES shaders (shadow, border, backdrop, frosted-glass, titlebar, rounded-window, backdrop-blur)"
                 );
                 Some(compiled)
             }
@@ -161,8 +279,19 @@ impl NeonRenderer {
             border_cache: HashMap::new(),
             glass_cache: HashMap::new(),
             titlebar_cache: HashMap::new(),
+            rounded_radii_cache: HashMap::new(),
             backdrop_cache: None,
             cursor_cache: CursorCache::load_default(),
+            chrome_blur_targets: BlurTargets::default(),
+            blur_targets: BlurTargets::default(),
+            blur_element_ids: HashMap::new(),
+            ws_slide_layer_ids: HashMap::new(),
+            mapped_blur_overlays: HashSet::new(),
+            overlay_anims: HashMap::new(),
+            blur_anim_commit: CommitCounter::default(),
+            last_blur_tex_commit: CommitCounter::default(),
+            chrome_blur_commit: CommitCounter::default(),
+            last_chrome_blur_tex_commit: CommitCounter::default(),
             screencopy_offscreen: None,
         }
     }
@@ -173,6 +302,192 @@ impl NeonRenderer {
 
     pub fn has_shaders(&self) -> bool {
         self.shaders.is_some()
+    }
+
+    /// Triggers a 60 FPS GPU open or close animation for a blurred shell overlay
+    /// (`"neon-quick-settings"`, `"neon-workspaces-panel"`, or `"neon-power-menu"`).
+    pub fn trigger_overlay_anim(&mut self, namespace: &str, opening: bool) {
+        let anim = if opening {
+            if self.mapped_blur_overlays.contains(namespace) {
+                OverlayAnim::Opening {
+                    started: Instant::now(),
+                }
+            } else {
+                OverlayAnim::PendingOpen {
+                    queued: Instant::now(),
+                }
+            }
+        } else {
+            OverlayAnim::Closing {
+                started: Instant::now(),
+            }
+        };
+        self.overlay_anims.insert(namespace.to_string(), anim);
+    }
+
+    /// Returns `true` while any shell overlay open/close GPU animation is still in progress
+    /// so the compositor schedules continuous VBlank-locked frames until settled.
+    pub fn has_active_overlay_animation(&self) -> bool {
+        self.overlay_anims.iter().any(|(ns, &anim)| {
+            let (_, _, _, _, active) = Self::eval_overlay_anim(ns, Some(anim));
+            active
+        })
+    }
+
+    /// Evaluates `(offset_x_logical, offset_y_logical, scale, alpha, is_animating)` for a shell overlay.
+    fn eval_overlay_anim(namespace: &str, anim: Option<OverlayAnim>) -> (f32, f32, f32, f32, bool) {
+        let Some(anim) = anim else {
+            return (0.0, 0.0, 1.0, 1.0, false);
+        };
+        if let OverlayAnim::PendingOpen { queued } = anim {
+            // Keep scheduling frames until GTK attaches its first real buffer (capped at 600ms).
+            return (0.0, 0.0, 1.0, 0.0, queued.elapsed().as_millis() < 600);
+        }
+        match namespace {
+            "neon-quick-settings" => match anim {
+                OverlayAnim::Opening { started } => {
+                    let elapsed = started.elapsed().as_secs_f32();
+                    const DUR: f32 = 0.25;
+                    if elapsed >= DUR {
+                        return (0.0, 0.0, 1.0, 1.0, false);
+                    }
+                    let t = (elapsed / DUR).clamp(0.0, 1.0);
+                    // Material 3 Expressive damped spring with subtle top-anchored overshoot
+                    // and smooth tail settle to exact 1.0 (zero end-frame pop).
+                    let raw =
+                        1.0 - (-8.5 * t).exp() * ((8.5 * t).cos() + 0.35 * (8.5 * t).sin());
+                    let tail = ((t - 0.85) / 0.15).clamp(0.0, 1.0);
+                    let smooth_tail = tail * tail * (3.0 - 2.0 * tail);
+                    let spring = raw * (1.0 - smooth_tail) + smooth_tail;
+                    let scale = (0.93 + 0.07 * spring).clamp(0.90, 1.018);
+                    let offset_y = -14.0 * (1.0 - spring);
+                    let at = (elapsed / 0.12).clamp(0.0, 1.0);
+                    let alpha = 1.0 - (1.0 - at).powi(3);
+                    (0.0, offset_y, scale, alpha, true)
+                }
+                OverlayAnim::Closing { started } => {
+                    let elapsed = started.elapsed().as_secs_f32();
+                    const DUR: f32 = 0.155;
+                    if elapsed >= DUR {
+                        return (0.0, -12.0, 0.935, 0.0, false);
+                    }
+                    let t = (elapsed / DUR).clamp(0.0, 1.0);
+                    let p = t * t * (3.0 - 2.0 * t);
+                    let scale = 1.0 - 0.065 * p;
+                    let offset_y = -12.0 * p;
+                    let alpha = (1.0 - p).clamp(0.0, 1.0);
+                    (0.0, offset_y, scale, alpha, true)
+                }
+                OverlayAnim::PendingOpen { .. } => unreachable!(),
+            },
+            "neon-workspaces-panel" => match anim {
+                OverlayAnim::Opening { started } => {
+                    let elapsed = started.elapsed().as_secs_f32();
+                    const DUR: f32 = 0.24;
+                    if elapsed >= DUR {
+                        return (0.0, 0.0, 1.0, 1.0, false);
+                    }
+                    let t = (elapsed / DUR).clamp(0.0, 1.0);
+                    // Critically-damped quartic ease-out (zero wobble, zero edge-clip glitch).
+                    let p = 1.0 - (1.0 - t).powi(4);
+                    let offset_x = -248.0 * (1.0 - p);
+                    let at = (elapsed / 0.11).clamp(0.0, 1.0);
+                    let alpha = 1.0 - (1.0 - at).powi(3);
+                    (offset_x, 0.0, 1.0, alpha, true)
+                }
+                OverlayAnim::Closing { started } => {
+                    let elapsed = started.elapsed().as_secs_f32();
+                    const DUR: f32 = 0.175;
+                    if elapsed >= DUR {
+                        return (-248.0, 0.0, 1.0, 0.0, false);
+                    }
+                    let t = (elapsed / DUR).clamp(0.0, 1.0);
+                    let p = t * t * (3.0 - 2.0 * t);
+                    let offset_x = -248.0 * p;
+                    let alpha = (1.0 - p).clamp(0.0, 1.0);
+                    (offset_x, 0.0, 1.0, alpha, true)
+                }
+                OverlayAnim::PendingOpen { .. } => unreachable!(),
+            },
+            "neon-screencast-picker" => match anim {
+                OverlayAnim::Opening { started } => {
+                    let elapsed = started.elapsed().as_secs_f32();
+                    const DUR: f32 = 0.22;
+                    if elapsed >= DUR {
+                        return (0.0, 0.0, 1.0, 1.0, false);
+                    }
+                    let t = (elapsed / DUR).clamp(0.0, 1.0);
+                    let p = 1.0 - (1.0 - t).powi(3);
+                    let scale = 0.94 + 0.06 * p;
+                    let offset_y = 14.0 * (1.0 - p);
+                    let at = (elapsed / 0.12).clamp(0.0, 1.0);
+                    let alpha = 1.0 - (1.0 - at).powi(3);
+                    (0.0, offset_y, scale, alpha, true)
+                }
+                OverlayAnim::Closing { started } => {
+                    let elapsed = started.elapsed().as_secs_f32();
+                    const DUR: f32 = 0.14;
+                    if elapsed >= DUR {
+                        return (0.0, 10.0, 0.95, 0.0, false);
+                    }
+                    let t = (elapsed / DUR).clamp(0.0, 1.0);
+                    let p = t * t * (3.0 - 2.0 * t);
+                    (0.0, 10.0 * p, 1.0 - 0.05 * p, (1.0 - p).clamp(0.0, 1.0), true)
+                }
+                OverlayAnim::PendingOpen { .. } => unreachable!(),
+            },
+            "neon-context-menu" | "neon-context-submenu" => match anim {
+                OverlayAnim::Opening { started } => {
+                    let elapsed = started.elapsed().as_secs_f32();
+                    const DUR: f32 = 0.135;
+                    if elapsed >= DUR {
+                        return (0.0, 0.0, 1.0, 1.0, false);
+                    }
+                    let t = (elapsed / DUR).clamp(0.0, 1.0);
+                    let p = 1.0 - (1.0 - t).powi(3);
+                    let scale = 0.955 + 0.045 * p;
+                    let offset_y = -4.0 * (1.0 - p);
+                    let at = (elapsed / 0.085).clamp(0.0, 1.0);
+                    let alpha = 1.0 - (1.0 - at).powi(2);
+                    (0.0, offset_y, scale, alpha, true)
+                }
+                OverlayAnim::Closing { started } => {
+                    let elapsed = started.elapsed().as_secs_f32();
+                    const DUR: f32 = 0.095;
+                    if elapsed >= DUR {
+                        return (0.0, -3.0, 0.96, 0.0, false);
+                    }
+                    let t = (elapsed / DUR).clamp(0.0, 1.0);
+                    let p = t * t * (3.0 - 2.0 * t);
+                    (0.0, -3.0 * p, 1.0 - 0.04 * p, (1.0 - p).clamp(0.0, 1.0), true)
+                }
+                OverlayAnim::PendingOpen { .. } => unreachable!(),
+            },
+            "neon-power-menu" => match anim {
+                OverlayAnim::Opening { started } => {
+                    let elapsed = started.elapsed().as_secs_f32();
+                    const DUR: f32 = 0.18;
+                    if elapsed >= DUR {
+                        return (0.0, 0.0, 1.0, 1.0, false);
+                    }
+                    let t = (elapsed / DUR).clamp(0.0, 1.0);
+                    let alpha = 1.0 - (1.0 - t).powi(3);
+                    (0.0, 0.0, 1.0, alpha, true)
+                }
+                OverlayAnim::Closing { started } => {
+                    let elapsed = started.elapsed().as_secs_f32();
+                    const DUR: f32 = 0.135;
+                    if elapsed >= DUR {
+                        return (0.0, 0.0, 1.0, 0.0, false);
+                    }
+                    let t = (elapsed / DUR).clamp(0.0, 1.0);
+                    let p = t * t * (3.0 - 2.0 * t);
+                    (0.0, 0.0, 1.0, (1.0 - p).clamp(0.0, 1.0), true)
+                }
+                OverlayAnim::PendingOpen { .. } => unreachable!(),
+            },
+            _ => (0.0, 0.0, 1.0, 1.0, false),
+        }
     }
 
     /// Collects render elements for a locked session (`ext_session_lock_v1`).
@@ -336,17 +651,87 @@ impl NeonRenderer {
             Vec::with_capacity(nodes.len() * 3 + override_redirect.len() * 2 + 8);
         let mut seen_windows: HashSet<WindowId> = HashSet::new();
 
-        // Collect zwlr_layer_shell_v1 surfaces on this output split into upper (Overlay/Top)
-        // and lower (Bottom/Background) strata so they composite in exact protocol Z-order.
-        let (upper_layers, lower_layers) = {
+        let has_fullscreen_window = nodes.iter().any(|n| {
+            matches!(
+                n.content,
+                NodeContent::Window {
+                    fullscreen: true,
+                    ..
+                }
+            )
+        });
+
+        // Collect zwlr_layer_shell_v1 surfaces on this output split into:
+        // - `front_overlays`: non-blur `Layer::Overlay` surfaces (context menus, toasts, screenshot UI)
+        // - `blur_overlays`: `Layer::Overlay` surfaces that receive a real-time GPU Gaussian backdrop
+        //   blur behind their exact bounds (`neon-quick-settings` rounded 24px, `neon-power-menu` full screen)
+        // - `backdrop_overlays`: transparent click-catcher backdrops stacked directly below blur overlays
+        // - `top_layers`: `Layer::Top` chrome (panel, dock, sensors) — completely omitted when a
+        //   fullscreen window is active and Overview is closed
+        // - `lower_layers`: `Layer::Bottom` / `Layer::Background` (wallpaper)
+        let (
+            front_overlays,
+            blur_overlays,
+            backdrop_overlays,
+            top_layers,
+            lower_layers,
+            has_overview_layer,
+        ) = {
             let layer_map = layer_map_for_output(output);
-            let mut upper = Vec::new();
+            let mut front = Vec::new();
+            let mut blur_ov = Vec::new();
+            let mut backdrop_ov = Vec::new();
+            let mut top = Vec::new();
             let mut lower = Vec::new();
-            for wlr_layer in [WlrLayer::Overlay, WlrLayer::Top] {
-                for layer in layer_map.layers_on(wlr_layer).rev() {
-                    if let Some(geo) = layer_map.layer_geometry(layer) {
-                        upper.push((layer.clone(), geo.loc));
+            let has_overview_layer = layer_map
+                .layers_on(WlrLayer::Top)
+                .any(|l| l.namespace() == "neon-overview");
+
+            for layer in layer_map.layers_on(WlrLayer::Overlay).rev() {
+                if let Some(geo) = layer_map.layer_geometry(layer) {
+                    match layer.namespace() {
+                        "neon-context-submenu" => {
+                            blur_ov.insert(0, (layer.clone(), geo, 13.0_f32, 22i32));
+                        }
+                        "neon-context-menu" => {
+                            let idx = usize::from(
+                                blur_ov
+                                    .first()
+                                    .is_some_and(|(l, _, _, _)| l.namespace() == "neon-context-submenu"),
+                            );
+                            blur_ov.insert(idx, (layer.clone(), geo, 13.0_f32, 22i32));
+                        }
+                        "neon-quick-settings" => {
+                            blur_ov.push((layer.clone(), geo, 24.0_f32, 0i32));
+                        }
+                        "neon-workspaces-panel" => {
+                            blur_ov.push((layer.clone(), geo, 16.0_f32, 0i32));
+                        }
+                        "neon-screencast-picker" => {
+                            blur_ov.push((layer.clone(), geo, 22.0_f32, 0i32));
+                        }
+                        "neon-power-menu" => {
+                            blur_ov.push((layer.clone(), geo, 0.0_f32, 0i32));
+                        }
+                        "neon-quick-settings-backdrop"
+                        | "neon-workspaces-backdrop"
+                        | "neon-screencast-picker-backdrop"
+                        | "neon-context-menu-backdrop" => {
+                            backdrop_ov.push((layer.clone(), geo.loc));
+                        }
+                        _ => {
+                            front.push((layer.clone(), geo.loc));
+                        }
                     }
+                }
+            }
+            for layer in layer_map.layers_on(WlrLayer::Top).rev() {
+                if let Some(geo) = layer_map.layer_geometry(layer)
+                    && (!has_fullscreen_window
+                        || has_overview_layer
+                        || layer.namespace() == "neon-overview")
+                {
+                    top.push((layer.clone(), geo));
                 }
             }
             for wlr_layer in [WlrLayer::Bottom, WlrLayer::Background] {
@@ -356,17 +741,22 @@ impl NeonRenderer {
                     }
                 }
             }
-            (upper, lower)
+            (
+                front,
+                blur_ov,
+                backdrop_ov,
+                top,
+                lower,
+                has_overview_layer,
+            )
         };
 
-        // Front-most: Overlay and Top layer surfaces (Context Menu, Overview, Top Panel, Dock).
-        for (layer, loc) in &upper_layers {
-            let phys_loc: Point<i32, Physical> = loc.to_physical_precise_round(scale_f);
-            let layer_elements = AsRenderElements::<GlesRenderer>::render_elements::<
-                WaylandSurfaceRenderElement<GlesRenderer>,
-            >(layer, renderer, phys_loc, scale, 1.0);
-            elements.extend(layer_elements.into_iter().map(NeonRenderElement::from));
-        }
+        let ws_slide = scene.workspace_slide();
+        let active_blur_strength = if blur.enabled && blur.strength > 0.01 {
+            blur.strength
+        } else {
+            0.0
+        };
 
         // XWayland override-redirect popups (context menus, dropdowns, tooltips) above windows.
         for &(or_win, loc) in override_redirect.iter().rev() {
@@ -391,12 +781,47 @@ impl NeonRenderer {
         for node in nodes {
             if !inserted_lower_layers && matches!(node.content, NodeContent::Backdrop { .. }) {
                 for (layer, loc) in &lower_layers {
-                    let phys_loc: Point<i32, Physical> = loc.to_physical_precise_round(scale_f);
-                    let layer_elements =
-                        AsRenderElements::<GlesRenderer>::render_elements::<
+                    if let Some(slide) = ws_slide {
+                        // Full-desktop Hyprland workspace slide: pan incoming and outgoing
+                        // wallpaper layers together with windows and dock across the 28px gutter.
+                        let in_loc: Point<i32, Logical> =
+                            (loc.x + slide.incoming_dx.round() as i32, loc.y).into();
+                        let in_phys: Point<i32, Physical> =
+                            in_loc.to_physical_precise_round(scale_f);
+                        let in_elems = AsRenderElements::<GlesRenderer>::render_elements::<
                             WaylandSurfaceRenderElement<GlesRenderer>,
-                        >(layer, renderer, phys_loc, scale, 1.0);
-                    elements.extend(layer_elements.into_iter().map(NeonRenderElement::from));
+                        >(layer, renderer, in_phys, scale, 1.0);
+                        elements.extend(in_elems.into_iter().map(NeonRenderElement::from));
+
+                        let out_loc: Point<i32, Logical> =
+                            (loc.x + slide.outgoing_dx.round() as i32, loc.y).into();
+                        let out_phys: Point<i32, Physical> =
+                            out_loc.to_physical_precise_round(scale_f);
+                        let out_elems = AsRenderElements::<GlesRenderer>::render_elements::<
+                            WaylandSurfaceRenderElement<GlesRenderer>,
+                        >(layer, renderer, out_phys, scale, 1.0);
+                        let ids = self
+                            .ws_slide_layer_ids
+                            .entry(format!("out:{}", layer.namespace()))
+                            .or_default();
+                        while ids.len() < out_elems.len() {
+                            ids.push(Id::new());
+                        }
+                        for (idx, elem) in out_elems.into_iter().enumerate() {
+                            elements.push(NeonRenderElement::from(TaggedWaylandElement::new(
+                                ids[idx].clone(),
+                                elem,
+                            )));
+                        }
+                    } else {
+                        let phys_loc: Point<i32, Physical> =
+                            loc.to_physical_precise_round(scale_f);
+                        let layer_elements =
+                            AsRenderElements::<GlesRenderer>::render_elements::<
+                                WaylandSurfaceRenderElement<GlesRenderer>,
+                            >(layer, renderer, phys_loc, scale, 1.0);
+                        elements.extend(layer_elements.into_iter().map(NeonRenderElement::from));
+                    }
                 }
                 inserted_lower_layers = true;
             }
@@ -415,7 +840,29 @@ impl NeonRenderer {
                 } => {
                     seen_windows.insert(*window_id);
 
+                    let mut skip_glass_backdrop = *fullscreen;
                     if let Some(window) = resolve_window(*window_id) {
+                        if let Some(x11) = window.x11_surface()
+                            && (x11.is_decorated()
+                                || x11.is_popup()
+                                || matches!(
+                                    x11.window_type(),
+                                    Some(
+                                        WmWindowType::Splash
+                                            | WmWindowType::Notification
+                                            | WmWindowType::Tooltip
+                                            | WmWindowType::PopupMenu
+                                            | WmWindowType::DropdownMenu
+                                            | WmWindowType::Menu
+                                            | WmWindowType::Toolbar
+                                    )
+                                ))
+                        {
+                            // Frameless / CSD / splash X11 windows (such as DaVinci Resolve)
+                            // manage their own chrome and transparency; avoid drawing a rectangular
+                            // frosted-glass box behind them.
+                            skip_glass_backdrop = true;
+                        }
                         let win_geo = window.geometry();
                         let (sx, sy) = node.scale;
                         let is_scaled = (sx - 1.0).abs() > 0.001 || (sy - 1.0).abs() > 0.001;
@@ -431,26 +878,148 @@ impl NeonRenderer {
                         let phys_loc: Point<i32, Physical> =
                             render_loc.to_physical_precise_round(scale_f);
 
-                        let surface_elements = AsRenderElements::<GlesRenderer>::render_elements::<
-                            WaylandSurfaceRenderElement<GlesRenderer>,
-                        >(
-                            window, renderer, phys_loc, scale, node.opacity
-                        );
-                        if is_scaled {
-                            let (cx, cy) = node.effective_center();
-                            let center_phys: Point<i32, Physical> =
-                                Point::<f64, Logical>::from((cx, cy))
-                                    .to_physical_precise_round(scale_f);
-                            let elem_scale = Scale::from((sx, sy));
-                            elements.extend(surface_elements.into_iter().map(|elem| {
-                                NeonRenderElement::from(RescaleRenderElement::from_element(
-                                    elem,
-                                    center_phys,
-                                    elem_scale,
-                                ))
-                            }));
+                        let rounded_program = if !*fullscreen
+                            && node.corner_radius > 0.5
+                            && eff_rect.size.w > 0
+                            && eff_rect.size.h > 0
+                        {
+                            self.shaders.as_ref().map(|s| s.rounded_window.clone())
                         } else {
-                            elements.extend(surface_elements.into_iter().map(NeonRenderElement::from));
+                            None
+                        };
+
+                        if let Some(program) = rounded_program {
+                            let win_phys: Rectangle<i32, Physical> =
+                                eff_rect.to_physical_precise_round(scale_f);
+                            let scale_min = sx.min(sy).clamp(0.1, 4.0);
+                            let bot_r_phys = (node.corner_radius as f64 * scale_f * scale_min) as f32;
+                            let top_r_phys = if node.titlebar.is_some() { 0.0 } else { bot_r_phys };
+                            let quant = (
+                                (top_r_phys * 10.0).round() as i32,
+                                (bot_r_phys * 10.0).round() as i32,
+                            );
+                            let radius_changed = self
+                                .rounded_radii_cache
+                                .insert(*window_id, quant)
+                                .is_some_and(|prev| prev != quant);
+
+                            // Emit XDG popups (menus, popovers, tooltips) unclipped above the window.
+                            let mut main_surface_elements: Vec<WaylandSurfaceRenderElement<GlesRenderer>> =
+                                Vec::new();
+                            match window.underlying_surface() {
+                                WindowSurface::Wayland(s) => {
+                                    let surface = s.wl_surface();
+                                    let popup_elems: Vec<WaylandSurfaceRenderElement<GlesRenderer>> =
+                                        PopupManager::popups_for_surface(surface)
+                                            .flat_map(|(popup, popup_offset)| {
+                                                let offset = (win_geo.loc + popup_offset
+                                                    - popup.geometry().loc)
+                                                    .to_physical_precise_round(scale_f);
+                                                render_elements_from_surface_tree(
+                                                    renderer,
+                                                    popup.wl_surface(),
+                                                    phys_loc + offset,
+                                                    scale,
+                                                    node.opacity,
+                                                    Kind::Unspecified,
+                                                )
+                                            })
+                                            .collect();
+                                    if is_scaled {
+                                        let (cx, cy) = node.effective_center();
+                                        let center_phys: Point<i32, Physical> =
+                                            Point::<f64, Logical>::from((cx, cy))
+                                                .to_physical_precise_round(scale_f);
+                                        let elem_scale = Scale::from((sx, sy));
+                                        elements.extend(popup_elems.into_iter().map(|elem| {
+                                            NeonRenderElement::from(
+                                                RescaleRenderElement::from_element(
+                                                    elem,
+                                                    center_phys,
+                                                    elem_scale,
+                                                ),
+                                            )
+                                        }));
+                                    } else {
+                                        elements.extend(
+                                            popup_elems.into_iter().map(NeonRenderElement::from),
+                                        );
+                                    }
+
+                                    main_surface_elements.extend(
+                                        render_elements_from_surface_tree(
+                                            renderer,
+                                            surface,
+                                            phys_loc,
+                                            scale,
+                                            node.opacity,
+                                            Kind::Unspecified,
+                                        ),
+                                    );
+                                }
+                                WindowSurface::X11(s) => {
+                                    main_surface_elements.extend(
+                                        AsRenderElements::<GlesRenderer>::render_elements::<
+                                            WaylandSurfaceRenderElement<GlesRenderer>,
+                                        >(
+                                            s, renderer, phys_loc, scale, node.opacity
+                                        ),
+                                    );
+                                }
+                            }
+
+                            let rounded_iter = main_surface_elements.into_iter().map(|elem| {
+                                RoundedSurfaceElement::new(
+                                    elem,
+                                    program.clone(),
+                                    win_phys,
+                                    top_r_phys,
+                                    bot_r_phys,
+                                    radius_changed,
+                                )
+                            });
+                            if is_scaled {
+                                let (cx, cy) = node.effective_center();
+                                let center_phys: Point<i32, Physical> =
+                                    Point::<f64, Logical>::from((cx, cy))
+                                        .to_physical_precise_round(scale_f);
+                                let elem_scale = Scale::from((sx, sy));
+                                elements.extend(rounded_iter.map(|elem| {
+                                    NeonRenderElement::from(RescaleRenderElement::from_element(
+                                        elem,
+                                        center_phys,
+                                        elem_scale,
+                                    ))
+                                }));
+                            } else {
+                                elements.extend(rounded_iter.map(NeonRenderElement::from));
+                            }
+                        } else {
+                            self.rounded_radii_cache.remove(window_id);
+                            let surface_elements =
+                                AsRenderElements::<GlesRenderer>::render_elements::<
+                                    WaylandSurfaceRenderElement<GlesRenderer>,
+                                >(
+                                    window, renderer, phys_loc, scale, node.opacity
+                                );
+                            if is_scaled {
+                                let (cx, cy) = node.effective_center();
+                                let center_phys: Point<i32, Physical> =
+                                    Point::<f64, Logical>::from((cx, cy))
+                                        .to_physical_precise_round(scale_f);
+                                let elem_scale = Scale::from((sx, sy));
+                                elements.extend(surface_elements.into_iter().map(|elem| {
+                                    NeonRenderElement::from(RescaleRenderElement::from_element(
+                                        elem,
+                                        center_phys,
+                                        elem_scale,
+                                    ))
+                                }));
+                            } else {
+                                elements.extend(
+                                    surface_elements.into_iter().map(NeonRenderElement::from),
+                                );
+                            }
                         }
                     }
 
@@ -488,14 +1057,17 @@ impl NeonRenderer {
                     };
 
                     if blur.enabled
-                        && !fullscreen
+                        && !skip_glass_backdrop
                         && frame_rect.size.w > 0
                         && frame_rect.size.h > 0
                         && let Some(elem) = self.get_or_update_glass(
                             *window_id,
                             frame_rect,
                             output_logical_size,
-                            blur,
+                            BlurSettings {
+                                corner_radius: node.corner_radius,
+                                ..blur
+                            },
                             node.opacity,
                         )
                     {
@@ -556,8 +1128,372 @@ impl NeonRenderer {
         self.border_cache.retain(|id, _| seen_windows.contains(id));
         self.glass_cache.retain(|id, _| seen_windows.contains(id));
         self.titlebar_cache.retain(|id, _| seen_windows.contains(id));
+        self.rounded_radii_cache
+            .retain(|id, _| seen_windows.contains(id));
 
-        elements
+        // Prepend `Layer::Top` chrome (Top Bar, Dock, App Drawer) above windows & wallpaper,
+        // applying unified GPU backdrop blur behind Top Bar and Dock from `active_blur_strength`.
+        let has_blur_chrome = !has_overview_layer
+            && top_layers
+                .iter()
+                .any(|(l, _)| matches!(l.namespace(), "neon-panel" | "neon-dock"));
+        let chrome_blur = if active_blur_strength > 0.01
+            && has_blur_chrome
+            && ws_slide.is_none()
+            && let Some(shaders) = self.shaders.clone()
+        {
+            self.chrome_blur_targets
+                .render_blurred_scene(
+                    renderer,
+                    output,
+                    &shaders,
+                    &elements,
+                    false,
+                    active_blur_strength,
+                    CHROME_BLUR_CACHE_TTL,
+                )
+                .map(|(tex, out_phys, commit, blend_alpha)| {
+                    if commit != self.last_chrome_blur_tex_commit {
+                        self.last_chrome_blur_tex_commit = commit;
+                        self.chrome_blur_commit.increment();
+                    }
+                    (
+                        tex,
+                        out_phys,
+                        self.chrome_blur_commit,
+                        shaders.rounded_window,
+                        blend_alpha,
+                    )
+                })
+        } else {
+            if ws_slide.is_some() || active_blur_strength <= 0.01 {
+                self.chrome_blur_targets.invalidate();
+            }
+            None
+        };
+
+        let mut scene_below_overlay: Vec<NeonRenderElement> =
+            Vec::with_capacity(elements.len() + top_layers.len() * 3 + 4);
+        for (layer, geo) in &top_layers {
+            let ns = layer.namespace();
+            if ns == "neon-dock"
+                && let Some(slide) = ws_slide
+            {
+                // Full-desktop Hyprland workspace slide: Dock glides out with the departing
+                // desktop while the incoming desktop's Dock enters smoothly from the opposite side.
+                let in_loc: Point<i32, Logical> =
+                    (geo.loc.x + slide.incoming_dx.round() as i32, geo.loc.y).into();
+                let in_phys: Point<i32, Physical> = in_loc.to_physical_precise_round(scale_f);
+                let in_elems = AsRenderElements::<GlesRenderer>::render_elements::<
+                    WaylandSurfaceRenderElement<GlesRenderer>,
+                >(layer, renderer, in_phys, scale, 1.0);
+                scene_below_overlay.extend(in_elems.into_iter().map(NeonRenderElement::from));
+
+                let out_loc: Point<i32, Logical> =
+                    (geo.loc.x + slide.outgoing_dx.round() as i32, geo.loc.y).into();
+                let out_phys: Point<i32, Physical> = out_loc.to_physical_precise_round(scale_f);
+                let out_elems = AsRenderElements::<GlesRenderer>::render_elements::<
+                    WaylandSurfaceRenderElement<GlesRenderer>,
+                >(layer, renderer, out_phys, scale, 1.0);
+                let ids = self
+                    .ws_slide_layer_ids
+                    .entry("out:neon-dock".to_string())
+                    .or_default();
+                while ids.len() < out_elems.len() {
+                    ids.push(Id::new());
+                }
+                for (idx, elem) in out_elems.into_iter().enumerate() {
+                    scene_below_overlay.push(NeonRenderElement::from(TaggedWaylandElement::new(
+                        ids[idx].clone(),
+                        elem,
+                    )));
+                }
+                continue;
+            }
+
+            let phys_loc: Point<i32, Physical> = geo.loc.to_physical_precise_round(scale_f);
+            let layer_elements = AsRenderElements::<GlesRenderer>::render_elements::<
+                WaylandSurfaceRenderElement<GlesRenderer>,
+            >(layer, renderer, phys_loc, scale, 1.0);
+            let has_committed = !layer_elements.is_empty();
+            scene_below_overlay.extend(layer_elements.into_iter().map(NeonRenderElement::from));
+
+            if has_committed
+                && geo.size.w > 0
+                && geo.size.h > 0
+                && let Some((ref blur_tex, out_phys, commit, ref rounded_prog, blend_alpha)) =
+                    chrome_blur
+            {
+                let blur_rect_and_radius: Option<(Rectangle<i32, Logical>, f32)> = match ns {
+                    "neon-panel" => Some((*geo, 0.0)),
+                    "neon-dock" => {
+                        if geo.size.h > geo.size.w {
+                            // Vertical Left/Right dock wrapper uses `padding: 16px 7px;`
+                            let pw = geo.size.w - 14;
+                            let ph = geo.size.h - 32;
+                            if pw > 16 && ph > 16 {
+                                let rad = if pw <= 42 { 15.0 } else { 20.0 };
+                                Some((
+                                    Rectangle::new(
+                                        (geo.loc.x + 7, geo.loc.y + 16).into(),
+                                        (pw, ph).into(),
+                                    ),
+                                    rad,
+                                ))
+                            } else {
+                                None
+                            }
+                        } else {
+                            // Horizontal Bottom dock wrapper uses `padding: 7px 20px 5px 20px;`
+                            let pw = geo.size.w - 40;
+                            let ph = geo.size.h - 12;
+                            if pw > 16 && ph > 16 {
+                                let rad = if ph <= 42 { 15.0 } else { 20.0 };
+                                Some((
+                                    Rectangle::new(
+                                        (geo.loc.x + 20, geo.loc.y + 7).into(),
+                                        (pw, ph).into(),
+                                    ),
+                                    rad,
+                                ))
+                            } else {
+                                None
+                            }
+                        }
+                    }
+                    _ => None,
+                };
+                if let Some((blur_rect, radius_logical)) = blur_rect_and_radius {
+                    let dst_phys: Rectangle<i32, Physical> =
+                        blur_rect.to_physical_precise_round(scale_f);
+                    let elem_id = self
+                        .blur_element_ids
+                        .entry(format!("chrome:{ns}"))
+                        .or_insert_with(Id::new)
+                        .clone();
+                    let radius_phys = radius_logical * scale_f as f32;
+                    if let Some(blur_elem) = BlurredBackdropElement::new(
+                        elem_id,
+                        commit,
+                        blur_tex.clone(),
+                        out_phys,
+                        dst_phys,
+                        radius_phys,
+                        (radius_phys > 0.5).then(|| rounded_prog.clone()),
+                        blend_alpha,
+                    ) {
+                        scene_below_overlay.push(NeonRenderElement::from(blur_elem));
+                    }
+                }
+            }
+        }
+        scene_below_overlay.extend(elements);
+        let elements = scene_below_overlay;
+
+        // Fast path when no `Layer::Overlay` surfaces are mapped (0 extra allocations / GPU passes).
+        if blur_overlays.is_empty() {
+            self.blur_targets.invalidate();
+            self.mapped_blur_overlays.clear();
+            // Keep any fresh IPC PendingOpen / Opening trigger until GTK commits its first buffer.
+            self.overlay_anims.retain(|_, anim| {
+                matches!(
+                    anim,
+                    OverlayAnim::PendingOpen { queued } if queued.elapsed().as_millis() < 600
+                ) || matches!(
+                    anim,
+                    OverlayAnim::Opening { started } if started.elapsed().as_millis() < 150
+                )
+            });
+        }
+        if front_overlays.is_empty() && blur_overlays.is_empty() && backdrop_overlays.is_empty() {
+            return elements;
+        }
+
+        // Pre-compute cached lightweight GPU Gaussian backdrop blur when Quick Settings,
+        // Workspaces Sidebar, or Power Menu is open and unified System Blur is active (> 0%).
+        let blurred_backdrop = if !blur_overlays.is_empty()
+            && active_blur_strength > 0.01
+            && let Some(shaders) = self.shaders.clone()
+        {
+            let heavy = blur_overlays
+                .iter()
+                .any(|(l, _, _, _)| l.namespace() == "neon-power-menu");
+            self.blur_targets
+                .render_blurred_scene(
+                    renderer,
+                    output,
+                    &shaders,
+                    &elements,
+                    heavy,
+                    active_blur_strength,
+                    OVERLAY_BLUR_CACHE_TTL,
+                )
+                .map(|(tex, out_phys, commit, blend_alpha)| {
+                    (tex, out_phys, commit, shaders.rounded_window, blend_alpha)
+                })
+        } else {
+            if active_blur_strength <= 0.01 {
+                self.blur_targets.invalidate();
+            }
+            None
+        };
+
+        let mut final_elements: Vec<NeonRenderElement> =
+            Vec::with_capacity(elements.len() + front_overlays.len() * 2 + blur_overlays.len() * 3 + 4);
+
+        for (layer, loc) in &front_overlays {
+            let phys_loc: Point<i32, Physical> = loc.to_physical_precise_round(scale_f);
+            let layer_elements = AsRenderElements::<GlesRenderer>::render_elements::<
+                WaylandSurfaceRenderElement<GlesRenderer>,
+            >(layer, renderer, phys_loc, scale, 1.0);
+            final_elements.extend(layer_elements.into_iter().map(NeonRenderElement::from));
+        }
+
+        let mut seen_blur_ns: HashSet<String> = HashSet::new();
+        for (layer, geo, corner_radius_logical, blur_inset_logical) in &blur_overlays {
+            let ns = layer.namespace();
+            seen_blur_ns.insert(ns.to_string());
+
+            let base_phys: Rectangle<i32, Physical> = geo.to_physical_precise_round(scale_f);
+            // Probe whether GTK has attached a real painted buffer yet before starting the
+            // opening clock so frame 0 of every overlay slide always begins cleanly at `t = 0.0`.
+            let probe_has_buffer = geo.size.w > 0
+                && geo.size.h > 0
+                && !AsRenderElements::<GlesRenderer>::render_elements::<
+                    WaylandSurfaceRenderElement<GlesRenderer>,
+                >(layer, renderer, base_phys.loc, scale, 1.0)
+                .is_empty();
+
+            if probe_has_buffer {
+                let first_commit = self.mapped_blur_overlays.insert(ns.to_string());
+                if first_commit
+                    || matches!(
+                        self.overlay_anims.get(ns),
+                        Some(OverlayAnim::PendingOpen { .. })
+                    )
+                {
+                    self.overlay_anims.insert(
+                        ns.to_string(),
+                        OverlayAnim::Opening {
+                            started: Instant::now(),
+                        },
+                    );
+                }
+            } else {
+                continue;
+            }
+
+            let (offset_x, offset_y, overlay_scale, alpha, is_animating) =
+                Self::eval_overlay_anim(ns, self.overlay_anims.get(ns).copied());
+            if alpha <= 0.005 {
+                continue;
+            }
+
+            let dx_phys = (offset_x as f64 * scale_f).round() as i32;
+            let dy_phys = (offset_y as f64 * scale_f).round() as i32;
+            let shifted_loc: Point<i32, Physical> =
+                (base_phys.loc.x + dx_phys, base_phys.loc.y + dy_phys).into();
+            let anchor_phys: Point<i32, Physical> =
+                (shifted_loc.x + base_phys.size.w / 2, shifted_loc.y).into();
+            let is_scaled = (overlay_scale - 1.0).abs() > 0.001;
+
+            let layer_elements = AsRenderElements::<GlesRenderer>::render_elements::<
+                WaylandSurfaceRenderElement<GlesRenderer>,
+            >(layer, renderer, shifted_loc, scale, alpha);
+            let has_committed = !layer_elements.is_empty();
+            if is_scaled {
+                let elem_scale = Scale::from((overlay_scale as f64, overlay_scale as f64));
+                final_elements.extend(layer_elements.into_iter().map(|elem| {
+                    NeonRenderElement::from(RescaleRenderElement::from_element(
+                        elem,
+                        anchor_phys,
+                        elem_scale,
+                    ))
+                }));
+            } else {
+                final_elements.extend(layer_elements.into_iter().map(NeonRenderElement::from));
+            }
+
+            let inset = *blur_inset_logical;
+            let blur_w_logical = geo.size.w - inset * 2;
+            let blur_h_logical = geo.size.h - inset * 2;
+            if has_committed
+                && blur_w_logical > 8
+                && blur_h_logical > 8
+                && let Some((ref blur_tex, out_phys, commit, ref rounded_prog, blend_alpha)) =
+                    blurred_backdrop
+            {
+                if is_animating || commit != self.last_blur_tex_commit {
+                    self.last_blur_tex_commit = commit;
+                    self.blur_anim_commit.increment();
+                }
+                let inset_phys = (inset as f64 * scale_f).round() as i32;
+                let inner_loc: Point<i32, Physical> =
+                    (shifted_loc.x + inset_phys, shifted_loc.y + inset_phys).into();
+                let inner_size: Size<i32, Physical> = (
+                    (base_phys.size.w - inset_phys * 2).max(1),
+                    (base_phys.size.h - inset_phys * 2).max(1),
+                )
+                    .into();
+                let dst_phys: Rectangle<i32, Physical> = if is_scaled {
+                    let sw = ((inner_size.w as f64) * overlay_scale as f64)
+                        .round()
+                        .max(1.0) as i32;
+                    let sh = ((inner_size.h as f64) * overlay_scale as f64)
+                        .round()
+                        .max(1.0) as i32;
+                    let scaled_inset_y = (inset_phys as f64 * overlay_scale as f64).round() as i32;
+                    Rectangle::new(
+                        (anchor_phys.x - sw / 2, anchor_phys.y + scaled_inset_y).into(),
+                        (sw, sh).into(),
+                    )
+                } else {
+                    Rectangle::new(inner_loc, inner_size)
+                };
+                let elem_id = self
+                    .blur_element_ids
+                    .entry(ns.to_string())
+                    .or_insert_with(Id::new)
+                    .clone();
+                let radius_phys = *corner_radius_logical * scale_f as f32 * overlay_scale;
+                if let Some(blur_elem) = BlurredBackdropElement::new(
+                    elem_id,
+                    self.blur_anim_commit,
+                    blur_tex.clone(),
+                    out_phys,
+                    dst_phys,
+                    radius_phys,
+                    (radius_phys > 0.5).then(|| rounded_prog.clone()),
+                    alpha * blend_alpha,
+                ) {
+                    final_elements.push(NeonRenderElement::from(blur_elem));
+                }
+            }
+        }
+        self.mapped_blur_overlays
+            .retain(|ns| seen_blur_ns.contains(ns));
+        self.overlay_anims.retain(|ns, anim| {
+            seen_blur_ns.contains(ns)
+                || matches!(
+                    anim,
+                    OverlayAnim::PendingOpen { queued } if queued.elapsed().as_millis() < 600
+                )
+                || matches!(
+                    anim,
+                    OverlayAnim::Opening { started } if started.elapsed().as_millis() < 150
+                )
+        });
+
+        for (layer, loc) in &backdrop_overlays {
+            let phys_loc: Point<i32, Physical> = loc.to_physical_precise_round(scale_f);
+            let layer_elements = AsRenderElements::<GlesRenderer>::render_elements::<
+                WaylandSurfaceRenderElement<GlesRenderer>,
+            >(layer, renderer, phys_loc, scale, 1.0);
+            final_elements.extend(layer_elements.into_iter().map(NeonRenderElement::from));
+        }
+
+        final_elements.extend(elements);
+        final_elements
     }
 
     /// Renders the retained [`SceneGraph`] into `framebuffer` with full `OutputDamageTracker` support.

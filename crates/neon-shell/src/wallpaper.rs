@@ -4,19 +4,26 @@
 //! desktop windows, top bar, and floating dock, and switches live when theme or wallpaper changes.
 
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
+    fs,
     path::{Path, PathBuf},
+    rc::Rc,
+    time::UNIX_EPOCH,
 };
 
 use gtk4::{
-    Application, ApplicationWindow, ContentFit, GestureClick, Picture, gdk, gdk_pixbuf, gio, glib,
-    prelude::*,
+    Align, Application, ApplicationWindow, Box as GtkBox, Button, ContentFit, GestureClick, Grid,
+    Label, Orientation, Overlay, Picture, gdk, gdk_pixbuf, gio, glib, prelude::*,
 };
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 use neon_ipc::AppearanceInfo;
 use tracing::info;
 
-use crate::context_menu::ContextMenuOverlay;
+use crate::{
+    context_menu::ContextMenuOverlay,
+    desktop_apps::{load_app_icon, parse_desktop_file},
+    file_ops::{desktop_dir, icon_for_path, open_path},
+};
 
 /// Decodes an image file scaled down to fit within `max_w × max_h` before GPU upload,
 /// avoiding multi-hundred-megabyte uncompressed 6K textures and heavy blur bandwidth.
@@ -157,11 +164,18 @@ fn box_blur_v(src: &[u8], dst: &mut [u8], w: usize, h: usize, r: usize) {
     }
 }
 
-/// Live background wallpaper surface managed by `neon-shell`.
+/// Live background wallpaper + interactive Desktop Icons (`~/Desktop`) surface managed by `neon-shell`.
+#[derive(Clone)]
 pub struct WallpaperLayer {
-    _window: ApplicationWindow,
+    window: ApplicationWindow,
     picture: Picture,
-    current_path: RefCell<Option<PathBuf>>,
+    icons_grid: Grid,
+    current_path: Rc<RefCell<Option<PathBuf>>>,
+    show_icons: Rc<Cell<bool>>,
+    sort_by: Rc<RefCell<String>>,
+    last_dir_sig: Rc<Cell<u64>>,
+    selected_tile: Rc<RefCell<Option<Button>>>,
+    context_menu: ContextMenuOverlay,
 }
 
 impl WallpaperLayer {
@@ -185,37 +199,75 @@ impl WallpaperLayer {
             window.set_keyboard_mode(KeyboardMode::None);
         }
 
+        let overlay = Overlay::new();
+
         let picture = Picture::new();
         picture.set_content_fit(ContentFit::Cover);
         picture.set_can_shrink(true);
         picture.set_hexpand(true);
         picture.set_vexpand(true);
         picture.add_css_class("neon-wallpaper-picture");
+        overlay.set_child(Some(&picture));
 
-        // Right-clicking anywhere on the desktop wallpaper opens the OS Desktop Context Menu.
+        let icons_grid = Grid::new();
+        icons_grid.add_css_class("neon-desktop-icons-layer");
+        icons_grid.set_row_spacing(12);
+        icons_grid.set_column_spacing(14);
+        icons_grid.set_halign(Align::Start);
+        icons_grid.set_valign(Align::Start);
+        icons_grid.set_visible(true);
+        overlay.add_overlay(&icons_grid);
+
+        let selected_tile: Rc<RefCell<Option<Button>>> = Rc::new(RefCell::new(None));
+
+        // Left-clicking empty wallpaper clears Desktop icon selection.
+        {
+            let clear_click = GestureClick::new();
+            clear_click.set_button(1);
+            let sel = Rc::clone(&selected_tile);
+            clear_click.connect_pressed(move |_, _, _, _| {
+                if let Some(prev) = sel.borrow_mut().take() {
+                    prev.remove_css_class("selected");
+                }
+            });
+            picture.add_controller(clear_click);
+        }
+
+        // Right-clicking empty desktop canvas opens the macOS Desktop Context Menu.
+        // Right-clicking an icon tile claims the gesture first and opens the File/Folder menu.
         let right_click = GestureClick::new();
         right_click.set_button(3);
-        right_click.connect_pressed(move |_, _, x, y| {
-            context_menu.open_desktop_menu(x.round() as i32, y.round() as i32);
-        });
+        {
+            let cm = context_menu.clone();
+            right_click.connect_pressed(move |_, _, x, y| {
+                cm.open_desktop_menu(x.round() as i32, y.round() as i32);
+            });
+        }
         window.add_controller(right_click);
 
-        window.set_child(Some(&picture));
+        window.set_child(Some(&overlay));
         window.set_cursor_from_name(Some("default"));
         window.present();
 
         let layer = Self {
-            _window: window,
+            window,
             picture,
-            current_path: RefCell::new(None),
+            icons_grid,
+            current_path: Rc::new(RefCell::new(None)),
+            show_icons: Rc::new(Cell::new(true)),
+            sort_by: Rc::new(RefCell::new("name".to_string())),
+            last_dir_sig: Rc::new(Cell::new(0)),
+            selected_tile,
+            context_menu,
         };
         if let Some(default_wp) = resolve_wallpaper_path(None, false) {
             layer.apply_path(&default_wp);
         }
+        layer.refresh_icons();
         layer
     }
 
-    /// Updates the rendered wallpaper if theme or configured wallpaper path changed.
+    /// Updates wallpaper, desktop icon visibility, and sort mode when appearance changes.
     pub fn update(&self, appearance: &AppearanceInfo) {
         let is_light = appearance.theme == "neon_light" || appearance.theme == "light";
         let resolved = resolve_wallpaper_path(appearance.wallpaper.as_deref(), is_light);
@@ -223,6 +275,228 @@ impl WallpaperLayer {
             && self.current_path.borrow().as_ref() != Some(&path)
         {
             self.apply_path(&path);
+        }
+
+        let prev_show = self.show_icons.get();
+        let sort_changed = *self.sort_by.borrow() != appearance.desktop_sort_by;
+        if sort_changed {
+            *self.sort_by.borrow_mut() = appearance.desktop_sort_by.clone();
+        }
+        if prev_show != appearance.show_desktop_icons {
+            self.show_icons.set(appearance.show_desktop_icons);
+            self.icons_grid.set_visible(appearance.show_desktop_icons);
+            if appearance.show_desktop_icons {
+                self.refresh_icons();
+                return;
+            }
+        }
+        if appearance.show_desktop_icons {
+            let sig = desktop_dir_signature(&desktop_dir());
+            if sort_changed || sig != self.last_dir_sig.get() {
+                self.refresh_icons();
+            }
+        }
+    }
+
+    /// Enables desktop icon visibility and rescans `~/Desktop` immediately (e.g. after New Folder).
+    pub fn force_show_and_refresh(&self) {
+        self.show_icons.set(true);
+        self.icons_grid.set_visible(true);
+        self.refresh_icons();
+    }
+
+    /// Lightweight periodic watcher so files/folders created externally appear automatically.
+    pub fn poll_dir_if_visible(&self) {
+        if !self.show_icons.get() {
+            return;
+        }
+        let sig = desktop_dir_signature(&desktop_dir());
+        if sig != self.last_dir_sig.get() {
+            self.refresh_icons();
+        }
+    }
+
+    /// Rescans `~/Desktop` and rebuilds the interactive Desktop icons grid immediately.
+    pub fn refresh_icons(&self) {
+        let dir = desktop_dir();
+        self.last_dir_sig.set(desktop_dir_signature(&dir));
+        self.selected_tile.borrow_mut().take();
+
+        while let Some(child) = self.icons_grid.first_child() {
+            self.icons_grid.remove(&child);
+        }
+
+        if !self.show_icons.get() {
+            self.icons_grid.set_visible(false);
+            return;
+        }
+        self.icons_grid.set_visible(true);
+
+        let Ok(rd) = fs::read_dir(&dir) else {
+            return;
+        };
+
+        struct DesktopEntry {
+            path: PathBuf,
+            display_name: String,
+            icon_spec: String,
+            is_dir: bool,
+            size: u64,
+            modified: u64,
+            ext: String,
+        }
+
+        let mut entries: Vec<DesktopEntry> = rd
+            .flatten()
+            .filter_map(|e| {
+                let path = e.path();
+                let fname = e.file_name().to_string_lossy().into_owned();
+                if fname.starts_with('.') {
+                    return None;
+                }
+                let meta = fs::metadata(&path).ok();
+                let is_dir = meta.as_ref().map(|m| m.is_dir()).unwrap_or(false);
+                let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+                let modified = meta
+                    .as_ref()
+                    .and_then(|m| m.modified().ok())
+                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let ext = path
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("")
+                    .to_lowercase();
+
+                let (display_name, icon_spec) = if !is_dir && ext == "desktop" {
+                    if let Some(stem) = path.file_stem().and_then(|s| s.to_str())
+                        && let Some(app) = parse_desktop_file(&path, stem)
+                    {
+                        (
+                            app.name,
+                            app.icon.unwrap_or_else(|| "application-x-executable".into()),
+                        )
+                    } else {
+                        (fname.clone(), icon_for_path(&path))
+                    }
+                } else {
+                    (fname.clone(), icon_for_path(&path))
+                };
+
+                Some(DesktopEntry {
+                    path,
+                    display_name,
+                    icon_spec,
+                    is_dir,
+                    size,
+                    modified,
+                    ext,
+                })
+            })
+            .collect();
+
+        let sort_mode = self.sort_by.borrow().clone();
+        entries.sort_by(|a, b| {
+            // Folders first unless sorting purely by date modified
+            if sort_mode != "modified" && a.is_dir != b.is_dir {
+                return b.is_dir.cmp(&a.is_dir);
+            }
+            match sort_mode.as_str() {
+                "modified" => b
+                    .modified
+                    .cmp(&a.modified)
+                    .then_with(|| a.display_name.to_lowercase().cmp(&b.display_name.to_lowercase())),
+                "size" => b
+                    .size
+                    .cmp(&a.size)
+                    .then_with(|| a.display_name.to_lowercase().cmp(&b.display_name.to_lowercase())),
+                "type" => a
+                    .ext
+                    .cmp(&b.ext)
+                    .then_with(|| a.display_name.to_lowercase().cmp(&b.display_name.to_lowercase())),
+                _ => a
+                    .display_name
+                    .to_lowercase()
+                    .cmp(&b.display_name.to_lowercase()),
+            }
+        });
+
+        const MAX_ROWS_PER_COL: usize = 6;
+        for (idx, item) in entries.into_iter().take(42).enumerate() {
+            let col = (idx / MAX_ROWS_PER_COL) as i32;
+            let row = (idx % MAX_ROWS_PER_COL) as i32;
+
+            let tile = Button::new();
+            tile.add_css_class("neon-desktop-icon-tile");
+            tile.set_tooltip_text(Some(&item.display_name));
+
+            let vbox = GtkBox::new(Orientation::Vertical, 6);
+            vbox.set_halign(Align::Center);
+            vbox.set_valign(Align::Center);
+
+            let icon = load_app_icon(Some(&item.icon_spec), &item.display_name, 48);
+            icon.set_halign(Align::Center);
+            vbox.append(&icon);
+
+            let lbl = Label::new(Some(&item.display_name));
+            lbl.add_css_class("neon-desktop-icon-label");
+            lbl.set_halign(Align::Center);
+            lbl.set_max_width_chars(12);
+            lbl.set_lines(2);
+            lbl.set_wrap(true);
+            lbl.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
+            lbl.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+            lbl.set_justify(gtk4::Justification::Center);
+            vbox.append(&lbl);
+
+            tile.set_child(Some(&vbox));
+
+            // Single-click selects; double-click launches/opens.
+            {
+                let click = GestureClick::new();
+                click.set_button(1);
+                let sel = Rc::clone(&self.selected_tile);
+                let tile_c = tile.clone();
+                let p = item.path.clone();
+                click.connect_pressed(move |gesture, n_press, _, _| {
+                    gesture.set_state(gtk4::EventSequenceState::Claimed);
+                    if let Some(prev) = sel.borrow_mut().replace(tile_c.clone()) {
+                        prev.remove_css_class("selected");
+                    }
+                    tile_c.add_css_class("selected");
+                    if n_press >= 2 {
+                        open_path(&p);
+                    }
+                });
+                tile.add_controller(click);
+            }
+
+            // Right-click selects tile & opens the Files & Folders macOS context menu!
+            {
+                let rc = GestureClick::new();
+                rc.set_button(3);
+                let cm = self.context_menu.clone();
+                let sel = Rc::clone(&self.selected_tile);
+                let win_c = self.window.clone();
+                let tile_c = tile.clone();
+                let p = item.path;
+                rc.connect_pressed(move |gesture, _, lx, ly| {
+                    gesture.set_state(gtk4::EventSequenceState::Claimed);
+                    if let Some(prev) = sel.borrow_mut().replace(tile_c.clone()) {
+                        prev.remove_css_class("selected");
+                    }
+                    tile_c.add_css_class("selected");
+                    let (sx, sy) = tile_c
+                        .compute_bounds(&win_c)
+                        .map(|b| ((b.x() as f64 + lx).round() as i32, (b.y() as f64 + ly).round() as i32))
+                        .unwrap_or((lx.round() as i32 + 40, ly.round() as i32 + 60));
+                    cm.open_file_menu(sx, sy, p.clone());
+                });
+                tile.add_controller(rc);
+            }
+
+            self.icons_grid.attach(&tile, col, row, 1, 1);
         }
     }
 
@@ -236,6 +510,43 @@ impl WallpaperLayer {
         *self.current_path.borrow_mut() = Some(path.to_path_buf());
         info!(wallpaper = %path.display(), "Applied NEON DE desktop wallpaper");
     }
+}
+
+fn desktop_dir_signature(dir: &Path) -> u64 {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    let Ok(rd) = fs::read_dir(dir) else {
+        return hash;
+    };
+    let mut items: Vec<(String, u64, u64)> = rd
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if name.starts_with('.') {
+                return None;
+            }
+            let m = fs::metadata(e.path()).ok();
+            let sz = m.as_ref().map(|x| x.len()).unwrap_or(0);
+            let mt = m
+                .as_ref()
+                .and_then(|x| x.modified().ok())
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            Some((name, sz, mt))
+        })
+        .collect();
+    items.sort();
+    for (name, sz, mt) in items {
+        for b in name.as_bytes() {
+            hash ^= u64::from(*b);
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        for b in sz.to_le_bytes().into_iter().chain(mt.to_le_bytes()) {
+            hash ^= u64::from(b);
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+    }
+    hash
 }
 
 pub fn resolve_wallpaper_path(explicit: Option<&str>, is_light: bool) -> Option<PathBuf> {

@@ -91,6 +91,13 @@ pub fn build_page(ctrl: Rc<SettingsController>) -> ScrolledWindow {
                 b.remove_css_class("active");
             }
             me.add_css_class("active");
+            let is_light = matches!(mode, ThemeMode::NeonLight);
+            if let Some(settings) = gtk4::Settings::default() {
+                settings.set_gtk_application_prefer_dark_theme(!is_light);
+            }
+            std::thread::spawn(move || {
+                neon_system::portals::sync_system_color_scheme(is_light);
+            });
             let req = build_appearance_request(&ctrl_c.config.borrow());
             ctrl_c.persist_and_sync(Some(req), msg);
         });
@@ -298,11 +305,15 @@ pub fn build_page(ctrl: Rc<SettingsController>) -> ScrolledWindow {
     page.append(&section_heading("Glass & Surface"));
     let blur_card = boxed_card();
 
-    let (reduce_blur, blur_strength, corner_radius, shadows_on, high_contrast) = {
+    let (system_blur_pct, corner_radius, shadows_on, high_contrast) = {
         let c = ctrl.config.borrow();
+        let effective_strength = if c.appearance.reduce_blur || !c.effects.blur_enabled {
+            0.0
+        } else {
+            c.effects.blur_strength.clamp(0.0, 2.0)
+        };
         (
-            c.appearance.reduce_blur,
-            f64::from(c.effects.blur_strength),
+            f64::from(effective_strength * 50.0).round(),
             f64::from(c.effects.corner_radius),
             c.effects.shadows_enabled,
             c.privacy_accessibility.high_contrast,
@@ -312,38 +323,32 @@ pub fn build_page(ctrl: Rc<SettingsController>) -> ScrolledWindow {
     append_rows(
         &blur_card,
         vec![
-            toggle_row(
-                "Reduce Blur",
-                "Use cleaner translucent surfaces with lower GPU load.",
-                reduce_blur,
-                {
-                    let ctrl_c = Rc::clone(&ctrl);
-                    move |active| {
-                        ctrl_c.config.borrow_mut().appearance.reduce_blur = active;
-                        let req = build_appearance_request(&ctrl_c.config.borrow());
-                        ctrl_c.persist_and_sync(Some(req), "Updated blur mode");
-                    }
-                },
-            ),
             slider_row(
-                "Blur Intensity",
-                "Controls glass blur strength across panels and App Drawer.",
+                "System Blur",
+                "Controls blur intensity everywhere: Top Bar, Dock, Quick Settings, Workspaces, Power Menu, App Drawer, and glass surfaces (0% disables blur).",
                 0.0,
-                2.0,
-                0.05,
-                blur_strength,
-                2,
+                100.0,
+                5.0,
+                system_blur_pct,
+                0,
                 {
                     let ctrl_c = Rc::clone(&ctrl);
-                    move |val| {
-                        let v = val as f32;
+                    move |pct| {
+                        let v = (pct / 50.0).clamp(0.0, 2.0) as f32;
+                        let on = pct > 0.5;
                         {
                             let mut c = ctrl_c.config.borrow_mut();
                             c.effects.blur_strength = v;
-                            c.effects.blur_enabled = v > 0.05;
+                            c.effects.blur_enabled = on;
+                            c.appearance.reduce_blur = !on;
                         }
-                        let req = build_appearance_request(&ctrl_c.config.borrow());
-                        ctrl_c.persist_and_sync(Some(req), &format!("Blur intensity: {v:.2}x"));
+                        let fx_req = build_effects_request(&ctrl_c.config.borrow());
+                        let app_req = build_appearance_request(&ctrl_c.config.borrow());
+                        ctrl_c.persist_and_sync(
+                            Some(app_req),
+                            &format!("System blur: {:.0}%", pct),
+                        );
+                        let _ = ctrl_c.send_ipc(fx_req);
                     }
                 },
             ),

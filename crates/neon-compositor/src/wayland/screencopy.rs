@@ -1,12 +1,26 @@
 //! `zwlr_screencopy_manager_v1` (v3) server implementation for **NEON DE**.
 //!
-//! Enables live Wayland screen capture for `xdg-desktop-portal-wlr` (OBS Studio, browser
-//! WebRTC screen sharing, Discord/Meet), `grim`, and `wf-recorder` via client `wl_shm` buffers.
+//! Supports BOTH zero-copy hardware `linux_dmabuf` (DMA-BUF) rendering (60 FPS OBS Studio,
+//! `xdg-desktop-portal-wlr`, PipeWire) AND `wl_shm` CPU-buffer fallback (`grim`, regions).
 
 use std::{sync::Mutex, time::Duration};
 
-use neon_renderer::screenshot::copy_rgba_region_to_shm;
+use neon_ipc::ScreencastTarget;
+use neon_renderer::{
+    BlurSettings, FALLBACK_CLEAR_COLOR, NeonRenderElement, NeonRenderer,
+    screenshot::{
+        WINDOW_CAPTURE_BG_COLOR, capture_output_to_dmabuf, capture_preview_png_async,
+        capture_window_to_dmabuf, capture_workspace_to_dmabuf, collect_window_capture_elements,
+        collect_workspace_capture_elements, copy_rgba_region_to_shm,
+    },
+};
+use neon_window_manager::WindowId;
 use smithay::{
+    backend::{
+        allocator::{Buffer as AllocBuffer, Fourcc, dmabuf::Dmabuf},
+        renderer::gles::GlesRenderer,
+    },
+    desktop::Window,
     output::Output,
     reexports::{
         wayland_protocols_wlr::screencopy::v1::server::{
@@ -18,11 +32,19 @@ use smithay::{
             protocol::{wl_buffer::WlBuffer, wl_shm},
         },
     },
-    wayland::shm::{BufferData, with_buffer_contents, with_buffer_contents_mut},
+    utils::{Logical, Point},
+    wayland::{
+        dmabuf::get_dmabuf,
+        session_lock::LockSurface,
+        shm::{BufferData, with_buffer_contents, with_buffer_contents_mut},
+    },
 };
 use tracing::{debug, warn};
 
-use crate::state::NeonState;
+use crate::{
+    state::{NeonState, PendingPreviewCapture},
+    window::from_wm_point,
+};
 
 /// Per-frame protocol state attached to each `zwlr_screencopy_frame_v1` resource.
 #[derive(Debug)]
@@ -30,15 +52,25 @@ pub struct ScreencopyFrameData {
     pub output_name: String,
     /// Physical pixel capture box `[x, y, width, height]` within the output buffer.
     pub region: [i32; 4],
+    pub is_full_output: bool,
     pub overlay_cursor: bool,
     pub used: bool,
+}
+
+/// Target backing buffer for a queued screencopy frame.
+#[derive(Debug)]
+pub enum ScreencopyTarget {
+    /// Hardware zero-copy DMA-BUF (`zwp_linux_dmabuf_v1` buffer).
+    Dmabuf(Dmabuf),
+    /// Shared-memory CPU buffer (`wl_shm`).
+    Shm(WlBuffer),
 }
 
 /// Queued screencopy copy request awaiting the compositor's GPU render pass.
 #[derive(Debug)]
 pub struct PendingScreencopyFrame {
     pub frame: ZwlrScreencopyFrameV1,
-    pub buffer: WlBuffer,
+    pub target: ScreencopyTarget,
     pub output_name: String,
     pub region: [i32; 4],
     pub overlay_cursor: bool,
@@ -65,7 +97,7 @@ impl GlobalDispatch<ZwlrScreencopyManagerV1, ()> for NeonState {
 
 impl Dispatch<ZwlrScreencopyManagerV1, ()> for NeonState {
     fn request(
-        _state: &mut Self,
+        state: &mut Self,
         _client: &Client,
         _resource: &ZwlrScreencopyManagerV1,
         request: zwlr_screencopy_manager_v1::Request,
@@ -73,13 +105,21 @@ impl Dispatch<ZwlrScreencopyManagerV1, ()> for NeonState {
         _dhandle: &DisplayHandle,
         data_init: &mut DataInit<'_, Self>,
     ) {
+        let supports_dmabuf = state.dmabuf_global.is_some();
         match request {
             zwlr_screencopy_manager_v1::Request::CaptureOutput {
                 frame,
                 overlay_cursor,
                 output,
             } => {
-                init_screencopy_frame(frame, overlay_cursor != 0, &output, None, data_init);
+                init_screencopy_frame(
+                    frame,
+                    overlay_cursor != 0,
+                    &output,
+                    None,
+                    supports_dmabuf,
+                    data_init,
+                );
             }
             zwlr_screencopy_manager_v1::Request::CaptureOutputRegion {
                 frame,
@@ -95,6 +135,7 @@ impl Dispatch<ZwlrScreencopyManagerV1, ()> for NeonState {
                     overlay_cursor != 0,
                     &output,
                     Some([x, y, width, height]),
+                    false,
                     data_init,
                 );
             }
@@ -109,6 +150,7 @@ fn init_screencopy_frame(
     overlay_cursor: bool,
     wl_output: &smithay::reexports::wayland_server::protocol::wl_output::WlOutput,
     logical_region: Option<[i32; 4]>,
+    advertise_dmabuf: bool,
     data_init: &mut DataInit<'_, NeonState>,
 ) {
     let Some(output) = Output::from_resource(wl_output) else {
@@ -117,6 +159,7 @@ fn init_screencopy_frame(
             Mutex::new(ScreencopyFrameData {
                 output_name: String::new(),
                 region: [0, 0, 0, 0],
+                is_full_output: false,
                 overlay_cursor,
                 used: true,
             }),
@@ -131,6 +174,7 @@ fn init_screencopy_frame(
             Mutex::new(ScreencopyFrameData {
                 output_name: output.name(),
                 region: [0, 0, 0, 0],
+                is_full_output: false,
                 overlay_cursor,
                 used: true,
             }),
@@ -143,6 +187,7 @@ fn init_screencopy_frame(
     let out_h = mode.size.h;
     let scale = output.current_scale().fractional_scale();
 
+    let is_full_output = logical_region.is_none();
     let region = if let Some([lx, ly, lw, lh]) = logical_region {
         let px = ((lx as f64) * scale).round() as i32;
         let py = ((ly as f64) * scale).round() as i32;
@@ -164,6 +209,7 @@ fn init_screencopy_frame(
         Mutex::new(ScreencopyFrameData {
             output_name: output.name(),
             region,
+            is_full_output,
             overlay_cursor,
             used: pw <= 0 || ph <= 0,
         }),
@@ -175,8 +221,11 @@ fn init_screencopy_frame(
     }
 
     let stride = (pw as u32).saturating_mul(4);
-    frame.buffer(wl_shm::Format::Argb8888, pw as u32, ph as u32, stride);
+    frame.buffer(wl_shm::Format::Xrgb8888, pw as u32, ph as u32, stride);
     if frame.version() >= 3 {
+        if advertise_dmabuf && is_full_output {
+            frame.linux_dmabuf(Fourcc::Xrgb8888 as u32, pw as u32, ph as u32);
+        }
         frame.buffer_done();
     }
     debug!(
@@ -184,6 +233,7 @@ fn init_screencopy_frame(
         width = pw,
         height = ph,
         overlay_cursor,
+        dmabuf = advertise_dmabuf && is_full_output,
         "Initialized zwlr_screencopy_frame_v1"
     );
 }
@@ -205,7 +255,7 @@ impl Dispatch<ZwlrScreencopyFrameV1, Mutex<ScreencopyFrameData>> for NeonState {
             _ => return,
         };
 
-        let (output_name, region, overlay_cursor) = {
+        let (output_name, region, is_full_output, overlay_cursor) = {
             let mut guard = data.lock().expect("screencopy frame lock");
             if guard.used {
                 resource.post_error(
@@ -215,11 +265,38 @@ impl Dispatch<ZwlrScreencopyFrameV1, Mutex<ScreencopyFrameData>> for NeonState {
                 return;
             }
             guard.used = true;
-            (guard.output_name.clone(), guard.region, guard.overlay_cursor)
+            (
+                guard.output_name.clone(),
+                guard.region,
+                guard.is_full_output,
+                guard.overlay_cursor,
+            )
         };
 
-        // Validate wl_shm buffer attributes strictly before queueing.
-        let valid = with_buffer_contents(&buffer, |_, pool_len, bdata: BufferData| {
+        // 1. Zero-copy DMA-BUF path (preferred by xdg-desktop-portal-wlr + OBS PipeWire)
+        if let Ok(dmabuf) = get_dmabuf(&buffer) {
+            let sz = dmabuf.size();
+            if is_full_output && sz.w == region[2] && sz.h == region[3] {
+                state.pending_screencopy_frames.push(PendingScreencopyFrame {
+                    frame: resource.clone(),
+                    target: ScreencopyTarget::Dmabuf(dmabuf.clone()),
+                    output_name,
+                    region,
+                    overlay_cursor,
+                    with_damage,
+                });
+                state.needs_redraw = true;
+                return;
+            }
+            resource.post_error(
+                zwlr_screencopy_frame_v1::Error::InvalidBuffer,
+                "invalid dmabuf dimensions for screencopy",
+            );
+            return;
+        }
+
+        // 2. Fallback wl_shm buffer path (grim, region captures, software clients)
+        let valid_shm = with_buffer_contents(&buffer, |_, pool_len, bdata: BufferData| {
             let supported_fmt = matches!(
                 bdata.format,
                 wl_shm::Format::Argb8888
@@ -241,17 +318,17 @@ impl Dispatch<ZwlrScreencopyFrameV1, Mutex<ScreencopyFrameData>> for NeonState {
         })
         .unwrap_or(false);
 
-        if !valid {
+        if !valid_shm {
             resource.post_error(
                 zwlr_screencopy_frame_v1::Error::InvalidBuffer,
-                "invalid wl_shm buffer dimensions, stride, or format for screencopy",
+                "invalid buffer dimensions, stride, or format for screencopy",
             );
             return;
         }
 
         state.pending_screencopy_frames.push(PendingScreencopyFrame {
             frame: resource.clone(),
-            buffer,
+            target: ScreencopyTarget::Shm(buffer),
             output_name,
             region,
             overlay_cursor,
@@ -261,10 +338,29 @@ impl Dispatch<ZwlrScreencopyFrameV1, Mutex<ScreencopyFrameData>> for NeonState {
     }
 }
 
-/// Completes a queued `zwlr_screencopy_frame_v1` by copying the captured RGBA8 frame
-/// into its client `wl_shm` buffer and sending `flags`, optional `damage`, and `ready`.
-pub fn complete_screencopy_frame(
+/// Emits `flags`, optional `damage`, and `ready` on a completed `zwlr_screencopy_frame_v1`.
+pub fn emit_screencopy_ready(pending: &PendingScreencopyFrame, timestamp: Duration) {
+    if !pending.frame.is_alive() {
+        return;
+    }
+    pending.frame.flags(FrameFlags::empty());
+    if pending.with_damage && pending.frame.version() >= 2 {
+        pending
+            .frame
+            .damage(0, 0, pending.region[2] as u32, pending.region[3] as u32);
+    }
+    let secs = timestamp.as_secs();
+    let tv_sec_hi = (secs >> 32) as u32;
+    let tv_sec_lo = (secs & 0xFFFF_FFFF) as u32;
+    let tv_nsec = timestamp.subsec_nanos();
+    pending.frame.ready(tv_sec_hi, tv_sec_lo, tv_nsec);
+}
+
+/// Completes a queued `wl_shm` `zwlr_screencopy_frame_v1` by copying captured RGBA8 pixels
+/// into the client's `wl_shm` buffer and sending `flags`, optional `damage`, and `ready`.
+pub fn complete_screencopy_shm_frame(
     pending: &PendingScreencopyFrame,
+    buffer: &WlBuffer,
     rgba_pixels: &[u8],
     src_w: u32,
     src_h: u32,
@@ -274,7 +370,7 @@ pub fn complete_screencopy_frame(
         return;
     }
 
-    let copy_result = with_buffer_contents_mut(&pending.buffer, |ptr, pool_len, bdata| {
+    let copy_result = with_buffer_contents_mut(buffer, |ptr, pool_len, bdata| {
         if bdata.offset < 0 || bdata.width <= 0 || bdata.height <= 0 || bdata.stride < bdata.width * 4 {
             return Err("Invalid shm buffer metadata".to_string());
         }
@@ -311,19 +407,7 @@ pub fn complete_screencopy_frame(
     });
 
     match copy_result {
-        Ok(Ok(())) => {
-            pending.frame.flags(FrameFlags::empty());
-            if pending.with_damage && pending.frame.version() >= 2 {
-                pending
-                    .frame
-                    .damage(0, 0, pending.region[2] as u32, pending.region[3] as u32);
-            }
-            let secs = timestamp.as_secs();
-            let tv_sec_hi = (secs >> 32) as u32;
-            let tv_sec_lo = (secs & 0xFFFF_FFFF) as u32;
-            let tv_nsec = timestamp.subsec_nanos();
-            pending.frame.ready(tv_sec_hi, tv_sec_lo, tv_nsec);
-        }
+        Ok(Ok(())) => emit_screencopy_ready(pending, timestamp),
         Ok(Err(err)) => {
             warn!(%err, "Screencopy pixel copy failed");
             pending.frame.failed();
@@ -331,6 +415,206 @@ pub fn complete_screencopy_frame(
         Err(err) => {
             warn!(?err, "Screencopy wl_shm buffer access failed");
             pending.frame.failed();
+        }
+    }
+}
+
+/// Fulfills a zero-copy DMA-BUF screencopy frame honoring `state.screencast_target`
+/// (`Output`, isolated `Window`, or isolated `Workspace`).
+#[allow(clippy::too_many_arguments)]
+pub fn fulfill_screencopy_dmabuf(
+    renderer: &mut GlesRenderer,
+    neon_renderer: &mut NeonRenderer,
+    output: &Output,
+    state: &NeonState,
+    blur: BlurSettings,
+    is_locked: bool,
+    lock_surface: Option<&LockSurface>,
+    or_popups: &[(&Window, Point<i32, Logical>)],
+    extra_top: Vec<NeonRenderElement>,
+    overlay_cursor: bool,
+    now_dur: Duration,
+    dmabuf: &mut Dmabuf,
+) -> Result<(), String> {
+    if is_locked {
+        return capture_output_to_dmabuf(
+            renderer,
+            neon_renderer,
+            output,
+            &state.scene,
+            blur,
+            true,
+            lock_surface,
+            or_popups,
+            extra_top,
+            |id| state.managed_windows.get(&id),
+            dmabuf,
+        );
+    }
+
+    match &state.screencast_target {
+        ScreencastTarget::Output { .. } => capture_output_to_dmabuf(
+            renderer,
+            neon_renderer,
+            output,
+            &state.scene,
+            blur,
+            false,
+            None,
+            or_popups,
+            extra_top,
+            |id| state.managed_windows.get(&id),
+            dmabuf,
+        ),
+        ScreencastTarget::Window { window_id } => {
+            let wid = WindowId(*window_id);
+            let win = state.managed_windows.get(&wid);
+            let cursor_info = if overlay_cursor
+                && let Some(w) = win
+                && let Some(rec) = state.wm.get(wid)
+                && rec.is_visible_on(state.wm.active_workspace_id())
+            {
+                let win_loc = state
+                    .space
+                    .element_location(w)
+                    .unwrap_or_else(|| from_wm_point(rec.current_geometry.loc));
+                Some((state.pointer_location, win_loc, &state.cursor_status))
+            } else {
+                None
+            };
+            let res =
+                capture_window_to_dmabuf(renderer, neon_renderer, output, win, cursor_info, dmabuf);
+            if let Some(w) = win {
+                w.send_frame(output, now_dur, Some(Duration::ZERO), |_, _| {
+                    Some(output.clone())
+                });
+            }
+            res
+        }
+        ScreencastTarget::Workspace { index } => {
+            if *index == state.wm.workspaces().active_index() {
+                capture_output_to_dmabuf(
+                    renderer,
+                    neon_renderer,
+                    output,
+                    &state.scene,
+                    blur,
+                    false,
+                    None,
+                    or_popups,
+                    extra_top,
+                    |id| state.managed_windows.get(&id),
+                    dmabuf,
+                )
+            } else {
+                let ws_wins = state.workspace_windows_front_to_back(*index);
+                let res =
+                    capture_workspace_to_dmabuf(renderer, output, &ws_wins, Vec::new(), dmabuf);
+                for (w, _, _) in &ws_wins {
+                    w.send_frame(output, now_dur, Some(Duration::ZERO), |_, _| {
+                        Some(output.clone())
+                    });
+                }
+                res
+            }
+        }
+    }
+}
+
+/// Renders queued fast GPU preview thumbnails (Displays, Windows, Workspaces) for
+/// `neon-screencast-picker` and encodes PNGs asynchronously on background threads.
+pub fn fulfill_screencast_previews(
+    renderer: &mut GlesRenderer,
+    neon_renderer: &mut NeonRenderer,
+    output: &Output,
+    state: &NeonState,
+    previews: Vec<PendingPreviewCapture>,
+) {
+    let out_log = state.output_logical_size();
+    let out_w = out_log.w.max(1) as f64;
+    let out_h = out_log.h.max(1) as f64;
+
+    for req in previews {
+        let mw = req.max_width as i32;
+        let mh = req.max_height as i32;
+
+        let result = match req.target {
+            ScreencastTarget::Output { .. } => {
+                let s = (mw as f64 / out_w).min(mh as f64 / out_h).min(1.0);
+                let pw = ((out_w * s).round() as i32).max(16);
+                let ph = ((out_h * s).round() as i32).max(16);
+                let active_idx = state.wm.workspaces().active_index();
+                let ws_wins: Vec<_> = state
+                    .workspace_windows_front_to_back(active_idx)
+                    .into_iter()
+                    .filter(|(w, _, _)| {
+                        crate::window::window_id(w)
+                            .and_then(|id| state.wm.get(id))
+                            .and_then(|r| r.app_id.as_deref())
+                            .map(|a| !a.to_lowercase().contains("screencast-picker"))
+                            .unwrap_or(true)
+                    })
+                    .collect();
+                let elements =
+                    collect_workspace_capture_elements(renderer, output, &ws_wins, s, true);
+                capture_preview_png_async(
+                    renderer,
+                    &elements,
+                    FALLBACK_CLEAR_COLOR,
+                    pw,
+                    ph,
+                    s,
+                    req.path,
+                )
+            }
+            ScreencastTarget::Window { window_id } => {
+                let wid = WindowId(window_id);
+                let elements = if let Some(win) = state.managed_windows.get(&wid) {
+                    collect_window_capture_elements(renderer, neon_renderer, win, mw, mh, 1.0, None)
+                } else {
+                    Vec::new()
+                };
+                capture_preview_png_async(
+                    renderer,
+                    &elements,
+                    WINDOW_CAPTURE_BG_COLOR,
+                    mw,
+                    mh,
+                    1.0,
+                    req.path,
+                )
+            }
+            ScreencastTarget::Workspace { index } => {
+                let s = (mw as f64 / out_w).min(mh as f64 / out_h).min(1.0);
+                let pw = ((out_w * s).round() as i32).max(16);
+                let ph = ((out_h * s).round() as i32).max(16);
+                let ws_wins: Vec<_> = state
+                    .workspace_windows_front_to_back(index)
+                    .into_iter()
+                    .filter(|(w, _, _)| {
+                        crate::window::window_id(w)
+                            .and_then(|id| state.wm.get(id))
+                            .and_then(|r| r.app_id.as_deref())
+                            .map(|a| !a.to_lowercase().contains("screencast-picker"))
+                            .unwrap_or(true)
+                    })
+                    .collect();
+                let elements =
+                    collect_workspace_capture_elements(renderer, output, &ws_wins, s, true);
+                capture_preview_png_async(
+                    renderer,
+                    &elements,
+                    FALLBACK_CLEAR_COLOR,
+                    pw,
+                    ph,
+                    s,
+                    req.path,
+                )
+            }
+        };
+
+        if let Err(err) = result {
+            warn!(%err, "Failed to render screencast preview thumbnail");
         }
     }
 }

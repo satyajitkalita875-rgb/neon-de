@@ -92,6 +92,16 @@ impl Easing {
         mass: 1.0,
     };
 
+    /// **Hyprland Workspace Slide** (`cubic-bezier(0.16, 1.0, 0.30, 1.0)`):
+    /// Snappy launch with zero edge overshoot so both full desktops (wallpaper, windows,
+    /// and dock) pan cleanly side-by-side and decelerate smoothly into exact pixel lock.
+    pub const HYPRLAND_WORKSPACE: Self = Self::CubicBezier {
+        x1: 0.16,
+        y1: 1.0,
+        x2: 0.30,
+        y2: 1.0,
+    };
+
     /// Evaluates the curve at normalized time `t` in `[0.0, 1.0]`.
     pub fn evaluate(self, t: f64) -> f64 {
         let t = t.clamp(0.0, 1.0);
@@ -127,15 +137,28 @@ impl Easing {
 }
 
 fn eval_cubic_bezier(x: f64, x1: f64, y1: f64, x2: f64, y2: f64) -> f64 {
+    // Guarded Newton-Raphson with bisection fallback for steep Hyprland Bézier curves.
+    let mut lo = 0.0_f64;
+    let mut hi = 1.0_f64;
     let mut u = x;
-    for _ in 0..8 {
+    for _ in 0..12 {
         let bx = cubic_component(u, x1, x2);
-        let dx = cubic_derivative(u, x1, x2);
         let err = bx - x;
-        if err.abs() < 1e-6 || dx.abs() < 1e-6 {
+        if err.abs() < 1e-7 {
             break;
         }
-        u = (u - err / dx).clamp(0.0, 1.0);
+        if err < 0.0 {
+            lo = u;
+        } else {
+            hi = u;
+        }
+        let dx = cubic_derivative(u, x1, x2);
+        let next = if dx.abs() > 1e-6 { u - err / dx } else { 0.5 * (lo + hi) };
+        u = if next > lo && next < hi {
+            next
+        } else {
+            0.5 * (lo + hi)
+        };
     }
     cubic_component(u, y1, y2)
 }
@@ -342,13 +365,43 @@ impl Default for EffectsConfig {
     }
 }
 
+/// Active dual-workspace Hyprland-style horizontal slidefade transition.
+#[derive(Debug, Clone)]
+struct WorkspaceTransition {
+    /// `+1` moving to a higher/next workspace (slides right -> left),
+    /// `-1` moving to a lower/previous workspace (slides left -> right).
+    direction: i32,
+    /// Full logical slide travel distance (typically `output_width * 1.03` for a sleek gutter).
+    travel_x: f64,
+    /// Progress `0.0 -> 1.0` evaluated on [`Easing::HYPRLAND_WORKSPACE`].
+    progress: Animation,
+}
+
+/// Per-frame Hyprland workspace `slidefade` visual transform for incoming or outgoing windows.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WorkspaceSlideSample {
+    pub offset_x: f64,
+    pub scale: f64,
+    pub opacity: f32,
+}
+
+impl Default for WorkspaceSlideSample {
+    fn default() -> Self {
+        Self {
+            offset_x: 0.0,
+            scale: 1.0,
+            opacity: 1.0,
+        }
+    }
+}
+
 /// Coordinates all frame-driven compositor animations (window open, close, minimize, restore,
-/// maximize/unmaximize/snap/resize morph, focus highlight, and workspace slide).
+/// maximize/unmaximize/snap/resize morph, focus highlight, and Hyprland dual-workspace slide).
 #[derive(Debug, Default)]
 pub struct EffectsManager {
     pub config: EffectsConfig,
     window_anims: HashMap<WindowId, WindowAnimations>,
-    workspace_offset_x: Option<Animation>,
+    workspace_transition: Option<WorkspaceTransition>,
 }
 
 impl EffectsManager {
@@ -356,7 +409,7 @@ impl EffectsManager {
         Self {
             config,
             window_anims: HashMap::new(),
-            workspace_offset_x: None,
+            workspace_transition: None,
         }
     }
 
@@ -686,21 +739,82 @@ impl EffectsManager {
         }
     }
 
-    /// Starts a Material 3 Expressive Slow Spatial horizontal workspace transition slide.
-    pub fn animate_workspace_switch(&mut self, direction: i32, now: Duration) {
+    /// Starts a Hyprland-style full-desktop horizontal slide transition sized to
+    /// `output_width` plus a sleek 28px dark gutter separating the outgoing and incoming desktops.
+    ///
+    /// Returns `true` if the animation started, or `false` if animations / reduced motion
+    /// caused the switch to complete immediately.
+    pub fn animate_workspace_switch_with_width(
+        &mut self,
+        direction: i32,
+        output_width: f64,
+        now: Duration,
+    ) -> bool {
         let dur = self.scaled_duration(380);
         if dur.is_zero() {
-            self.workspace_offset_x = None;
-            return;
+            self.workspace_transition = None;
+            return false;
         }
-        let start_offset = if direction >= 0 { 320.0 } else { -320.0 };
-        self.workspace_offset_x = Some(Animation::new(
-            start_offset,
-            0.0,
-            now,
-            dur,
-            Easing::M3_EXPRESSIVE_SLOW_SPATIAL,
-        ));
+        let dir = if direction >= 0 { 1 } else { -1 };
+        let travel_x = output_width.max(640.0) + 28.0;
+        self.workspace_transition = Some(WorkspaceTransition {
+            direction: dir,
+            travel_x,
+            progress: Animation::new(0.0, 1.0, now, dur, Easing::HYPRLAND_WORKSPACE),
+        });
+        true
+    }
+
+    /// Starts a Hyprland-style workspace switch animation using a default 1280px travel width.
+    pub fn animate_workspace_switch(&mut self, direction: i32, now: Duration) {
+        let _ = self.animate_workspace_switch_with_width(direction, 1280.0, now);
+    }
+
+    /// Returns `true` if a Hyprland dual-workspace slide transition is currently in flight.
+    pub fn is_workspace_transition_active(&self, now: Duration) -> bool {
+        self.workspace_transition
+            .as_ref()
+            .map(|tr| !tr.progress.is_finished(now))
+            .unwrap_or(false)
+    }
+
+    /// Samples the active Hyprland full-desktop slide transform for the **incoming** workspace.
+    pub fn sample_workspace_incoming(&self, now: Duration) -> WorkspaceSlideSample {
+        let Some(tr) = &self.workspace_transition else {
+            return WorkspaceSlideSample::default();
+        };
+        if tr.progress.is_finished(now) {
+            return WorkspaceSlideSample::default();
+        }
+        let p = tr.progress.sample(now).clamp(0.0, 1.0);
+        let dir = f64::from(tr.direction);
+        // Entire incoming desktop (wallpaper + windows + dock) pans crisply at 1:1 scale &
+        // full opacity from `+(W + 28)` (going right) or `-(W + 28)` (going left) to `0.0`.
+        WorkspaceSlideSample {
+            offset_x: dir * tr.travel_x * (1.0 - p),
+            scale: 1.0,
+            opacity: 1.0,
+        }
+    }
+
+    /// Samples the active Hyprland full-desktop slide transform for the **outgoing** workspace.
+    ///
+    /// Returns `None` once the workspace transition finishes so outgoing windows can be pruned.
+    pub fn sample_workspace_outgoing(&self, now: Duration) -> Option<WorkspaceSlideSample> {
+        let tr = self.workspace_transition.as_ref()?;
+        if tr.progress.is_finished(now) {
+            return None;
+        }
+        let p = tr.progress.sample(now).clamp(0.0, 1.0);
+        let dir = f64::from(tr.direction);
+        // Entire outgoing desktop (wallpaper + windows + dock) pans simultaneously at 1:1 scale &
+        // full opacity from `0.0` to `-(W + 28)` (going right) or `+(W + 28)` (going left),
+        // keeping a constant 28px dark gutter between the two desktops on every frame.
+        Some(WorkspaceSlideSample {
+            offset_x: -dir * tr.travel_x * p,
+            scale: 1.0,
+            opacity: 1.0,
+        })
     }
 
     /// Removes animation state when a window is destroyed.
@@ -708,53 +822,52 @@ impl EffectsManager {
         self.window_anims.remove(&id);
     }
 
-    /// Samples current visual state for `id` including any active workspace slide offset.
+    /// Samples current visual state for `id` including any active incoming workspace slide.
     pub fn sample_window(&self, id: WindowId, focused: bool, now: Duration) -> WindowVisualState {
-        let ws_dx = self
-            .workspace_offset_x
-            .as_ref()
-            .map(|a| a.sample(now))
-            .unwrap_or(0.0);
+        let ws_in = self.sample_workspace_incoming(now);
 
         let Some(entry) = self.window_anims.get(&id) else {
             return WindowVisualState {
-                opacity: 1.0,
-                offset_x: ws_dx,
+                opacity: ws_in.opacity,
+                offset_x: ws_in.offset_x,
                 offset_y: 0.0,
-                scale_x: 1.0,
-                scale_y: 1.0,
+                scale_x: ws_in.scale,
+                scale_y: ws_in.scale,
                 focus_progress: if focused { 1.0 } else { 0.0 },
             };
         };
 
-        let opacity = entry
+        let opacity = (entry
             .opacity
             .as_ref()
             .map(|a| a.sample(now) as f32)
             .unwrap_or(1.0)
+            * ws_in.opacity)
             .clamp(0.0, 1.0);
         let offset_x = entry
             .offset_x
             .as_ref()
             .map(|a| a.sample(now))
             .unwrap_or(0.0)
-            + ws_dx;
+            + ws_in.offset_x;
         let offset_y = entry
             .offset_y
             .as_ref()
             .map(|a| a.sample(now))
             .unwrap_or(0.0);
-        let scale_x = entry
+        let scale_x = (entry
             .scale_x
             .as_ref()
             .map(|a| a.sample(now))
             .unwrap_or(1.0)
+            * ws_in.scale)
             .clamp(0.10, 3.5);
-        let scale_y = entry
+        let scale_y = (entry
             .scale_y
             .as_ref()
             .map(|a| a.sample(now))
             .unwrap_or(1.0)
+            * ws_in.scale)
             .clamp(0.10, 3.5);
         let focus_progress = entry
             .focus_progress
@@ -777,9 +890,9 @@ impl EffectsManager {
     pub fn tick(&mut self, now: Duration) -> bool {
         let mut active = false;
 
-        if let Some(ws) = &self.workspace_offset_x {
-            if ws.is_finished(now) {
-                self.workspace_offset_x = None;
+        if let Some(tr) = &self.workspace_transition {
+            if tr.progress.is_finished(now) {
+                self.workspace_transition = None;
             } else {
                 active = true;
             }
@@ -817,12 +930,7 @@ impl EffectsManager {
 
     /// Returns `true` if any animation is currently in progress at `now`.
     pub fn has_active_animations(&self, now: Duration) -> bool {
-        if self
-            .workspace_offset_x
-            .as_ref()
-            .map(|a| !a.is_finished(now))
-            .unwrap_or(false)
-        {
+        if self.is_workspace_transition_active(now) {
             return true;
         }
         self.window_anims.values().any(|entry| {
@@ -860,6 +968,7 @@ mod tests {
             Easing::M3_EXPRESSIVE_FAST_EFFECTS,
             Easing::M3_EXPRESSIVE_DEFAULT_EFFECTS,
             Easing::M3_EXPRESSIVE_SLOW_EFFECTS,
+            Easing::HYPRLAND_WORKSPACE,
         ];
         for curve in curves {
             assert_eq!(curve.evaluate(0.0), 0.0);
@@ -948,5 +1057,51 @@ mod tests {
         assert_eq!(vis.offset_y, 0.0);
         assert_eq!(vis.scale_x, 1.0);
         assert_eq!(vis.scale_y, 1.0);
+        assert!(fx.sample_workspace_outgoing(Duration::from_millis(10)).is_none());
+    }
+
+    #[test]
+    fn hyprland_workspace_switch_glides_outgoing_and_incoming_simultaneously() {
+        let mut fx = EffectsManager::default();
+        let t0 = Duration::from_millis(100);
+        assert!(fx.animate_workspace_switch_with_width(1, 1920.0, t0));
+        assert!(fx.is_workspace_transition_active(t0));
+
+        // At t0: incoming starts off-right (+1948px), outgoing starts at 0px, constant 28px gutter.
+        let in0 = fx.sample_workspace_incoming(t0);
+        let out0 = fx.sample_workspace_outgoing(t0).expect("outgoing active at t0");
+        assert!((in0.offset_x - 1948.0).abs() < 1e-3);
+        assert!(out0.offset_x.abs() < 1e-3);
+        assert!((in0.scale - 1.0).abs() < 1e-6 && (in0.opacity - 1.0).abs() < 1e-6);
+        assert!((out0.scale - 1.0).abs() < 1e-6 && (out0.opacity - 1.0).abs() < 1e-6);
+
+        // Mid-flight (~60ms into 380ms): both desktops visibly pan side-by-side with constant 1948px spacing.
+        let t_mid = t0 + Duration::from_millis(60);
+        let in_mid = fx.sample_workspace_incoming(t_mid);
+        let out_mid = fx.sample_workspace_outgoing(t_mid).expect("outgoing active mid-flight");
+        assert!(in_mid.offset_x > 400.0 && in_mid.offset_x < 1500.0, "in_mid={in_mid:?}");
+        assert!(out_mid.offset_x < -400.0 && out_mid.offset_x > -1500.0, "out_mid={out_mid:?}");
+        assert!(
+            ((in_mid.offset_x - out_mid.offset_x) - 1948.0).abs() < 1e-3,
+            "constant desktop gutter must be preserved mid-flight"
+        );
+
+        // Settled at t0 + 400ms: incoming locks to (0, 1.0, 1.0), outgoing clears to None.
+        let t_end = t0 + Duration::from_millis(400);
+        assert!(!fx.tick(t_end));
+        assert!(fx.sample_workspace_outgoing(t_end).is_none());
+        let in_end = fx.sample_workspace_incoming(t_end);
+        assert_eq!(in_end.offset_x, 0.0);
+        assert_eq!(in_end.scale, 1.0);
+        assert_eq!(in_end.opacity, 1.0);
+
+        // Reverse direction (-1): incoming starts off-left (-travel_x), outgoing glides right (+x).
+        assert!(fx.animate_workspace_switch_with_width(-1, 1280.0, t_end));
+        let in_rev = fx.sample_workspace_incoming(t_end + Duration::from_millis(60));
+        let out_rev = fx
+            .sample_workspace_outgoing(t_end + Duration::from_millis(60))
+            .expect("reverse outgoing active");
+        assert!(in_rev.offset_x < 0.0, "expected negative incoming offset, got {in_rev:?}");
+        assert!(out_rev.offset_x > 0.0, "expected positive outgoing offset, got {out_rev:?}");
     }
 }

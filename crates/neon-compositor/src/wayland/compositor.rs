@@ -156,8 +156,7 @@ impl CompositorHandler for NeonState {
                         .map(|w| w.is_visible_on(self.wm.active_workspace_id()))
                         .unwrap_or(false)
                 {
-                    self.space
-                        .map_element(window.clone(), from_wm_point(new_loc), false);
+                    self.map_preserving_z_order(window.clone(), from_wm_point(new_loc));
                 }
 
                 if !was_mapped
@@ -179,12 +178,14 @@ impl CompositorHandler for NeonState {
 
         // Handle zwlr_layer_shell_v1 surface commits, initial configure, and exclusive keyboard focus.
         if let Some(output) = self.primary_output.clone() {
+            let prev_work_area = self.work_area();
             let (arranged_changed, exclusive_surface) = {
                 let mut map = layer_map_for_output(&output);
                 if let Some(layer) = map
                     .layer_for_surface(surface, WindowSurfaceType::TOPLEVEL)
                     .cloned()
                 {
+                    let changed = map.arrange();
                     let initial_configure_sent = with_states(surface, |states| {
                         states
                             .data_map
@@ -195,7 +196,30 @@ impl CompositorHandler for NeonState {
                     if !initial_configure_sent {
                         layer.layer_surface().send_configure();
                     }
-                    let changed = map.arrange();
+                    if layer.namespace() == "neon-panel"
+                        && let Some(geo) = map.layer_geometry(&layer)
+                        && geo.size.h > 0
+                    {
+                        self.last_panel_height = geo.size.h;
+                    }
+                    if layer.namespace() == "neon-dock" {
+                        let ex = with_states(surface, |states| {
+                            match states
+                                .cached_state
+                                .get::<LayerSurfaceCachedState>()
+                                .current()
+                                .exclusive_zone
+                            {
+                                smithay::wayland::shell::wlr_layer::ExclusiveZone::Exclusive(n) => {
+                                    n as i32
+                                }
+                                _ => 0,
+                            }
+                        });
+                        if ex > 0 {
+                            self.last_dock_exclusive = ex;
+                        }
+                    }
                     let interactivity = with_states(surface, |states| {
                         states
                             .cached_state
@@ -211,13 +235,13 @@ impl CompositorHandler for NeonState {
                 }
             };
 
-            if arranged_changed {
+            if arranged_changed && self.work_area() != prev_work_area {
                 self.relayout_non_floating_windows();
             }
             if let Some(layer_wl) = exclusive_surface
                 && let Some(keyboard) = self.seat.get_keyboard()
             {
-                keyboard.set_focus(self, Some(layer_wl), SERIAL_COUNTER.next_serial());
+                keyboard.set_focus(self, Some(layer_wl.into()), SERIAL_COUNTER.next_serial());
             }
         }
 

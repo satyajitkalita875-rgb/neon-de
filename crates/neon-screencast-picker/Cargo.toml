@@ -1,0 +1,19 @@
+[package]
+name = "neon-screencast-picker"
+description = "NEON DE native GNOME/KDE-style GTK4 Screen, Window, and Workspace selector for PipeWire / OBS"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "neon-screencast-picker"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+gtk4.workspace = true
+gtk4-layer-shell.workspace = true
+neon-ipc.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

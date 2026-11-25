@@ -4,13 +4,13 @@
 use std::rc::Rc;
 
 use gtk4::{
-    Align, Box as GtkBox, Button, DropDown, Orientation, ScrolledWindow, SearchEntry, Spinner,
-    StringList, Switch, glib, prelude::*,
+    Align, Box as GtkBox, Button, DropDown, Label, Orientation, ScrolledWindow, SearchEntry,
+    Spinner, StringList, Switch, glib, prelude::*,
 };
 use neon_system::datetime::{self, DateTimeLocaleStatus};
 
 use crate::{
-    state::SettingsController,
+    state::{SettingsController, build_appearance_request},
     ui::{
         append_rows, boxed_card, info_row, page_shell, run_async, section_heading, setting_row,
         status_badge,
@@ -56,6 +56,36 @@ fn render_datetime(root: &GtkBox, ctrl: Rc<SettingsController>, data: DateTimeDa
     root.append(&section_heading("Clock & Sync"));
     let time_card = boxed_card();
 
+    let use_12h_initial = !ctrl.config.borrow().panel.clock_24h;
+    let time_display = format_current_time_preview(use_12h_initial, &data.status.local_time_display);
+    let current_time_val = Label::new(Some(&time_display));
+    current_time_val.add_css_class("settings-row-desc");
+    current_time_val.set_valign(Align::Center);
+    current_time_val.set_selectable(true);
+
+    let clock_12h_sw = Switch::new();
+    clock_12h_sw.set_active(use_12h_initial);
+    clock_12h_sw.set_valign(Align::Center);
+    {
+        let ctrl_c = Rc::clone(&ctrl);
+        let time_lbl = current_time_val.clone();
+        let fallback_str = data.status.local_time_display.clone();
+        clock_12h_sw.connect_state_set(move |_, use_12h| {
+            ctrl_c.config.borrow_mut().panel.clock_24h = !use_12h;
+            let req = build_appearance_request(&ctrl_c.config.borrow());
+            ctrl_c.persist_and_sync(
+                Some(req),
+                if use_12h {
+                    "Clock set to 12-hour (AM/PM)"
+                } else {
+                    "Clock set to 24-hour format"
+                },
+            );
+            time_lbl.set_text(&format_current_time_preview(use_12h, &fallback_str));
+            glib::Propagation::Proceed
+        });
+    }
+
     let ntp_sw = Switch::new();
     ntp_sw.set_active(data.status.ntp_enabled);
     ntp_sw.set_sensitive(data.status.timedated_available);
@@ -93,10 +123,11 @@ fn render_datetime(root: &GtkBox, ctrl: Rc<SettingsController>, data: DateTimeDa
     append_rows(
         &time_card,
         vec![
-            info_row(
-                "Current Time",
-                &data.status.timezone,
-                &data.status.local_time_display,
+            setting_row("Current Time", &data.status.timezone, &current_time_val),
+            setting_row(
+                "12-Hour Clock (AM/PM)",
+                "Display time with AM/PM in the top bar and menus.",
+                &clock_12h_sw,
             ),
             setting_row(
                 "Set Time Automatically (NTP)",
@@ -200,4 +231,17 @@ fn render_datetime(root: &GtkBox, ctrl: Rc<SettingsController>, data: DateTimeDa
     let lang_card = boxed_card();
     lang_card.append(&info_row("System Locale", "", &data.status.system_locale));
     root.append(&lang_card);
+}
+
+fn format_current_time_preview(use_12h: bool, fallback: &str) -> String {
+    let fmt = if use_12h {
+        "%a, %b %-e, %Y  %-I:%M %p"
+    } else {
+        "%a, %b %-e, %Y  %H:%M"
+    };
+    glib::DateTime::now_local()
+        .ok()
+        .and_then(|dt| dt.format(fmt).ok())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| fallback.to_string())
 }

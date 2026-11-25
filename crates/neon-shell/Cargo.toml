@@ -15,6 +15,7 @@ anyhow.workspace = true
 clap.workspace = true
 gtk4.workspace = true
 gtk4-layer-shell.workspace = true
+neon-config.workspace = true
 neon-ipc.workspace = true
 neon-system.workspace = true
 tracing.workspace = true

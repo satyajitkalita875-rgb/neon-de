@@ -19,6 +19,37 @@ pub struct InstalledApp {
     pub icon: Option<String>,
     pub categories: Vec<String>,
     pub mime_types: Vec<String>,
+    #[serde(default)]
+    pub terminal: bool,
+    #[serde(default)]
+    pub working_dir: Option<String>,
+    #[serde(default)]
+    pub desktop_path: Option<PathBuf>,
+}
+
+/// Packaging origin detected for an installed desktop application.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AppInstallSource {
+    FlatpakUser(String),
+    FlatpakSystem(String),
+    Snap(String),
+    UserDesktop(PathBuf),
+    SystemPackage(PathBuf),
+    Unknown,
+}
+
+impl AppInstallSource {
+    /// Short human-readable label describing how this app is installed.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::FlatpakUser(_) => "Flatpak (User)",
+            Self::FlatpakSystem(_) => "Flatpak",
+            Self::Snap(_) => "Snap",
+            Self::UserDesktop(_) => "User App",
+            Self::SystemPackage(_) => "System Package",
+            Self::Unknown => "Application",
+        }
+    }
 }
 
 /// An XDG autostart `.desktop` entry under `~/.config/autostart` or `/etc/xdg/autostart`.
@@ -31,20 +62,28 @@ pub struct AutostartEntry {
     pub user_owned: bool,
 }
 
-/// Discovers installed XDG applications across user and system application directories.
+/// Discovers installed XDG applications across user, Flatpak, Snap, and system directories.
 pub fn discover_installed_apps() -> Vec<InstalledApp> {
     let mut dirs = Vec::new();
+    let mut push_unique = |p: PathBuf| {
+        if !dirs.contains(&p) {
+            dirs.push(p);
+        }
+    };
     if let Some(home) = std::env::var_os("HOME") {
-        dirs.push(PathBuf::from(home).join(".local/share/applications"));
+        let h = PathBuf::from(home);
+        push_unique(h.join(".local/share/applications"));
+        push_unique(h.join(".local/share/flatpak/exports/share/applications"));
     }
     if let Some(data_dirs) = std::env::var_os("XDG_DATA_DIRS") {
         for part in std::env::split_paths(&data_dirs) {
-            dirs.push(part.join("applications"));
+            push_unique(part.join("applications"));
         }
-    } else {
-        dirs.push(PathBuf::from("/usr/local/share/applications"));
-        dirs.push(PathBuf::from("/usr/share/applications"));
     }
+    push_unique(PathBuf::from("/var/lib/flatpak/exports/share/applications"));
+    push_unique(PathBuf::from("/var/lib/snapd/desktop/applications"));
+    push_unique(PathBuf::from("/usr/local/share/applications"));
+    push_unique(PathBuf::from("/usr/share/applications"));
 
     let mut seen: HashMap<String, InstalledApp> = HashMap::new();
     let mut hidden: HashSet<String> = HashSet::new();
@@ -93,6 +132,8 @@ fn parse_desktop_entry(path: &Path, desktop_id: &str) -> Option<InstalledApp> {
     let mut mime_types = Vec::new();
     let mut no_display = false;
     let mut hidden = false;
+    let mut terminal = false;
+    let mut working_dir = None;
 
     for line in raw.lines() {
         let line = line.trim();
@@ -114,9 +155,11 @@ fn parse_desktop_entry(path: &Path, desktop_id: &str) -> Option<InstalledApp> {
             "Name" => name = Some(v.trim().to_string()),
             "Comment" => comment = Some(v.trim().to_string()),
             "Exec" => exec = Some(v.trim().to_string()),
+            "Path" => working_dir = Some(v.trim().to_string()),
             "Icon" => icon = Some(v.trim().to_string()),
             "NoDisplay" => no_display = v.trim().eq_ignore_ascii_case("true"),
             "Hidden" => hidden = v.trim().eq_ignore_ascii_case("true"),
+            "Terminal" => terminal = v.trim().eq_ignore_ascii_case("true"),
             "Categories" => {
                 categories = v
                     .split(';')
@@ -146,7 +189,102 @@ fn parse_desktop_entry(path: &Path, desktop_id: &str) -> Option<InstalledApp> {
         icon,
         categories,
         mime_types,
+        terminal,
+        working_dir,
+        desktop_path: Some(path.to_path_buf()),
     })
+}
+
+/// Finds an executable binary on `$PATH` (or accepts an executable absolute path).
+pub fn find_executable_in_path(bin: &str) -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let candidate = Path::new(bin);
+    if candidate.is_absolute() {
+        return candidate
+            .metadata()
+            .ok()
+            .filter(|m| m.is_file() && (m.permissions().mode() & 0o111 != 0))
+            .map(|_| candidate.to_path_buf());
+    }
+    let path_env = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path_env) {
+        let full = dir.join(bin);
+        if let Ok(meta) = full.metadata()
+            && meta.is_file()
+            && (meta.permissions().mode() & 0o111 != 0)
+        {
+            return Some(full);
+        }
+    }
+    None
+}
+
+/// Wraps a `Terminal=true` command `(program, args)` in an available terminal emulator.
+pub fn wrap_terminal_command(program: &str, args: &[String]) -> Option<(String, Vec<String>)> {
+    const CANDIDATES: &[&str] = &[
+        "kitty",
+        "alacritty",
+        "ghostty",
+        "foot",
+        "wezterm",
+        "gnome-terminal",
+        "kgx",
+        "konsole",
+        "xfce4-terminal",
+        "xterm",
+        "x-terminal-emulator",
+    ];
+
+    let mut chosen: Option<String> = None;
+    if let Ok(env_term) = std::env::var("TERMINAL") {
+        let trimmed = env_term.trim();
+        if !trimmed.is_empty() && find_executable_in_path(trimmed).is_some() {
+            chosen = Some(trimmed.to_string());
+        }
+    }
+    if chosen.is_none() {
+        for cand in CANDIDATES {
+            if find_executable_in_path(cand).is_some() {
+                chosen = Some((*cand).to_string());
+                break;
+            }
+        }
+    }
+    let term = chosen?;
+    Some(build_terminal_argv(&term, program, args))
+}
+
+/// Formats `(terminal_program, argv)` for the chosen terminal emulator binary name.
+pub fn build_terminal_argv(
+    terminal: &str,
+    program: &str,
+    args: &[String],
+) -> (String, Vec<String>) {
+    let base = Path::new(terminal)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(terminal);
+    let mut out = Vec::with_capacity(args.len() + 3);
+    match base {
+        "kitty" | "foot" | "gnome-terminal" | "kgx" => {
+            out.push("--".to_string());
+        }
+        "wezterm" => {
+            out.push("start".to_string());
+            out.push("--".to_string());
+        }
+        "xfce4-terminal" => {
+            out.push("-x".to_string());
+        }
+        _ => {
+            // alacritty, ghostty, konsole, xterm, x-terminal-emulator, etc.
+            out.push("-e".to_string());
+        }
+    }
+    out.push(program.to_string());
+    out.extend(args.iter().cloned());
+    (terminal.to_string(), out)
 }
 
 /// Queries the default handler `.desktop` ID for a MIME type via `xdg-mime`.
@@ -300,4 +438,324 @@ fn parse_autostart_file(path: &Path, file_name: &str, user_owned: bool) -> Optio
         enabled: !hidden && gnome_enabled,
         user_owned,
     })
+}
+
+/// Detects the package source of an installed application without spawning subprocesses.
+pub fn detect_install_source(app: &InstalledApp) -> AppInstallSource {
+    let path_str = app
+        .desktop_path
+        .as_ref()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let app_stem = app
+        .desktop_id
+        .strip_suffix(".desktop")
+        .unwrap_or(&app.desktop_id);
+
+    if path_str.contains("/.local/share/flatpak/") {
+        return AppInstallSource::FlatpakUser(app_stem.to_string());
+    }
+    if path_str.contains("/var/lib/flatpak/")
+        || app.exec.starts_with("flatpak run ")
+        || app.exec.starts_with("/usr/bin/flatpak run ")
+    {
+        return AppInstallSource::FlatpakSystem(app_stem.to_string());
+    }
+    if path_str.starts_with("/var/lib/snapd/desktop/")
+        || app.exec.contains("/snap/bin/")
+        || app.exec.contains("/var/lib/snapd/")
+    {
+        let snap_name = app_stem
+            .split('_')
+            .next()
+            .filter(|s| !s.is_empty())
+            .unwrap_or(app_stem)
+            .to_string();
+        return AppInstallSource::Snap(snap_name);
+    }
+    if let Some(ref p) = app.desktop_path {
+        if let Some(home) = std::env::var_os("HOME") {
+            let user_apps = PathBuf::from(home).join(".local/share/applications");
+            if p.starts_with(&user_apps) {
+                return AppInstallSource::UserDesktop(p.clone());
+            }
+        }
+        if path_str.contains("/.local/share/applications/") {
+            return AppInstallSource::UserDesktop(p.clone());
+        }
+        if p.starts_with("/usr/share/applications") || p.starts_with("/usr/local/share/applications")
+        {
+            return AppInstallSource::SystemPackage(p.clone());
+        }
+    }
+    AppInstallSource::Unknown
+}
+
+/// Returns `true` if `pkg` is a core OS or NEON DE package that must never be uninstalled from Settings.
+pub fn is_protected_system_package(pkg: &str) -> bool {
+    let p = pkg.trim().to_ascii_lowercase();
+    if p.starts_with("neon-") {
+        return true;
+    }
+    matches!(
+        p.as_str(),
+        "systemd"
+            | "systemd-sysv"
+            | "sudo"
+            | "apt"
+            | "dpkg"
+            | "bash"
+            | "libc6"
+            | "coreutils"
+            | "polkitd"
+            | "dbus"
+            | "dbus-daemon"
+            | "dbus-user-session"
+            | "login"
+            | "init"
+            | "base-files"
+    )
+}
+
+fn is_safe_pkg_token(s: &str) -> bool {
+    !s.is_empty()
+        && !s.starts_with('-')
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '+'))
+}
+
+fn resolve_dpkg_owner(path: &Path) -> Option<String> {
+    let mut candidates = vec![path.to_path_buf()];
+    if let Ok(canon) = fs::canonicalize(path)
+        && canon != path
+    {
+        candidates.push(canon);
+    }
+    for cand in candidates {
+        let Ok(out) = Command::new("dpkg").arg("-S").arg(&cand).output() else {
+            continue;
+        };
+        if !out.status.success() {
+            continue;
+        }
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        for line in stdout.lines() {
+            if let Some((pkg_raw, _)) = line.split_once(':') {
+                // Take the first package (stripping any `:arch` or comma-separated multi-owner)
+                let pkg = pkg_raw
+                    .split(',')
+                    .next()
+                    .unwrap_or("")
+                    .split(':')
+                    .next()
+                    .unwrap_or("")
+                    .trim();
+                if is_safe_pkg_token(pkg) {
+                    return Some(pkg.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Uninstalls an application cleanly using its native package manager (Flatpak, Snap, APT via
+/// Polkit `pkexec`) or removes a user-local `.desktop` launcher.
+pub fn uninstall_app(app: &InstalledApp) -> Result<String, String> {
+    match detect_install_source(app) {
+        AppInstallSource::FlatpakUser(app_id) => {
+            if !is_safe_pkg_token(&app_id) {
+                return Err("Invalid Flatpak application ID".into());
+            }
+            let out = Command::new("flatpak")
+                .args(["uninstall", "-y", "--noninteractive", "--user", &app_id])
+                .output()
+                .map_err(|e| format!("Failed to run flatpak: {e}"))?;
+            if out.status.success() {
+                Ok(format!("Uninstalled {}", app.name))
+            } else {
+                let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                Err(if err.is_empty() {
+                    "Flatpak uninstall failed".into()
+                } else {
+                    err
+                })
+            }
+        }
+        AppInstallSource::FlatpakSystem(app_id) => {
+            if !is_safe_pkg_token(&app_id) {
+                return Err("Invalid Flatpak application ID".into());
+            }
+            // Prefer --user if installed per-user, otherwise elevate cleanly via pkexec.
+            let is_user = Command::new("flatpak")
+                .args(["info", "--user", &app_id])
+                .output()
+                .is_ok_and(|o| o.status.success());
+            let out = if is_user {
+                Command::new("flatpak")
+                    .args(["uninstall", "-y", "--noninteractive", "--user", &app_id])
+                    .output()
+            } else {
+                Command::new("pkexec")
+                    .args(["flatpak", "uninstall", "-y", "--noninteractive", &app_id])
+                    .output()
+            }
+            .map_err(|e| format!("Failed to uninstall Flatpak app: {e}"))?;
+            if out.status.success() {
+                Ok(format!("Uninstalled {}", app.name))
+            } else {
+                let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                Err(if err.is_empty() {
+                    "Uninstall cancelled or failed".into()
+                } else {
+                    err
+                })
+            }
+        }
+        AppInstallSource::Snap(snap_name) => {
+            if !is_safe_pkg_token(&snap_name) {
+                return Err("Invalid Snap package name".into());
+            }
+            let out = Command::new("pkexec")
+                .args(["snap", "remove", &snap_name])
+                .output()
+                .map_err(|e| format!("Failed to run snap remove: {e}"))?;
+            if out.status.success() {
+                Ok(format!("Uninstalled {}", app.name))
+            } else {
+                let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                Err(if err.is_empty() {
+                    "Snap removal cancelled or failed".into()
+                } else {
+                    err
+                })
+            }
+        }
+        AppInstallSource::UserDesktop(path) => {
+            fs::remove_file(&path)
+                .map_err(|e| format!("Failed to remove user launcher {}: {e}", path.display()))?;
+            Ok(format!("Removed {}", app.name))
+        }
+        AppInstallSource::SystemPackage(path) => {
+            let Some(pkg) = resolve_dpkg_owner(&path) else {
+                return Err(format!(
+                    "{} is not managed by APT, Flatpak, or Snap and must be removed with its own uninstaller.",
+                    app.name
+                ));
+            };
+            if is_protected_system_package(&pkg) {
+                return Err(format!(
+                    "Cannot uninstall protected core system package '{pkg}'."
+                ));
+            }
+            let out = Command::new("pkexec")
+                .args([
+                    "env",
+                    "DEBIAN_FRONTEND=noninteractive",
+                    "apt-get",
+                    "remove",
+                    "-y",
+                    &pkg,
+                ])
+                .output()
+                .map_err(|e| format!("Failed to launch pkexec apt-get: {e}"))?;
+            if out.status.success() {
+                Ok(format!("Uninstalled {} ({pkg})", app.name))
+            } else {
+                let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                Err(if err.is_empty() {
+                    "Uninstall cancelled or failed".into()
+                } else {
+                    err
+                })
+            }
+        }
+        AppInstallSource::Unknown => Err(format!(
+            "Could not determine package source for {}.",
+            app.name
+        )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_app(id: &str, exec: &str, path: &str) -> InstalledApp {
+        InstalledApp {
+            desktop_id: id.into(),
+            name: "Sample".into(),
+            comment: None,
+            exec: exec.into(),
+            icon: None,
+            categories: Vec::new(),
+            mime_types: Vec::new(),
+            terminal: false,
+            working_dir: None,
+            desktop_path: Some(PathBuf::from(path)),
+        }
+    }
+
+    #[test]
+    fn detects_flatpak_snap_user_and_system_sources() {
+        let fp_u = sample_app(
+            "com.spotify.Client.desktop",
+            "/usr/bin/flatpak run com.spotify.Client",
+            "/home/test/.local/share/flatpak/exports/share/applications/com.spotify.Client.desktop",
+        );
+        assert_eq!(
+            detect_install_source(&fp_u),
+            AppInstallSource::FlatpakUser("com.spotify.Client".into())
+        );
+
+        let fp_s = sample_app(
+            "org.videolan.VLC.desktop",
+            "flatpak run org.videolan.VLC",
+            "/var/lib/flatpak/exports/share/applications/org.videolan.VLC.desktop",
+        );
+        assert_eq!(
+            detect_install_source(&fp_s),
+            AppInstallSource::FlatpakSystem("org.videolan.VLC".into())
+        );
+
+        let snap = sample_app(
+            "firefox_firefox.desktop",
+            "/snap/bin/firefox %u",
+            "/var/lib/snapd/desktop/applications/firefox_firefox.desktop",
+        );
+        assert_eq!(
+            detect_install_source(&snap),
+            AppInstallSource::Snap("firefox".into())
+        );
+
+        let usr = sample_app(
+            "my-pwa.desktop",
+            "/usr/bin/google-chrome --app-id=abc",
+            "/home/test/.local/share/applications/my-pwa.desktop",
+        );
+        assert!(matches!(
+            detect_install_source(&usr),
+            AppInstallSource::UserDesktop(_)
+        ));
+
+        let deb = sample_app(
+            "gimp.desktop",
+            "gimp-2.10 %U",
+            "/usr/share/applications/gimp.desktop",
+        );
+        assert!(matches!(
+            detect_install_source(&deb),
+            AppInstallSource::SystemPackage(_)
+        ));
+    }
+
+    #[test]
+    fn protects_core_system_and_neon_packages() {
+        assert!(is_protected_system_package("neon-compositor"));
+        assert!(is_protected_system_package("neon-shell"));
+        assert!(is_protected_system_package("systemd"));
+        assert!(is_protected_system_package("sudo"));
+        assert!(!is_protected_system_package("vlc"));
+        assert!(!is_protected_system_package("gimp"));
+    }
 }

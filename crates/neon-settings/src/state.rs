@@ -2,7 +2,7 @@
 //! GTK toolkit synchronization, and auto-hiding transient feedback toasts.
 
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     path::PathBuf,
     process::Command,
     rc::Rc,
@@ -48,7 +48,7 @@ pub struct SettingsController {
     pub window: ApplicationWindow,
     pub navigate_cb: RefCell<Option<NavCallback>>,
     pub rebuild_page_cb: RefCell<Option<RebuildCallback>>,
-    toast_timer: RefCell<Option<glib::SourceId>>,
+    toast_generation: Rc<Cell<u64>>,
     worker_tx: mpsc::Sender<WorkerMsg>,
 }
 
@@ -108,7 +108,7 @@ impl SettingsController {
             window,
             navigate_cb: RefCell::new(None),
             rebuild_page_cb: RefCell::new(None),
-            toast_timer: RefCell::new(None),
+            toast_generation: Rc::new(Cell::new(0)),
             worker_tx: tx,
         }
     }
@@ -147,14 +147,17 @@ impl SettingsController {
         self.status_label.set_text(msg);
         self.status_bar.set_visible(true);
 
-        if let Some(prev) = self.toast_timer.borrow_mut().take() {
-            prev.remove();
-        }
+        // Use a monotonic generation counter instead of SourceId::remove() so fired timers
+        // can never panic on subsequent clicks (e.g. changing wallpapers multiple times).
+        let my_gen = self.toast_generation.get().wrapping_add(1);
+        self.toast_generation.set(my_gen);
+        let gen_c = Rc::clone(&self.toast_generation);
         let bar = self.status_bar.clone();
-        let id = glib::timeout_add_local_once(Duration::from_millis(auto_hide_ms), move || {
-            bar.set_visible(false);
+        glib::timeout_add_local_once(Duration::from_millis(auto_hide_ms), move || {
+            if gen_c.get() == my_gen {
+                bar.set_visible(false);
+            }
         });
-        *self.toast_timer.borrow_mut() = Some(id);
     }
 
     pub fn set_status_ok(&self, msg: &str) {
@@ -273,21 +276,41 @@ pub fn build_appearance_request(cfg: &NeonConfig) -> IpcRequest {
         ThemeMode::NeonLight => "neon_light",
         ThemeMode::Auto => "auto",
     };
-    IpcRequest::UpdateAppearance {
+    let dock_pos = match cfg.dock.position {
+        neon_config::DockPosition::Bottom => "bottom",
+        neon_config::DockPosition::Left => "left",
+        neon_config::DockPosition::Right => "right",
+    };
+    IpcRequest::from(neon_ipc::AppearanceUpdate {
         theme: Some(theme.into()),
         accent_color: Some(cfg.appearance.accent_color.clone()),
         dock_transparency: Some(cfg.dock.transparency),
+        dock_auto_hide: Some(cfg.dock.auto_hide),
+        dock_smart_hide: Some(cfg.dock.intelligent_hide),
+        dock_position: Some(dock_pos.into()),
+        dock_icon_size: Some(cfg.dock.icon_size),
+        dock_magnification: Some(cfg.dock.magnification),
+        dock_pinned_apps: Some(cfg.dock.pinned_apps.clone()),
         panel_transparency: Some(cfg.panel.transparency),
         panel_visible: Some(cfg.panel.visible),
+        panel_smart_hide: Some(cfg.panel.smart_hide),
         show_clock: Some(cfg.panel.show_clock),
+        clock_24h: Some(cfg.panel.clock_24h),
         show_workspaces: Some(cfg.panel.show_workspaces),
+        show_app_title: Some(cfg.panel.show_app_title),
+        show_system_tray: Some(cfg.panel.show_system_tray),
+        show_battery: Some(cfg.panel.show_battery),
+        show_quick_settings: Some(cfg.panel.show_quick_settings),
+        show_desktop_icons: Some(cfg.desktop.show_desktop_icons),
+        desktop_sort_by: Some(cfg.desktop.desktop_sort_by.clone()),
+        desktop_auto_arrange: Some(cfg.desktop.desktop_auto_arrange),
         high_contrast: Some(cfg.privacy_accessibility.high_contrast),
         wallpaper: Some(cfg.appearance.wallpaper_path.clone().unwrap_or_default()),
         reduce_blur: Some(cfg.appearance.reduce_blur),
         blur_strength: Some(cfg.effects.blur_strength),
         cursor_theme: Some(cfg.appearance.cursor_theme.clone()),
         cursor_size: Some(cfg.appearance.cursor_size),
-    }
+    })
 }
 
 pub fn build_window_behavior_request(cfg: &NeonConfig) -> IpcRequest {

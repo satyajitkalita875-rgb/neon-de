@@ -19,7 +19,7 @@ use smithay::{
     },
     reexports::wayland_protocols::xdg::shell::server::xdg_toplevel,
     utils::{Rectangle, SERIAL_COUNTER},
-    wayland::shell::wlr_layer::{KeyboardInteractivity, Layer as WlrLayer},
+    wayland::shell::wlr_layer::KeyboardInteractivity,
 };
 use tracing::info;
 
@@ -249,7 +249,16 @@ fn handle_keyboard<B: InputBackend>(state: &mut NeonState, event: B::KeyboardKey
                     if sym == Keysym::from(keysyms::KEY_h) || sym == Keysym::from(keysyms::KEY_H) {
                         return FilterResult::Intercept(CompositorAction::MinimizeFocused);
                     }
-                    if let Some(ws_idx) = digit_keysym_to_workspace_index(sym) {
+                    if !modifiers.ctrl
+                        && !modifiers.alt
+                        && let Some(ws_idx) = digit_keysym_to_workspace_index(sym).or_else(|| {
+                            handle
+                                .raw_syms()
+                                .iter()
+                                .copied()
+                                .find_map(digit_keysym_to_workspace_index)
+                        })
+                    {
                         return FilterResult::Intercept(CompositorAction::SwitchWorkspaceIndex(
                             ws_idx,
                         ));
@@ -325,9 +334,31 @@ fn handle_keyboard<B: InputBackend>(state: &mut NeonState, event: B::KeyboardKey
 fn digit_keysym_to_workspace_index(sym: Keysym) -> Option<usize> {
     let raw = sym.raw();
     if (keysyms::KEY_1..=keysyms::KEY_9).contains(&raw) {
-        Some((raw - keysyms::KEY_1) as usize)
-    } else {
-        None
+        return Some((raw - keysyms::KEY_1) as usize);
+    }
+    if raw == keysyms::KEY_0 {
+        return Some(9);
+    }
+    // Numpad digits (NumLock ON)
+    if (keysyms::KEY_KP_1..=keysyms::KEY_KP_9).contains(&raw) {
+        return Some((raw - keysyms::KEY_KP_1) as usize);
+    }
+    if raw == keysyms::KEY_KP_0 {
+        return Some(9);
+    }
+    // Numpad navigation keysyms (NumLock OFF) so Super + Numpad 1..9/0 always works
+    match raw {
+        keysyms::KEY_KP_End => Some(0),
+        keysyms::KEY_KP_Down => Some(1),
+        keysyms::KEY_KP_Page_Down => Some(2),
+        keysyms::KEY_KP_Left => Some(3),
+        keysyms::KEY_KP_Begin => Some(4),
+        keysyms::KEY_KP_Right => Some(5),
+        keysyms::KEY_KP_Home => Some(6),
+        keysyms::KEY_KP_Up => Some(7),
+        keysyms::KEY_KP_Page_Up => Some(8),
+        keysyms::KEY_KP_Insert => Some(9),
+        _ => None,
     }
 }
 
@@ -340,11 +371,7 @@ fn apply_pointer_motion_at(
     state.needs_redraw = true;
 
     // Update hover highlight for macOS SSD traffic-light controls (×, −, + glyphs on hover).
-    let hovered_tb = if !state.is_locked()
-        && state
-            .layer_surface_under(pos, &[WlrLayer::Overlay, WlrLayer::Top])
-            .is_none()
-    {
+    let hovered_tb = if !state.is_locked() && state.upper_layer_surface_under(pos).is_none() {
         state.ssd_titlebar_hit_test(pos).and_then(|(id, _, hit)| {
             matches!(
                 hit,
@@ -363,16 +390,20 @@ fn apply_pointer_motion_at(
             .lock_state
             .primary_surface()
             .cloned()
-            .map(|s| (s, (0.0, 0.0).into()))
+            .map(|s| (s.into(), (0.0, 0.0).into()))
     } else {
         state.surface_under(pos)
     };
 
     // Optional FocusFollowsMouse policy (ClickToFocus remains default; disabled while locked).
+    // Never pull focus off a visible transient/modal child dialog (e.g. DaVinci Resolve's
+    // "Create New Project") back onto its parent window behind it.
     if !state.is_locked()
         && state.wm.focus_policy() == FocusPolicy::FocusFollowsMouse
         && let Some((window, _)) = state.window_under(pos)
-        && window_id(&window) != state.wm.focused_id()
+        && let Some(hovered_id) = window_id(&window)
+        && Some(hovered_id) != state.wm.focused_id()
+        && state.wm.visible_transient_children(hovered_id).is_empty()
     {
         state.focus_window_with_raise(Some(&window), serial, false);
     }
@@ -444,26 +475,42 @@ fn handle_pointer_button<B: InputBackend>(state: &mut NeonState, event: B::Point
 
     if !state.is_locked() && button_state == ButtonState::Pressed && !pointer.is_grabbed() {
         let pos = state.pointer_location;
-        let (alt_held, super_held) = state
+        // Refresh pointer focus before delivering the press if a newly-mapped surface (such as
+        // Quick Settings' click-catcher backdrop) appeared underneath a stationary cursor.
+        let under = state.surface_under(pos);
+        let cur_id = pointer.current_focus().and_then(|f| f.wl_surface_id());
+        let under_id = under.as_ref().and_then(|(f, _)| f.wl_surface_id());
+        if cur_id != under_id {
+            pointer.motion(
+                state,
+                under,
+                &MotionEvent {
+                    location: pos,
+                    serial: SERIAL_COUNTER.next_serial(),
+                    time: event.time_msec(),
+                },
+            );
+            pointer.frame(state);
+        }
+
+        let (alt_held, super_held, shift_held) = state
             .seat
             .get_keyboard()
             .map(|kbd| {
                 let m = kbd.modifier_state();
-                (m.alt, m.logo)
+                (m.alt, m.logo, m.shift)
             })
-            .unwrap_or((false, false));
+            .unwrap_or((false, false, false));
 
         // If clicking an upper layer-shell surface (Panel, Dock, Overview, Context Menu),
         // deliver the click directly to the layer surface.
-        if let Some((layer_surface, _, interactivity)) =
-            state.layer_surface_under(pos, &[WlrLayer::Overlay, WlrLayer::Top])
-        {
+        if let Some((layer_surface, _, interactivity)) = state.upper_layer_surface_under(pos) {
             if matches!(
                 interactivity,
                 KeyboardInteractivity::OnDemand | KeyboardInteractivity::Exclusive
             ) && let Some(keyboard) = state.seat.get_keyboard()
             {
-                keyboard.set_focus(state, Some(layer_surface), serial);
+                keyboard.set_focus(state, Some(layer_surface.into()), serial);
             }
         } else if button == BTN_RIGHT
             && let Some((id, window, _hit)) = state.ssd_titlebar_hit_test(pos)
@@ -518,11 +565,18 @@ fn handle_pointer_button<B: InputBackend>(state: &mut NeonState, event: B::Point
                 }
             }
         } else if let Some((window, mut window_loc)) = state.window_under(pos) {
-            // Click-to-focus & raise
-            state.focus_window(Some(&window), serial);
+            // Click-to-focus & raise; if this window currently owns a visible transient/modal
+            // child dialog (e.g. DaVinci Resolve's "Create New Project"), keep that child
+            // raised and focused instead of stealing X11 input focus back onto its parent.
+            let focus_target = window_id(&window)
+                .and_then(|id| state.wm.visible_transient_children(id).into_iter().last())
+                .and_then(|child_id| state.find_window_by_id(child_id))
+                .unwrap_or_else(|| window.clone());
+            state.focus_window(Some(&focus_target), serial);
 
-            // Super+Right-Click opens the OS Window Context Menu on any window (CSD or SSD)
+            // Super+Shift+Right-Click opens the OS Window Context Menu on any window (CSD or SSD).
             if super_held
+                && shift_held
                 && button == BTN_RIGHT
                 && let Some(id) = window_id(&window)
             {
@@ -535,17 +589,64 @@ fn handle_pointer_button<B: InputBackend>(state: &mut NeonState, event: B::Point
                 return;
             }
 
-            // Compositor-initiated Alt+Left move (auto-unmaximizes/unsnaps cleanly)
-            if alt_held && button == BTN_LEFT {
+            // Super+Left-Click or Alt+Left-Click interactive window Move (auto-unmaximizes/unsnaps cleanly).
+            if (super_held || alt_held) && button == BTN_LEFT {
+                let old_loc = window_loc;
+                let old_size = window.geometry().size;
                 if let Some(id) = window_id(&window) {
-                    let work_area = state.work_area();
+                    let was_non_floating = state
+                        .wm
+                        .get(id)
+                        .map(|r| !r.mode.is_floating())
+                        .unwrap_or(false);
+                    let work_area = state.effective_work_area_for(id);
                     if let Some(update) = state.wm.set_floating(id, work_area) {
+                        if let Some(x11) = window.x11_surface() {
+                            let _ = x11.set_maximized(false);
+                            let _ = x11.set_fullscreen(false);
+                            if let (Some(loc), Some(sz)) =
+                                (update.target_location, update.configure_size)
+                            {
+                                let _ = x11.configure(Rectangle::new(
+                                    crate::window::from_wm_point(loc),
+                                    crate::window::from_wm_size(sz),
+                                ));
+                            }
+                        }
                         state.apply_layout_update(&update);
-                        if let Some(loc) = state.space.element_location(&window) {
+                        // Keep pointer proportionally positioned over the restored window when
+                        // dragging out of maximized/snapped mode.
+                        if was_non_floating && old_size.w > 0 {
+                            let new_w = update
+                                .configure_size
+                                .map(|s| s.w)
+                                .unwrap_or(old_size.w)
+                                .max(200);
+                            let ratio_x = ((pos.x - old_loc.x as f64) / old_size.w as f64)
+                                .clamp(0.12, 0.88);
+                            let new_x = (pos.x - new_w as f64 * ratio_x).round() as i32;
+                            let new_y = (pos.y - 24.0).round().max(work_area.loc.y as f64) as i32;
+                            let adjusted: smithay::utils::Point<i32, smithay::utils::Logical> =
+                                (new_x, new_y).into();
+                            state.space.map_element(window.clone(), adjusted, true);
+                            state
+                                .wm
+                                .set_floating_location(id, crate::window::to_wm_point(adjusted));
+                            if let Some(x11) = window.x11_surface() {
+                                let mut g = x11.geometry();
+                                g.loc = adjusted;
+                                let _ = x11.configure(g);
+                            }
+                            window_loc = adjusted;
+                        } else if let Some(loc) = state.space.element_location(&window) {
                             window_loc = loc;
                         }
                     }
                 }
+                state.cursor_status = smithay::input::pointer::CursorImageStatus::Named(
+                    smithay::input::pointer::CursorIcon::Grabbing,
+                );
+                state.needs_redraw = true;
                 let start_data = PointerGrabStartData {
                     focus: state.surface_under(pos),
                     button,
@@ -560,10 +661,15 @@ fn handle_pointer_button<B: InputBackend>(state: &mut NeonState, event: B::Point
                 return;
             }
 
-            if alt_held && button == BTN_RIGHT {
+            // Super+Right-Click or Alt+Right-Click interactive quadrant-smart window Resize.
+            if (super_held || alt_held) && button == BTN_RIGHT {
                 if let Some(id) = window_id(&window) {
-                    let work_area = state.work_area();
+                    let work_area = state.effective_work_area_for(id);
                     if let Some(update) = state.wm.set_floating(id, work_area) {
+                        if let Some(x11) = window.x11_surface() {
+                            let _ = x11.set_maximized(false);
+                            let _ = x11.set_fullscreen(false);
+                        }
                         state.apply_layout_update(&update);
                         if let Some(loc) = state.space.element_location(&window) {
                             window_loc = loc;
@@ -571,6 +677,33 @@ fn handle_pointer_button<B: InputBackend>(state: &mut NeonState, event: B::Point
                     }
                 }
                 let initial_size = window.geometry().size;
+                let rel_x = pos.x - window_loc.x as f64;
+                let rel_y = pos.y - window_loc.y as f64;
+                let horiz = if rel_x < initial_size.w as f64 * 0.5 {
+                    ResizeEdge::LEFT
+                } else {
+                    ResizeEdge::RIGHT
+                };
+                let vert = if rel_y < initial_size.h as f64 * 0.5 {
+                    ResizeEdge::TOP
+                } else {
+                    ResizeEdge::BOTTOM
+                };
+                let edges = horiz | vert;
+
+                let resize_cursor = match (
+                    edges.contains(ResizeEdge::LEFT),
+                    edges.contains(ResizeEdge::TOP),
+                ) {
+                    (true, true) => smithay::input::pointer::CursorIcon::NwResize,
+                    (false, true) => smithay::input::pointer::CursorIcon::NeResize,
+                    (true, false) => smithay::input::pointer::CursorIcon::SwResize,
+                    (false, false) => smithay::input::pointer::CursorIcon::SeResize,
+                };
+                state.cursor_status =
+                    smithay::input::pointer::CursorImageStatus::Named(resize_cursor);
+                state.needs_redraw = true;
+
                 if let Some(toplevel) = window.toplevel() {
                     toplevel.with_pending_state(|s| {
                         s.states.set(xdg_toplevel::State::Resizing);
@@ -585,16 +718,29 @@ fn handle_pointer_button<B: InputBackend>(state: &mut NeonState, event: B::Point
                 let grab = ResizeSurfaceGrab::start(
                     start_data,
                     window,
-                    ResizeEdge::BOTTOM_RIGHT,
+                    edges,
                     Rectangle::new(window_loc, initial_size),
                 );
                 pointer.set_grab(state, grab, serial, Focus::Clear);
                 return;
             }
         } else {
-            // Clicking empty desktop canvas clears window focus cleanly
+            // Clicking empty desktop canvas clears window focus cleanly.
             state.focus_window(None, serial);
-            if button == BTN_RIGHT {
+            // If a Background/Bottom layer surface (such as `neon-wallpaper` with interactive
+            // Desktop Icons) sits under the pointer, let the right-click flow directly to it so
+            // it can distinguish File/Folder icon right-clicks from empty Desktop right-clicks.
+            if button == BTN_RIGHT
+                && state
+                    .layer_surface_under(
+                        pos,
+                        &[
+                            smithay::wayland::shell::wlr_layer::Layer::Bottom,
+                            smithay::wayland::shell::wlr_layer::Layer::Background,
+                        ],
+                    )
+                    .is_none()
+            {
                 state.pending_context_menu = Some((
                     pos.x.round() as i32,
                     pos.y.round() as i32,
@@ -820,5 +966,85 @@ fn handle_gesture_hold_end<B: InputBackend>(state: &mut NeonState, event: B::Ges
                 cancelled: event.cancelled(),
             },
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn super_number_row_and_numpad_map_to_workspaces() {
+        // Top row 1..9, 0
+        for (sym, expected) in [
+            (keysyms::KEY_1, 0),
+            (keysyms::KEY_2, 1),
+            (keysyms::KEY_3, 2),
+            (keysyms::KEY_4, 3),
+            (keysyms::KEY_5, 4),
+            (keysyms::KEY_6, 5),
+            (keysyms::KEY_7, 6),
+            (keysyms::KEY_8, 7),
+            (keysyms::KEY_9, 8),
+            (keysyms::KEY_0, 9),
+        ] {
+            assert_eq!(
+                digit_keysym_to_workspace_index(Keysym::from(sym)),
+                Some(expected),
+                "top row key should map to workspace {expected}"
+            );
+        }
+
+        // Numpad with NumLock ON
+        for (sym, expected) in [
+            (keysyms::KEY_KP_1, 0),
+            (keysyms::KEY_KP_2, 1),
+            (keysyms::KEY_KP_3, 2),
+            (keysyms::KEY_KP_4, 3),
+            (keysyms::KEY_KP_5, 4),
+            (keysyms::KEY_KP_6, 5),
+            (keysyms::KEY_KP_7, 6),
+            (keysyms::KEY_KP_8, 7),
+            (keysyms::KEY_KP_9, 8),
+            (keysyms::KEY_KP_0, 9),
+        ] {
+            assert_eq!(
+                digit_keysym_to_workspace_index(Keysym::from(sym)),
+                Some(expected),
+                "numpad (NumLock ON) key should map to workspace {expected}"
+            );
+        }
+
+        // Numpad with NumLock OFF
+        for (sym, expected) in [
+            (keysyms::KEY_KP_End, 0),
+            (keysyms::KEY_KP_Down, 1),
+            (keysyms::KEY_KP_Page_Down, 2),
+            (keysyms::KEY_KP_Left, 3),
+            (keysyms::KEY_KP_Begin, 4),
+            (keysyms::KEY_KP_Right, 5),
+            (keysyms::KEY_KP_Home, 6),
+            (keysyms::KEY_KP_Up, 7),
+            (keysyms::KEY_KP_Page_Up, 8),
+            (keysyms::KEY_KP_Insert, 9),
+        ] {
+            assert_eq!(
+                digit_keysym_to_workspace_index(Keysym::from(sym)),
+                Some(expected),
+                "numpad (NumLock OFF) key should map to workspace {expected}"
+            );
+        }
+
+        // Regular arrows & page keys must NOT collide with numpad workspace switching
+        for non_ws in [
+            keysyms::KEY_Left,
+            keysyms::KEY_Right,
+            keysyms::KEY_Up,
+            keysyms::KEY_Down,
+            keysyms::KEY_Page_Up,
+            keysyms::KEY_Page_Down,
+        ] {
+            assert_eq!(digit_keysym_to_workspace_index(Keysym::from(non_ws)), None);
+        }
     }
 }

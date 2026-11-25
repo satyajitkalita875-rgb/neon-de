@@ -432,25 +432,42 @@ button.settings-destructive-btn:hover {{
 /* ===================== SWITCHES, DROPDOWNS, SEGMENTED & SLIDERS ===================== */
 
 switch {{
+    background-image: none;
     background-color: {switch_off};
-    border: 1px solid {card_border};
-    border-radius: 999px;
-    min-width: 38px;
-    min-height: 21px;
-    padding: 1px;
+    border: none;
+    border-radius: 12px;
+    min-width: 40px;
+    min-height: 22px;
+    padding: 2px;
+    box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.14);
 }}
 
 switch:checked {{
+    background-image: none;
     background-color: {accent};
-    border-color: transparent;
+    border: none;
 }}
 
-switch > slider {{
+switch > image {{
+    color: transparent;
+    opacity: 0;
+    min-width: 0;
+    min-height: 0;
+}}
+
+switch > slider,
+switch:hover > slider,
+switch:checked > slider,
+switch:checked:hover > slider {{
+    background-image: none;
     background-color: #FFFFFF;
-    border-radius: 999px;
-    min-width: 17px;
-    min-height: 17px;
-    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.32);
+    border: none;
+    outline: none;
+    margin: 0;
+    border-radius: 9px;
+    min-width: 18px;
+    min-height: 18px;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.28);
 }}
 
 dropdown > button {{
@@ -495,28 +512,51 @@ button.settings-seg-btn.active {{
     box-shadow: 0 1px 2px rgba(0, 0, 0, 0.18);
 }}
 
-scale.settings-scale trough {{
+scale,
+scale.settings-scale {{
+    padding: 8px 0;
+    margin: 0;
+}}
+
+scale > trough,
+scale.settings-scale > trough {{
+    background-image: none;
     background-color: {trough_bg};
-    border-radius: 999px;
+    border: none;
+    border-radius: 3px;
     min-height: 4px;
+    box-shadow: none;
 }}
 
-scale.settings-scale highlight {{
+scale > trough > highlight,
+scale.settings-scale > trough > highlight {{
+    background-image: none;
     background-color: {accent};
-    border-radius: 999px;
+    border: none;
+    margin: 0;
+    border-radius: 3px;
+    box-shadow: none;
 }}
 
-scale.settings-scale slider {{
-    background-color: #E5E5EA;
-    border: 1px solid rgba(0, 0, 0, 0.25);
-    border-radius: 999px;
-    min-width: 15px;
-    min-height: 15px;
+scale > trough > slider,
+scale > trough > slider:hover,
+scale > trough > slider:active,
+scale.settings-scale > trough > slider,
+scale.settings-scale > trough > slider:hover,
+scale.settings-scale > trough > slider:active {{
+    background-image: none;
+    background-color: #FFFFFF;
+    border: none;
+    outline: none;
+    border-radius: 8px;
+    min-width: 16px;
+    min-height: 16px;
     margin: -6px 0;
-    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.35);
+    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.34);
 }}
 
-scale.settings-scale value {{
+scale > value,
+scale.settings-scale > value {{
     font-size: 11.5px;
     color: {muted};
 }}

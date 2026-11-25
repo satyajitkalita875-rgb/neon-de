@@ -69,9 +69,9 @@ pub const SETTINGS_REGISTRY: &[SettingMetadata] = &[
         id: "appearance.blur",
         category_id: "appearance",
         category_title: "Appearance",
-        name: "Glass Blur, Corner Radius & Shadows",
-        description: "Adjust blur intensity, reduce blur, corner rounding, drop shadows, and high contrast.",
-        keywords: "blur glass transparency corner radius shadow high contrast",
+        name: "System Blur, Corner Radius & Shadows",
+        description: "Single unified slider controlling blur across Top Bar, Dock, Quick Settings, Workspaces, App Drawer, and glass panels, plus corner rounding and shadows.",
+        keywords: "system blur glass transparency corner radius shadow high contrast top bar dock quick settings app drawer",
     },
     SettingMetadata {
         id: "appearance.cursor",

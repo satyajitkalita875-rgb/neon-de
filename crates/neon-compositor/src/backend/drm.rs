@@ -538,16 +538,12 @@ pub fn run_drm(config: DrmConfig) -> Result<()> {
     {
         let rt_for_timer = Rc::clone(&runtime);
         let ipc_for_timer = Rc::clone(&ipc_server);
-        let mut tick_count: u64 = 0;
         event_loop
             .handle()
             .insert_source(
                 Timer::from_duration(Duration::from_millis(16)),
                 move |_, _, state| {
-                    tick_count = tick_count.wrapping_add(1);
-                    if tick_count % 2 == 0 {
-                        ipc_for_timer.borrow_mut().poll_requests(state);
-                    }
+                    ipc_for_timer.borrow_mut().poll_requests(state);
                     render_all_drm_outputs(&mut rt_for_timer.borrow_mut(), state);
                     TimeoutAction::ToDuration(Duration::from_millis(16))
                 },
@@ -616,7 +612,9 @@ fn render_all_drm_outputs(rt: &mut DrmRuntime, state: &mut NeonState) {
     state.needs_redraw = animating;
 
     let blur = BlurSettings {
-        enabled: state.effects.config.blur_enabled && !state.config.appearance.reduce_blur,
+        enabled: state.effects.config.blur_enabled
+            && !state.config.appearance.reduce_blur
+            && state.effects.config.blur_strength > 0.01,
         strength: state.effects.config.blur_strength,
         corner_radius: state.effects.config.corner_radius,
     };
@@ -626,6 +624,14 @@ fn render_all_drm_outputs(rt: &mut DrmRuntime, state: &mut NeonState) {
     let now = state.clock.now();
 
     let crtcs: Vec<crtc::Handle> = rt.outputs.keys().copied().collect();
+    if !state.pending_overlay_anims.is_empty() {
+        let anims = std::mem::take(&mut state.pending_overlay_anims);
+        for active in rt.outputs.values_mut() {
+            for (ns, opening) in &anims {
+                active.neon_renderer.trigger_overlay_anim(ns, *opening);
+            }
+        }
+    }
     // Fulfill queued native screenshot capture cleanly via offscreen GLES readback.
     if let Some((shot_path, region)) = state.pending_screenshot.take()
         && let Some(&primary_crtc) = crtcs.first()
@@ -644,6 +650,22 @@ fn render_all_drm_outputs(rt: &mut DrmRuntime, state: &mut NeonState) {
         ) {
             Ok(()) => state.notify_screenshot_saved(shot_path),
             Err(err) => warn!(%err, "Failed to capture DRM screenshot"),
+        }
+    }
+
+    // Fulfill queued fast GPU preview thumbnails for neon-screencast-picker.
+    if !state.pending_screencast_previews.is_empty() {
+        let previews = std::mem::take(&mut state.pending_screencast_previews);
+        if let Some(&primary_crtc) = crtcs.first()
+            && let Some(active) = rt.outputs.get_mut(&primary_crtc)
+        {
+            crate::wayland::screencopy::fulfill_screencast_previews(
+                &mut rt.renderer,
+                &mut active.neon_renderer,
+                &active.output,
+                state,
+                previews,
+            );
         }
     }
 
@@ -709,26 +731,55 @@ fn render_all_drm_outputs(rt: &mut DrmRuntime, state: &mut NeonState) {
                 None
             };
 
-            if let Err(err) = capture_output_rgba(
-                &mut rt.renderer,
-                &mut active.neon_renderer,
-                &active.output,
-                &state.scene,
-                blur,
-                is_locked,
-                lock_surface,
-                &or_popups,
-                extra_top,
-                |id| state.managed_windows.get(&id),
-                |rgba, w, h| {
-                    crate::wayland::screencopy::complete_screencopy_frame(
-                        &pending, rgba, w, h, now_dur,
-                    );
-                    Ok(())
-                },
-            ) {
-                warn!(%err, "Failed to capture zwlr_screencopy_frame_v1 on DRM");
-                pending.frame.failed();
+            match &pending.target {
+                crate::wayland::screencopy::ScreencopyTarget::Dmabuf(dmabuf) => {
+                    let mut dmabuf = dmabuf.clone();
+                    match crate::wayland::screencopy::fulfill_screencopy_dmabuf(
+                        &mut rt.renderer,
+                        &mut active.neon_renderer,
+                        &active.output,
+                        state,
+                        blur,
+                        is_locked,
+                        lock_surface,
+                        &or_popups,
+                        extra_top,
+                        pending.overlay_cursor,
+                        now_dur,
+                        &mut dmabuf,
+                    ) {
+                        Ok(()) => {
+                            crate::wayland::screencopy::emit_screencopy_ready(&pending, now_dur);
+                        }
+                        Err(err) => {
+                            warn!(%err, "Failed DMA-BUF zwlr_screencopy_frame_v1 on DRM");
+                            pending.frame.failed();
+                        }
+                    }
+                }
+                crate::wayland::screencopy::ScreencopyTarget::Shm(buffer) => {
+                    if let Err(err) = capture_output_rgba(
+                        &mut rt.renderer,
+                        &mut active.neon_renderer,
+                        &active.output,
+                        &state.scene,
+                        blur,
+                        is_locked,
+                        lock_surface,
+                        &or_popups,
+                        extra_top,
+                        |id| state.managed_windows.get(&id),
+                        |rgba, w, h| {
+                            crate::wayland::screencopy::complete_screencopy_shm_frame(
+                                &pending, buffer, rgba, w, h, now_dur,
+                            );
+                            Ok(())
+                        },
+                    ) {
+                        warn!(%err, "Failed SHM zwlr_screencopy_frame_v1 on DRM");
+                        pending.frame.failed();
+                    }
+                }
             }
         }
     }
@@ -787,6 +838,9 @@ fn render_all_drm_outputs(rt: &mut DrmRuntime, state: &mut NeonState) {
                 &or_popups,
                 |id| state.managed_windows.get(&id),
             ));
+            if active.neon_renderer.has_active_overlay_animation() {
+                state.needs_redraw = true;
+            }
             FALLBACK_CLEAR_COLOR
         };
 

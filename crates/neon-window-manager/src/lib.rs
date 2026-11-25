@@ -52,6 +52,7 @@ pub struct ManagedWindow {
     pub current_geometry: Rect,
     pub mapped: bool,
     pub focused: bool,
+    pub always_on_top: bool,
     /// Parent window for transient dialogs / modal sheets.
     pub parent: Option<WindowId>,
     /// Rules already evaluated and applied to this window so we don't re-apply repeatedly.
@@ -174,6 +175,86 @@ impl WindowManager {
             .collect()
     }
 
+    /// Returns visible windows on the active workspace ordered from bottom-most (oldest focus)
+    /// to top-most (most-recently focused), preserving deterministic stacking order.
+    pub fn active_visible_windows_mru_order(&self) -> Vec<WindowId> {
+        self.visible_windows_mru_order_for(self.active_workspace_id())
+    }
+
+    /// Returns visible (non-minimized) windows on `ws_id` ordered from bottom-most (oldest focus)
+    /// to top-most (most-recently focused), with `always_on_top` windows stacked above normal ones.
+    pub fn visible_windows_mru_order_for(&self, ws_id: WorkspaceId) -> Vec<WindowId> {
+        let mut normal = Vec::new();
+        let mut pinned_top = Vec::new();
+        let mut push_id = |id: WindowId| {
+            let Some(w) = self.windows.get(&id) else {
+                return;
+            };
+            if !w.is_visible_on(ws_id) {
+                return;
+            }
+            if w.always_on_top {
+                if !pinned_top.contains(&id) {
+                    pinned_top.push(id);
+                }
+            } else if !normal.contains(&id) {
+                normal.push(id);
+            }
+        };
+        if let Some(stack) = self.focus_history.get(&ws_id) {
+            for &id in stack {
+                push_id(id);
+            }
+        }
+        for &id in self.workspaces.windows_on(ws_id) {
+            push_id(id);
+        }
+        normal.extend(pinned_top);
+        normal
+    }
+
+    /// Returns visible `always_on_top` windows on `ws_id` in MRU bottom-to-top order.
+    pub fn visible_always_on_top_windows(&self, ws_id: WorkspaceId) -> Vec<WindowId> {
+        self.visible_windows_mru_order_for(ws_id)
+            .into_iter()
+            .filter(|id| {
+                self.windows
+                    .get(id)
+                    .map(|w| w.always_on_top)
+                    .unwrap_or(false)
+            })
+            .collect()
+    }
+
+    /// Returns visible transient descendant windows of `parent_id` on the active workspace,
+    /// ordered bottom-to-top so child dialogs always stack above their parent window.
+    pub fn visible_transient_children(&self, parent_id: WindowId) -> Vec<WindowId> {
+        let active_ws = self.active_workspace_id();
+        let mru = self.active_visible_windows_mru_order();
+        let mut result = Vec::new();
+        let mut frontier = vec![parent_id];
+        let mut cursor = 0;
+        while cursor < frontier.len() {
+            let cur = frontier[cursor];
+            cursor += 1;
+            for &wid in &mru {
+                if wid != parent_id
+                    && !result.contains(&wid)
+                    && self.windows.get(&wid).and_then(|w| w.parent) == Some(cur)
+                    && self
+                        .windows
+                        .get(&wid)
+                        .map(|w| w.is_visible_on(active_ws))
+                        .unwrap_or(false)
+                {
+                    result.push(wid);
+                    frontier.push(wid);
+                }
+            }
+        }
+        result
+    }
+
     /// Registers a newly created toplevel window, assigns workspace & intelligent floating location.
     pub fn register_window(&mut self, work_area: Rect, parent: Option<WindowId>) -> ManagedWindow {
         self.next_id += 1;
@@ -199,6 +280,7 @@ impl WindowManager {
             current_geometry: initial_rect,
             mapped: false,
             focused: false,
+            always_on_top: false,
             parent,
             rules_applied: false,
             matched_rules: Vec::new(),
@@ -278,7 +360,7 @@ impl WindowManager {
         });
 
         let centered_origin = if eval.center_on_open {
-            Some(work_area.center_size(initial_size))
+            Some(work_area.clamp_origin(work_area.center_size(initial_size), initial_size))
         } else {
             None
         };
@@ -332,6 +414,26 @@ impl WindowManager {
         None
     }
 
+    /// Computes and applies center-first collision-aware floating placement for `id` using its
+    /// known `size` inside `work_area`.
+    pub fn place_floating_window(
+        &mut self,
+        id: WindowId,
+        work_area: Rect,
+        size: Size,
+    ) -> Option<Point> {
+        let parent = self.windows.get(&id)?.parent;
+        let loc = self.compute_floating_placement_excluding(work_area, size, parent, false, Some(id));
+        let win = self.windows.get_mut(&id)?;
+        if win.mode.is_floating() {
+            win.floating_geometry.loc = loc;
+            win.current_geometry.loc = loc;
+            Some(loc)
+        } else {
+            None
+        }
+    }
+
     /// Records the window's committed geometry when floating.
     pub fn update_committed_size(
         &mut self,
@@ -339,28 +441,54 @@ impl WindowManager {
         size: Size,
         work_area: Rect,
     ) -> Option<Point> {
-        let parent_rect = self
-            .windows
-            .get(&id)
-            .and_then(|w| w.parent)
-            .and_then(|pid| self.windows.get(&pid).map(|p| p.current_geometry));
+        let (parent, parent_rect, was_unmapped, is_floating, rules_centered) = {
+            let win = self.windows.get(&id)?;
+            let prect = win
+                .parent
+                .and_then(|pid| self.windows.get(&pid).map(|p| p.current_geometry));
+            (
+                win.parent,
+                prect,
+                !win.mapped,
+                win.mode.is_floating(),
+                !win.matched_rules.is_empty(),
+            )
+        };
 
-        let win = self.windows.get_mut(&id)?;
-        let was_unmapped = !win.mapped;
-        win.current_geometry.size = size;
-        if win.mode.is_floating() {
-            win.floating_geometry.size = size;
+        {
+            let win = self.windows.get_mut(&id)?;
+            win.current_geometry.size = size;
+            if is_floating {
+                win.floating_geometry.size = size;
+            }
         }
+
         if was_unmapped && !size.is_empty() {
-            win.mapped = true;
-            // Re-center dialogs precisely once their real size is committed.
-            if let Some(prect) = parent_rect
-                && win.mode.is_floating()
-            {
-                let centered = work_area.clamp_origin(prect.center_size(size), size);
-                win.floating_geometry.loc = centered;
-                win.current_geometry.loc = centered;
-                return Some(centered);
+            if let Some(win) = self.windows.get_mut(&id) {
+                win.mapped = true;
+            }
+            if is_floating {
+                let target_loc = if let Some(prect) = parent_rect {
+                    // Re-center transient dialogs precisely over their parent once real size is known.
+                    work_area.clamp_origin(prect.center_size(size), size)
+                } else if !rules_centered {
+                    // GNOME/KDE center-first placement using the window's actual committed size,
+                    // gently cascading only when another visible floating window is already there.
+                    self.compute_floating_placement_excluding(
+                        work_area,
+                        size,
+                        parent,
+                        false,
+                        Some(id),
+                    )
+                } else {
+                    return None;
+                };
+                if let Some(win) = self.windows.get_mut(&id) {
+                    win.floating_geometry.loc = target_loc;
+                    win.current_geometry.loc = target_loc;
+                }
+                return Some(target_loc);
             }
         }
         None
@@ -467,6 +595,57 @@ impl WindowManager {
         }
         self.sync_geometry_for_mode(id, work_area);
         self.layout_update_for(id, work_area)
+    }
+
+    /// Toggles the `always_on_top` stacking flag on `id` and returns its new state.
+    pub fn toggle_always_on_top(&mut self, id: WindowId) -> Option<bool> {
+        let win = self.windows.get_mut(&id)?;
+        win.always_on_top = !win.always_on_top;
+        Some(win.always_on_top)
+    }
+
+    /// Centers `id` inside `work_area` (restoring to floating if currently snapped/maximized).
+    pub fn center_window(&mut self, id: WindowId, work_area: Rect) -> Option<WindowLayoutUpdate> {
+        let win = self.windows.get_mut(&id)?;
+        if win.mode.is_minimized() {
+            win.mode.restore();
+        }
+        if !win.mode.is_floating() {
+            win.mode.set_floating();
+            if !win.floating_geometry.size.is_empty() {
+                win.current_geometry.size = win.floating_geometry.size;
+            }
+        }
+        let size = if win.current_geometry.size.is_empty() {
+            if !win.floating_geometry.size.is_empty() {
+                win.floating_geometry.size
+            } else {
+                Size::new(800, 560)
+            }
+        } else {
+            win.current_geometry.size
+        };
+        let centered = work_area.clamp_origin(work_area.center_size(size), size);
+        win.floating_geometry.loc = centered;
+        win.floating_geometry.size = size;
+        win.current_geometry.loc = centered;
+        win.current_geometry.size = size;
+        self.layout_update_for(id, work_area)
+    }
+
+    /// Relocates `id` cleanly onto another monitor's `target_work_area`.
+    pub fn move_window_to_area(
+        &mut self,
+        id: WindowId,
+        target_work_area: Rect,
+    ) -> Option<WindowLayoutUpdate> {
+        let is_floating = self.windows.get(&id)?.mode.is_floating();
+        if is_floating {
+            self.center_window(id, target_work_area)
+        } else {
+            self.sync_geometry_for_mode(id, target_work_area);
+            self.layout_update_for(id, target_work_area)
+        }
     }
 
     pub fn minimize(&mut self, id: WindowId, work_area: Rect) -> Option<WindowLayoutUpdate> {
@@ -580,6 +759,17 @@ impl WindowManager {
     /// Switches active workspace to `index`, returning `Some(new_workspace_id)` if changed.
     pub fn switch_workspace_index(&mut self, index: usize) -> Option<WorkspaceId> {
         self.workspaces.switch_to_index(index)
+    }
+
+    /// Switches active workspace to `index`, automatically creating any missing desktops up to
+    /// `MAX_WORKSPACES` (10) so shortcuts like `Super+1..4` and `Super+Numpad` always work.
+    pub fn switch_workspace_index_or_create(&mut self, index: usize) -> Option<WorkspaceId> {
+        self.workspaces.switch_to_index_or_create(index)
+    }
+
+    /// Toggles the pinned persistence state of the workspace at `index`.
+    pub fn toggle_pin_workspace(&mut self, index: usize) -> Option<bool> {
+        self.workspaces.toggle_pin(index)
     }
 
     pub fn switch_workspace_next(&mut self) -> Option<WorkspaceId> {
@@ -714,16 +904,33 @@ impl WindowManager {
         })
     }
 
-    /// Intelligent floating placement:
-    /// 1. Transient dialogs center cleanly over their parent window.
-    /// 2. Rule-centered windows center inside the output work area.
-    /// 3. General floating windows cascade with overlap avoidance inside the work area.
+    /// Intelligent GNOME/KDE-style center-first floating placement:
+    /// 1. Transient dialogs center cleanly over their parent window (clamped to `work_area`).
+    /// 2. Standalone floating windows open centered in `work_area`, cascading gently outward
+    ///    only when another visible floating window already occupies that origin.
     fn compute_floating_placement(
         &mut self,
         work_area: Rect,
         assumed_size: Size,
         parent: Option<WindowId>,
         center_on_open: bool,
+    ) -> Point {
+        self.compute_floating_placement_excluding(
+            work_area,
+            assumed_size,
+            parent,
+            center_on_open,
+            None,
+        )
+    }
+
+    fn compute_floating_placement_excluding(
+        &mut self,
+        work_area: Rect,
+        assumed_size: Size,
+        parent: Option<WindowId>,
+        center_on_open: bool,
+        exclude_id: Option<WindowId>,
     ) -> Point {
         if let Some(pid) = parent
             && let Some(parent_win) = self.windows.get(&pid)
@@ -732,51 +939,53 @@ impl WindowManager {
             return work_area.clamp_origin(centered, assumed_size);
         }
 
+        let center = work_area.clamp_origin(work_area.center_size(assumed_size), assumed_size);
         if center_on_open {
-            return work_area.center_size(assumed_size);
+            return center;
         }
 
-        const MARGIN_X: i32 = 48;
-        const MARGIN_Y: i32 = 48;
-        const STEP_X: i32 = 36;
-        const STEP_Y: i32 = 32;
-        const MAX_STEPS: i32 = 8;
+        const OFFSETS: [(i32, i32); 9] = [
+            (0, 0),
+            (32, 28),
+            (-32, -28),
+            (64, 56),
+            (-64, -56),
+            (96, 84),
+            (-96, -84),
+            (128, 112),
+            (-128, -112),
+        ];
 
         let active_ws = self.active_workspace_id();
         let occupied: Vec<Point> = self
             .windows
             .values()
-            .filter(|w| w.is_visible_on(active_ws) && w.mode.is_floating())
+            .filter(|w| {
+                Some(w.id) != exclude_id
+                    && w.mapped
+                    && w.is_visible_on(active_ws)
+                    && w.mode.is_floating()
+            })
             .map(|w| w.current_geometry.loc)
             .collect();
 
-        for offset in 0..MAX_STEPS {
-            let step = (self.cascade_index + offset) % MAX_STEPS;
+        for (dx, dy) in OFFSETS {
             let candidate = work_area.clamp_origin(
-                Point::new(
-                    work_area.loc.x + MARGIN_X + step * STEP_X,
-                    work_area.loc.y + MARGIN_Y + step * STEP_Y,
-                ),
+                Point::new(center.x + dx, center.y + dy),
                 assumed_size,
             );
             let collides = occupied
                 .iter()
                 .any(|p| (p.x - candidate.x).abs() < 16 && (p.y - candidate.y).abs() < 16);
             if !collides {
-                self.cascade_index = (step + 1) % MAX_STEPS;
                 return candidate;
             }
         }
 
-        let step = self.cascade_index % MAX_STEPS;
-        self.cascade_index = (self.cascade_index + 1) % MAX_STEPS;
-        work_area.clamp_origin(
-            Point::new(
-                work_area.loc.x + MARGIN_X + step * STEP_X,
-                work_area.loc.y + MARGIN_Y + step * STEP_Y,
-            ),
-            assumed_size,
-        )
+        let step = self.cascade_index % (OFFSETS.len() as i32);
+        self.cascade_index = (self.cascade_index + 1) % (OFFSETS.len() as i32);
+        let (dx, dy) = OFFSETS[step as usize];
+        work_area.clamp_origin(Point::new(center.x + dx, center.y + dy), assumed_size)
     }
 }
 
@@ -805,6 +1014,32 @@ mod tests {
             .expect("dialog should recenter once size is committed");
         let p_loc = wm.get(parent.id).unwrap().current_geometry.loc;
         assert_eq!(recentered, Point::new(p_loc.x + 200, p_loc.y + 200));
+    }
+
+    #[test]
+    fn center_size_handles_larger_child_and_standalone_windows_center_first() {
+        let work_area = Rect::new(Point::new(0, 31), Size::new(1920, 969));
+        let splash = Rect::new(Point::new(405, 273), Size::new(1110, 490));
+        let proj_mgr_size = Size::new(1350, 768);
+
+        // Centering a larger window over a smaller anchor rect must not pin to anchor top-left.
+        let over_splash = work_area.clamp_origin(splash.center_size(proj_mgr_size), proj_mgr_size);
+        assert_eq!(over_splash.x, 285);
+
+        // First standalone floating window centers cleanly inside work_area once size is committed.
+        let mut wm = WindowManager::default();
+        let w1 = wm.register_window(work_area, None);
+        let loc1 = wm
+            .update_committed_size(w1.id, proj_mgr_size, work_area)
+            .expect("first standalone window should center on commit");
+        assert_eq!(loc1, Point::new(285, 131));
+
+        // Second standalone floating window cascades cleanly from center without colliding.
+        let w2 = wm.register_window(work_area, None);
+        let loc2 = wm
+            .update_committed_size(w2.id, proj_mgr_size, work_area)
+            .expect("second standalone window should cascade from center");
+        assert_ne!(loc1, loc2);
     }
 
     #[test]
@@ -861,5 +1096,34 @@ mod tests {
         assert_eq!(eval.matched_names, vec!["max-editor"]);
         assert_eq!(update.mode, WindowMode::Maximized);
         assert_eq!(update.configure_size, Some(Size::new(1280, 800)));
+    }
+
+    #[test]
+    fn always_on_top_center_and_move_to_monitor_work_cleanly() {
+        let mut wm = WindowManager::default();
+        let primary = Rect::new(Point::new(0, 31), Size::new(1920, 969));
+        let secondary = Rect::new(Point::new(1920, 0), Size::new(1280, 720));
+        let w1 = wm.register_window(primary, None);
+        let w2 = wm.register_window(primary, None);
+        wm.update_committed_size(w1.id, Size::new(800, 500), primary);
+        wm.update_committed_size(w2.id, Size::new(700, 450), primary);
+
+        // Pin w1 always-on-top, then focus w2: w1 must stay above w2 in stacking order!
+        assert_eq!(wm.toggle_always_on_top(w1.id), Some(true));
+        wm.mark_focused(Some(w2.id));
+        let order = wm.active_visible_windows_mru_order();
+        assert_eq!(order, vec![w2.id, w1.id]);
+
+        // Snap w1 then center it: must restore to floating and center geometrically.
+        wm.toggle_snap(w1.id, geometry::SnapRegion::LeftHalf, primary);
+        let centered = wm.center_window(w1.id, primary).expect("center update");
+        assert!(centered.mode.is_floating());
+        assert_eq!(centered.target_location, Some(Point::new(560, 265)));
+
+        // Move w1 onto secondary monitor: centers cleanly inside secondary work area.
+        let moved = wm
+            .move_window_to_area(w1.id, secondary)
+            .expect("move to secondary monitor");
+        assert_eq!(moved.target_location, Some(Point::new(1920 + 240, 110)));
     }
 }

@@ -114,7 +114,7 @@ impl SessionLockHandler for NeonState {
         }
 
         if let Some(keyboard) = self.seat.get_keyboard() {
-            keyboard.set_focus(self, Some(wl_surf), SERIAL_COUNTER.next_serial());
+            keyboard.set_focus(self, Some(wl_surf.into()), SERIAL_COUNTER.next_serial());
         }
         info!(output = %output_name, ?logical_size, "Configured ext_session_lock_v1 surface");
     }

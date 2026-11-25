@@ -216,6 +216,43 @@ impl<W: Copy + Eq + std::hash::Hash + std::fmt::Debug> WorkspaceManager<W> {
         Some(active_id)
     }
 
+    /// Switches active workspace to `target_index`, automatically creating and pinning any
+    /// intermediate desktops up to `target_index` (capped at [`MAX_WORKSPACES`]) so shortcuts
+    /// such as `Super+1..4` and `Super+Numpad` always jump directly to the requested desktop.
+    ///
+    /// Returns `Some(new_id)` if the active workspace actually changed.
+    pub fn switch_to_index_or_create(&mut self, target_index: usize) -> Option<WorkspaceId> {
+        if target_index >= MAX_WORKSPACES {
+            return None;
+        }
+        if target_index >= self.workspaces.len() {
+            // Pin existing workspaces and newly created ones up to target_index so dynamic
+            // pruning never collapses target_index back down to a lower slot.
+            for ws in &mut self.workspaces {
+                ws.pinned = true;
+            }
+            while self.workspaces.len() <= target_index {
+                self.push_new_workspace_with(true);
+            }
+        }
+        self.switch_to_index(target_index)
+    }
+
+    /// Toggles the pinned flag on the desktop at `index` (COSMIC-style persistent workspace pin).
+    ///
+    /// Returns `Some(new_pinned_state)`, or `None` if `index` is out of bounds.
+    /// When unpinned, dynamic reconciliation runs so empty non-active non-trailing workspaces
+    /// are pruned cleanly.
+    pub fn toggle_pin(&mut self, index: usize) -> Option<bool> {
+        let ws = self.workspaces.get_mut(index)?;
+        ws.pinned = !ws.pinned;
+        let new_pinned = ws.pinned;
+        let ws_id = ws.id;
+        self.reconcile_dynamic_workspaces();
+        debug!(?ws_id, index, pinned = new_pinned, "Toggled workspace pin");
+        Some(new_pinned)
+    }
+
     /// Switches to the workspace with the given [`WorkspaceId`].
     pub fn switch_to_id(&mut self, id: WorkspaceId) -> Option<WorkspaceId> {
         let idx = self.index_of(id)?;
@@ -490,5 +527,33 @@ mod tests {
         // Removing a desktop shrinks cleanly back to 9
         assert!(mgr.remove_workspace(9));
         assert_eq!(mgr.len(), 9);
+    }
+
+    #[test]
+    fn switch_to_index_or_create_expands_and_preserves_workspaces_and_pin_toggle() {
+        let mut mgr: WorkspaceManager<u64> = WorkspaceManager::default();
+        mgr.assign_window(1, None);
+        assert_eq!(mgr.len(), 2);
+
+        // Jumping directly to Workspace 4 (index 3) creates Workspaces 3 & 4 and switches there.
+        let ws4 = mgr
+            .switch_to_index_or_create(3)
+            .expect("should create and switch to workspace 4");
+        assert_eq!(mgr.len(), 4);
+        assert_eq!(mgr.active_index(), 3);
+        assert_eq!(mgr.active_workspace_id(), ws4);
+
+        // Switching back to Workspace 1 keeps all 4 workspaces intact.
+        mgr.switch_to_index_or_create(0)
+            .expect("switch back to workspace 1");
+        assert_eq!(mgr.len(), 4);
+        assert_eq!(mgr.active_index(), 0);
+
+        // Out-of-bounds beyond MAX_WORKSPACES is rejected.
+        assert!(mgr.switch_to_index_or_create(MAX_WORKSPACES).is_none());
+
+        // Unpinning an empty intermediate workspace (index 2) prunes it cleanly.
+        assert_eq!(mgr.toggle_pin(2), Some(false));
+        assert_eq!(mgr.len(), 3);
     }
 }

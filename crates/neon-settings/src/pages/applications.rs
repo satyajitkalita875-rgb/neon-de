@@ -1,25 +1,24 @@
-//! Applications settings: Default Apps (XDG MIME), Login Items (XDG Autostart toggles),
-//! and searchable installed applications browser.
+//! Applications settings: Default Apps (XDG MIME) and searchable installed applications
+//! browser with real uninstallation (APT / Flatpak / Snap / user launchers).
 
 use std::rc::Rc;
 
 use gtk4::{
     Align, Box as GtkBox, Button, DropDown, Orientation, ScrolledWindow, SearchEntry, Spinner,
-    StringList, Switch, glib, prelude::*,
+    StringList, prelude::*,
 };
-use neon_system::apps::{self, AutostartEntry, InstalledApp};
+use neon_system::apps::{self, InstalledApp};
 
 use crate::{
     state::SettingsController,
     ui::{
-        append_rows, boxed_card, info_row, page_shell, run_async, section_heading, setting_row,
-        status_badge,
+        append_rows, boxed_card, confirm_action_dialog, info_row, page_shell, run_async,
+        section_heading, setting_row, status_badge,
     },
 };
 
 struct AppsData {
     installed: Vec<InstalledApp>,
-    autostart: Vec<AutostartEntry>,
     default_browser: Option<String>,
     default_mail: Option<String>,
     default_files: Option<String>,
@@ -44,7 +43,6 @@ pub fn build_page(ctrl: Rc<SettingsController>) -> ScrolledWindow {
     run_async(
         || AppsData {
             installed: apps::discover_installed_apps(),
-            autostart: apps::list_autostart_entries(),
             default_browser: apps::query_default_mime_app("x-scheme-handler/https"),
             default_mail: apps::query_default_mime_app("x-scheme-handler/mailto"),
             default_files: apps::query_default_mime_app("inode/directory"),
@@ -159,54 +157,6 @@ fn render_apps(root: &GtkBox, ctrl: Rc<SettingsController>, data: AppsData) {
     append_rows(&def_card, def_rows);
     root.append(&def_card);
 
-    // ── Open at Login (XDG Autostart) ────────────────────────────────────────
-    root.append(&section_heading(&format!(
-        "Open at Login ({})",
-        data.autostart.len()
-    )));
-    let auto_card = boxed_card();
-    if data.autostart.is_empty() {
-        auto_card.append(&info_row(
-            "No Login Items",
-            "Use Add to Login below on any installed application.",
-            "—",
-        ));
-    } else {
-        let mut rows = Vec::new();
-        for item in data.autostart.into_iter().take(20) {
-            let sw = Switch::new();
-            sw.set_active(item.enabled);
-            sw.set_valign(Align::Center);
-            let ctrl_c = Rc::clone(&ctrl);
-            let file_name = item.file_name.clone();
-            let app_name = item.name.clone();
-            sw.connect_state_set(move |_, active| {
-                let ctrl_done = Rc::clone(&ctrl_c);
-                let f = file_name.clone();
-                let n = app_name.clone();
-                run_async(
-                    move || apps::set_autostart_enabled(&f, active),
-                    move |res| match res {
-                        Ok(()) => ctrl_done.set_status_ok(&format!(
-                            "{} {n} at login",
-                            if active { "Enabled" } else { "Disabled" }
-                        )),
-                        Err(e) => ctrl_done.set_status_err(&format!("Autostart error: {e}")),
-                    },
-                );
-                glib::Propagation::Proceed
-            });
-            let sub = format!(
-                "{} • {}",
-                if item.user_owned { "User" } else { "System" },
-                item.exec
-            );
-            rows.push(setting_row(&item.name, &sub, &sw));
-        }
-        append_rows(&auto_card, rows);
-    }
-    root.append(&auto_card);
-
     // ── Installed Applications ───────────────────────────────────────────────
     root.append(&section_heading(&format!(
         "Installed Applications ({})",
@@ -242,7 +192,7 @@ fn render_apps(root: &GtkBox, ctrl: Rc<SettingsController>, data: AppsData) {
                             .as_deref()
                             .is_some_and(|c| c.to_ascii_lowercase().contains(&q))
                 })
-                .take(30)
+                .take(100)
                 .collect();
 
             if filtered.is_empty() {
@@ -250,24 +200,60 @@ fn render_apps(root: &GtkBox, ctrl: Rc<SettingsController>, data: AppsData) {
             } else {
                 let mut rows = Vec::new();
                 for app in filtered {
-                    let add_btn = Button::with_label("Add to Login");
-                    add_btn.add_css_class("settings-secondary-btn");
+                    let source = apps::detect_install_source(app);
+                    let source_label = source.label();
+                    let uninstall_btn = Button::with_label("Uninstall…");
+                    uninstall_btn.add_css_class("settings-destructive-btn");
                     let ctrl_a = Rc::clone(&ctrl_c);
                     let app_clone = app.clone();
-                    add_btn.connect_clicked(move |_| {
-                        match apps::add_user_autostart(&app_clone) {
-                            Ok(()) => {
-                                ctrl_a.set_status_ok(&format!("Added {} to Login Items", app_clone.name));
-                                ctrl_a.rebuild_page("applications");
-                            }
-                            Err(e) => ctrl_a.set_status_err(&format!("Autostart error: {e}")),
-                        }
+                    uninstall_btn.connect_clicked(move |btn| {
+                        let ctrl_inner = Rc::clone(&ctrl_a);
+                        let app_run = app_clone.clone();
+                        let btn_c = btn.clone();
+                        let title = format!("Uninstall {}?", app_clone.name);
+                        let body = format!(
+                            "Remove {} ({source_label}) from this computer? Administrator authentication may be requested for system packages.",
+                            app_clone.name
+                        );
+                        confirm_action_dialog(
+                            &ctrl_a.window,
+                            &title,
+                            &body,
+                            "Uninstall",
+                            true,
+                            move || {
+                                btn_c.set_sensitive(false);
+                                btn_c.set_label("Uninstalling…");
+                                ctrl_inner.set_status_info(&format!(
+                                    "Uninstalling {}…",
+                                    app_run.name
+                                ));
+                                let ctrl_done = Rc::clone(&ctrl_inner);
+                                let btn_done = btn_c.clone();
+                                run_async(
+                                    move || apps::uninstall_app(&app_run),
+                                    move |res| match res {
+                                        Ok(msg) => {
+                                            ctrl_done.set_status_ok(&msg);
+                                            ctrl_done.rebuild_page("applications");
+                                        }
+                                        Err(e) => {
+                                            btn_done.set_sensitive(true);
+                                            btn_done.set_label("Uninstall…");
+                                            ctrl_done.set_status_err(&format!(
+                                                "Uninstall failed: {e}"
+                                            ));
+                                        }
+                                    },
+                                );
+                            },
+                        );
                     });
-                    let sub = app
-                        .comment
-                        .as_deref()
-                        .unwrap_or(&app.desktop_id);
-                    rows.push(setting_row(&app.name, sub, &add_btn));
+                    let sub = match app.comment.as_deref().filter(|s| !s.trim().is_empty()) {
+                        Some(comment) => format!("{source_label} • {comment}"),
+                        None => format!("{source_label} • {}", app.desktop_id),
+                    };
+                    rows.push(setting_row(&app.name, &sub, &uninstall_btn));
                 }
                 append_rows(&card, rows);
             }

@@ -137,6 +137,8 @@ pub struct WindowInfo {
     pub minimized: bool,
     pub maximized: bool,
     pub fullscreen: bool,
+    #[serde(default)]
+    pub always_on_top: bool,
 }
 
 /// Snapshot of a dynamic workspace.
@@ -145,6 +147,8 @@ pub struct WorkspaceInfo {
     pub id: u64,
     pub index: usize,
     pub active: bool,
+    #[serde(default)]
+    pub pinned: bool,
     pub window_ids: Vec<u64>,
 }
 
@@ -176,20 +180,73 @@ pub struct EffectsInfo {
     pub speed_scale: f64,
 }
 
+/// Appearance payload revision emitted by current `neon-compositor` builds.
+/// Older pre-restart compositors omit this field (deserializing as `0`), allowing `neon-shell`
+/// to gracefully overlay newly added shell preferences from XDG config until next login.
+pub const APPEARANCE_PROTOCOL_REV: u32 = 2;
+
 fn default_blur_strength() -> f32 {
     1.0
 }
 
-/// Snapshot of live appearance, dock, and panel shell settings.
+fn default_dock_position() -> String {
+    "bottom".into()
+}
+
+fn default_dock_icon_size() -> u32 {
+    36
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_desktop_sort_by() -> String {
+    "name".into()
+}
+
+/// Snapshot of live appearance, dock, desktop, and panel shell settings.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AppearanceInfo {
+    #[serde(default)]
+    pub protocol_rev: u32,
     pub theme: String,
     pub accent_color: String,
     pub dock_transparency: f32,
+    #[serde(default)]
+    pub dock_auto_hide: bool,
+    #[serde(default)]
+    pub dock_smart_hide: bool,
+    #[serde(default = "default_dock_position")]
+    pub dock_position: String,
+    #[serde(default = "default_dock_icon_size")]
+    pub dock_icon_size: u32,
+    #[serde(default = "default_true")]
+    pub dock_magnification: bool,
+    #[serde(default)]
+    pub dock_pinned_apps: Vec<String>,
     pub panel_transparency: f32,
     pub panel_visible: bool,
+    #[serde(default)]
+    pub panel_smart_hide: bool,
     pub show_clock: bool,
+    #[serde(default = "default_true")]
+    pub clock_24h: bool,
     pub show_workspaces: bool,
+    #[serde(default = "default_true")]
+    pub show_app_title: bool,
+    #[serde(default = "default_true")]
+    pub show_system_tray: bool,
+    #[serde(default = "default_true")]
+    pub show_battery: bool,
+    #[serde(default = "default_true")]
+    pub show_quick_settings: bool,
+    #[serde(default = "default_true")]
+    pub show_desktop_icons: bool,
+    #[serde(default = "default_desktop_sort_by")]
+    pub desktop_sort_by: String,
+    #[serde(default = "default_true")]
+    pub desktop_auto_arrange: bool,
     #[serde(default)]
     pub high_contrast: bool,
     #[serde(default)]
@@ -202,6 +259,110 @@ pub struct AppearanceInfo {
     pub cursor_theme: Option<String>,
     #[serde(default)]
     pub cursor_size: Option<u32>,
+}
+
+impl Default for AppearanceInfo {
+    fn default() -> Self {
+        Self {
+            protocol_rev: APPEARANCE_PROTOCOL_REV,
+            theme: "neon_dark".into(),
+            accent_color: "#38BDF8".into(),
+            dock_transparency: 0.78,
+            dock_auto_hide: false,
+            dock_smart_hide: false,
+            dock_position: default_dock_position(),
+            dock_icon_size: default_dock_icon_size(),
+            dock_magnification: true,
+            dock_pinned_apps: Vec::new(),
+            panel_transparency: 0.76,
+            panel_visible: true,
+            panel_smart_hide: false,
+            show_clock: true,
+            clock_24h: true,
+            show_workspaces: true,
+            show_app_title: true,
+            show_system_tray: true,
+            show_battery: true,
+            show_quick_settings: true,
+            show_desktop_icons: true,
+            desktop_sort_by: default_desktop_sort_by(),
+            desktop_auto_arrange: true,
+            high_contrast: false,
+            wallpaper: None,
+            reduce_blur: false,
+            blur_strength: 1.0,
+            cursor_theme: Some("macOS".into()),
+            cursor_size: Some(20),
+        }
+    }
+}
+
+/// Ergonomic partial patch builder for [`IpcRequest::UpdateAppearance`].
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct AppearanceUpdate {
+    pub theme: Option<String>,
+    pub accent_color: Option<String>,
+    pub dock_transparency: Option<f32>,
+    pub dock_auto_hide: Option<bool>,
+    pub dock_smart_hide: Option<bool>,
+    pub dock_position: Option<String>,
+    pub dock_icon_size: Option<u32>,
+    pub dock_magnification: Option<bool>,
+    pub dock_pinned_apps: Option<Vec<String>>,
+    pub panel_transparency: Option<f32>,
+    pub panel_visible: Option<bool>,
+    pub panel_smart_hide: Option<bool>,
+    pub show_clock: Option<bool>,
+    pub clock_24h: Option<bool>,
+    pub show_workspaces: Option<bool>,
+    pub show_app_title: Option<bool>,
+    pub show_system_tray: Option<bool>,
+    pub show_battery: Option<bool>,
+    pub show_quick_settings: Option<bool>,
+    pub show_desktop_icons: Option<bool>,
+    pub desktop_sort_by: Option<String>,
+    pub desktop_auto_arrange: Option<bool>,
+    pub high_contrast: Option<bool>,
+    pub wallpaper: Option<String>,
+    pub reduce_blur: Option<bool>,
+    pub blur_strength: Option<f32>,
+    pub cursor_theme: Option<String>,
+    pub cursor_size: Option<u32>,
+}
+
+impl From<AppearanceUpdate> for IpcRequest {
+    fn from(u: AppearanceUpdate) -> Self {
+        Self::UpdateAppearance {
+            theme: u.theme,
+            accent_color: u.accent_color,
+            dock_transparency: u.dock_transparency,
+            dock_auto_hide: u.dock_auto_hide,
+            dock_smart_hide: u.dock_smart_hide,
+            dock_position: u.dock_position,
+            dock_icon_size: u.dock_icon_size,
+            dock_magnification: u.dock_magnification,
+            dock_pinned_apps: u.dock_pinned_apps,
+            panel_transparency: u.panel_transparency,
+            panel_visible: u.panel_visible,
+            panel_smart_hide: u.panel_smart_hide,
+            show_clock: u.show_clock,
+            clock_24h: u.clock_24h,
+            show_workspaces: u.show_workspaces,
+            show_app_title: u.show_app_title,
+            show_system_tray: u.show_system_tray,
+            show_battery: u.show_battery,
+            show_quick_settings: u.show_quick_settings,
+            show_desktop_icons: u.show_desktop_icons,
+            desktop_sort_by: u.desktop_sort_by,
+            desktop_auto_arrange: u.desktop_auto_arrange,
+            high_contrast: u.high_contrast,
+            wallpaper: u.wallpaper,
+            reduce_blur: u.reduce_blur,
+            blur_strength: u.blur_strength,
+            cursor_theme: u.cursor_theme,
+            cursor_size: u.cursor_size,
+        }
+    }
 }
 
 /// Live compositor frame-timing, uptime, and runtime diagnostics.
@@ -265,6 +426,9 @@ pub enum IpcRequest {
     RemoveWorkspace {
         index: usize,
     },
+    TogglePinWorkspace {
+        index: usize,
+    },
     MoveWindowToWorkspace {
         window_id: u64,
         workspace_index: usize,
@@ -284,9 +448,25 @@ pub enum IpcRequest {
     ToggleMaximizeWindow {
         window_id: u64,
     },
+    ToggleFullscreenWindow {
+        window_id: u64,
+    },
     SnapWindow {
         window_id: u64,
         region: String,
+    },
+    ToggleAlwaysOnTop {
+        window_id: u64,
+    },
+    CenterWindow {
+        window_id: u64,
+    },
+    SetFloatingWindow {
+        window_id: u64,
+    },
+    MoveWindowToOutput {
+        window_id: u64,
+        output_name: String,
     },
     ToggleOverview,
     SetOverview {
@@ -294,10 +474,26 @@ pub enum IpcRequest {
     },
     LockSession,
     OpenScreenshotUi,
+    AnimateOverlay {
+        namespace: String,
+        opening: bool,
+    },
     TakeScreenshot {
         path: Option<String>,
         #[serde(default)]
         region: Option<[i32; 4]>,
+    },
+    GetScreencastTarget,
+    SetScreencastTarget {
+        target: ScreencastTarget,
+    },
+    CaptureScreencastPreview {
+        target: ScreencastTarget,
+        path: String,
+        #[serde(default)]
+        max_width: Option<u32>,
+        #[serde(default)]
+        max_height: Option<u32>,
     },
     ConfigureOutput {
         name: String,
@@ -322,10 +518,40 @@ pub enum IpcRequest {
         theme: Option<String>,
         accent_color: Option<String>,
         dock_transparency: Option<f32>,
+        #[serde(default)]
+        dock_auto_hide: Option<bool>,
+        #[serde(default)]
+        dock_smart_hide: Option<bool>,
+        #[serde(default)]
+        dock_position: Option<String>,
+        #[serde(default)]
+        dock_icon_size: Option<u32>,
+        #[serde(default)]
+        dock_magnification: Option<bool>,
+        #[serde(default)]
+        dock_pinned_apps: Option<Vec<String>>,
         panel_transparency: Option<f32>,
         panel_visible: Option<bool>,
+        #[serde(default)]
+        panel_smart_hide: Option<bool>,
         show_clock: Option<bool>,
+        #[serde(default)]
+        clock_24h: Option<bool>,
         show_workspaces: Option<bool>,
+        #[serde(default)]
+        show_app_title: Option<bool>,
+        #[serde(default)]
+        show_system_tray: Option<bool>,
+        #[serde(default)]
+        show_battery: Option<bool>,
+        #[serde(default)]
+        show_quick_settings: Option<bool>,
+        #[serde(default)]
+        show_desktop_icons: Option<bool>,
+        #[serde(default)]
+        desktop_sort_by: Option<String>,
+        #[serde(default)]
+        desktop_auto_arrange: Option<bool>,
         #[serde(default)]
         high_contrast: Option<bool>,
         #[serde(default)]
@@ -387,6 +613,25 @@ pub enum IpcPayload {
     Appearance { appearance: AppearanceInfo },
     WindowBehavior { behavior: WindowBehaviorInfo },
     Screenshot { path: String },
+    ScreencastTarget { target: ScreencastTarget },
+}
+
+/// Active live capture target for PipeWire / `zwlr_screencopy_manager_v1` DMA-BUF screencasts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ScreencastTarget {
+    /// Capture an entire physical display/monitor by connector name (or primary if omitted).
+    Output { name: Option<String> },
+    /// Capture a single managed toplevel window isolated from all other windows and workspaces.
+    Window { window_id: u64 },
+    /// Capture a specific desktop/workspace by zero-based index (even while viewing another).
+    Workspace { index: usize },
+}
+
+impl Default for ScreencastTarget {
+    fn default() -> Self {
+        Self::Output { name: None }
+    }
 }
 
 /// Target surface kind for an OS-level right-click context menu requested by the compositor.

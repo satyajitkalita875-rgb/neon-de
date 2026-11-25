@@ -1,17 +1,16 @@
-//! Battery & Power settings: live UPower battery level & health, PowerProfilesDaemon
-//! mode selector, and real systemd-logind / compositor session power actions.
+//! Battery & Power settings: live UPower battery level & health and PowerProfilesDaemon
+//! performance profile selector.
 
 use std::rc::Rc;
 
 use gtk4::{Align, Box as GtkBox, Button, Orientation, ProgressBar, ScrolledWindow, Spinner, prelude::*};
-use neon_ipc::IpcRequest;
 use neon_system::power::{self, PowerStatus};
 
 use crate::{
     state::SettingsController,
     ui::{
-        append_rows, boxed_card, confirm_action_dialog, info_row, page_shell, run_async,
-        section_heading, setting_row, status_badge,
+        append_rows, boxed_card, info_row, page_shell, run_async, section_heading, setting_row,
+        status_badge,
     },
 };
 
@@ -122,143 +121,4 @@ fn render_power(root: &GtkBox, ctrl: Rc<SettingsController>, status: PowerStatus
 
     append_rows(&bat_card, bat_rows);
     root.append(&bat_card);
-
-    // ── Session & System Power Controls ──────────────────────────────────────
-    root.append(&section_heading("Session & Power"));
-    let act_card = boxed_card();
-
-    let lock_btn = Button::with_label("Lock Screen");
-    lock_btn.add_css_class("settings-secondary-btn");
-    {
-        let ctrl_c = Rc::clone(&ctrl);
-        lock_btn.connect_clicked(move |_| {
-            let socket = ctrl_c.ipc_socket.clone();
-            let ctrl_done = Rc::clone(&ctrl_c);
-            run_async(
-                move || crate::state::send_ipc_socket(&socket, IpcRequest::LockSession),
-                move |res| match res {
-                    Ok(_) => ctrl_done.set_status_ok("Session locked"),
-                    Err(e) => ctrl_done.set_status_err(&format!("Lock failed: {e}")),
-                },
-            );
-        });
-    }
-
-    let sleep_btn = Button::with_label("Sleep");
-    sleep_btn.add_css_class("settings-secondary-btn");
-    sleep_btn.set_sensitive(status.can_suspend);
-    {
-        let ctrl_c = Rc::clone(&ctrl);
-        sleep_btn.connect_clicked(move |_| {
-            let ctrl_done = Rc::clone(&ctrl_c);
-            run_async(
-                || power::invoke_logind_action("Suspend"),
-                move |res| {
-                    if let Err(e) = res {
-                        ctrl_done.set_status_err(&format!("Sleep failed: {e}"));
-                    }
-                },
-            );
-        });
-    }
-
-    let logout_btn = Button::with_label("Log Out…");
-    logout_btn.add_css_class("settings-secondary-btn");
-    {
-        let ctrl_c = Rc::clone(&ctrl);
-        logout_btn.connect_clicked(move |_| {
-            let ctrl_inner = Rc::clone(&ctrl_c);
-            confirm_action_dialog(
-                &ctrl_c.window,
-                "Log Out of NEON DE?",
-                "All open applications in this session will be closed.",
-                "Log Out",
-                false,
-                move || {
-                    let ctrl_done = Rc::clone(&ctrl_inner);
-                    run_async(power::terminate_current_session, move |res| {
-                        if let Err(e) = res {
-                            ctrl_done.set_status_err(&format!("Log out failed: {e}"));
-                        }
-                    });
-                },
-            );
-        });
-    }
-
-    let restart_btn = Button::with_label("Restart…");
-    restart_btn.add_css_class("settings-secondary-btn");
-    restart_btn.set_sensitive(status.can_reboot);
-    {
-        let ctrl_c = Rc::clone(&ctrl);
-        restart_btn.connect_clicked(move |_| {
-            let ctrl_inner = Rc::clone(&ctrl_c);
-            confirm_action_dialog(
-                &ctrl_c.window,
-                "Restart Computer?",
-                "Your computer will restart immediately via systemd-logind.",
-                "Restart",
-                true,
-                move || {
-                    let ctrl_done = Rc::clone(&ctrl_inner);
-                    run_async(
-                        || power::invoke_logind_action("Reboot"),
-                        move |res| {
-                            if let Err(e) = res {
-                                ctrl_done.set_status_err(&format!("Restart failed: {e}"));
-                            }
-                        },
-                    );
-                },
-            );
-        });
-    }
-
-    let shutdown_btn = Button::with_label("Shut Down…");
-    shutdown_btn.add_css_class("settings-destructive-btn");
-    shutdown_btn.set_sensitive(status.can_power_off);
-    {
-        let ctrl_c = Rc::clone(&ctrl);
-        shutdown_btn.connect_clicked(move |_| {
-            let ctrl_inner = Rc::clone(&ctrl_c);
-            confirm_action_dialog(
-                &ctrl_c.window,
-                "Shut Down Computer?",
-                "Your computer will power off immediately via systemd-logind.",
-                "Shut Down",
-                true,
-                move || {
-                    let ctrl_done = Rc::clone(&ctrl_inner);
-                    run_async(
-                        || power::invoke_logind_action("PowerOff"),
-                        move |res| {
-                            if let Err(e) = res {
-                                ctrl_done.set_status_err(&format!("Shut down failed: {e}"));
-                            }
-                        },
-                    );
-                },
-            );
-        });
-    }
-
-    let session_btns = GtkBox::new(Orientation::Horizontal, 6);
-    session_btns.set_valign(Align::Center);
-    session_btns.append(&lock_btn);
-    session_btns.append(&sleep_btn);
-    session_btns.append(&logout_btn);
-
-    let power_btns = GtkBox::new(Orientation::Horizontal, 6);
-    power_btns.set_valign(Align::Center);
-    power_btns.append(&restart_btn);
-    power_btns.append(&shutdown_btn);
-
-    append_rows(
-        &act_card,
-        vec![
-            setting_row("Session", "Lock screen, suspend, or sign out.", &session_btns),
-            setting_row("System Power", "Restart or shut down this machine.", &power_btns),
-        ],
-    );
-    root.append(&act_card);
 }

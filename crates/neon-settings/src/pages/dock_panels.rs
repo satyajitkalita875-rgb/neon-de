@@ -4,7 +4,7 @@
 use std::rc::Rc;
 
 use gtk4::{Align, Box as GtkBox, Button, Orientation, ScrolledWindow, prelude::*};
-use neon_config::{EffectsPreset, FocusMode, WindowButtonLayout};
+use neon_config::{DockPosition, EffectsPreset, FocusMode, WindowButtonLayout};
 
 use crate::{
     state::{
@@ -24,24 +24,145 @@ pub fn build_page(ctrl: Rc<SettingsController>) -> ScrolledWindow {
     page.append(&section_heading("Dock & Top Bar"));
     let shell_card = boxed_card();
 
-    let (dock_opacity, panel_visible, panel_opacity, show_clock, show_workspaces) = {
+    let (
+        dock_position,
+        dock_icon_size,
+        dock_magnification,
+        dock_auto_hide,
+        dock_smart_hide,
+        dock_opacity,
+        show_desktop_icons,
+        panel_visible,
+        panel_smart_hide,
+        panel_opacity,
+        show_clock,
+        show_workspaces,
+    ) = {
         let c = ctrl.config.borrow();
         (
+            c.dock.position,
+            f64::from(c.dock.icon_size),
+            c.dock.magnification,
+            c.dock.auto_hide,
+            c.dock.intelligent_hide,
             f64::from(c.dock.transparency),
+            c.desktop.show_desktop_icons,
             c.panel.visible,
+            c.panel.smart_hide,
             f64::from(c.panel.transparency),
             c.panel.show_clock,
             c.panel.show_workspaces,
         )
     };
 
+    let dock_pos_idx = match dock_position {
+        DockPosition::Bottom => 0,
+        DockPosition::Left => 1,
+        DockPosition::Right => 2,
+    };
+
+    let dock_vis_idx = if dock_auto_hide {
+        1
+    } else if dock_smart_hide {
+        2
+    } else {
+        0
+    };
+
     append_rows(
         &shell_card,
         vec![
+            dropdown_row(
+                "Dock Position",
+                "Place the floating dock on the bottom, left, or right screen edge.",
+                &["Bottom", "Left", "Right"],
+                dock_pos_idx,
+                {
+                    let ctrl_c = Rc::clone(&ctrl);
+                    move |idx| {
+                        ctrl_c.config.borrow_mut().dock.position = match idx {
+                            1 => DockPosition::Left,
+                            2 => DockPosition::Right,
+                            _ => DockPosition::Bottom,
+                        };
+                        let req = build_appearance_request(&ctrl_c.config.borrow());
+                        ctrl_c.persist_and_sync(Some(req), "Updated dock position");
+                    }
+                },
+            ),
+            slider_row(
+                "Dock Icon Size",
+                "Adjust the icon size inside the floating dock (22–64 px).",
+                22.0,
+                64.0,
+                2.0,
+                dock_icon_size,
+                0,
+                {
+                    let ctrl_c = Rc::clone(&ctrl);
+                    move |val| {
+                        ctrl_c.config.borrow_mut().dock.icon_size = val.round() as u32;
+                        let req = build_appearance_request(&ctrl_c.config.borrow());
+                        ctrl_c.persist_and_sync(
+                            Some(req),
+                            &format!("Dock icon size: {:.0} px", val),
+                        );
+                    }
+                },
+            ),
+            toggle_row(
+                "Dock Magnification",
+                "Smoothly magnify dock icons on pointer hover.",
+                dock_magnification,
+                {
+                    let ctrl_c = Rc::clone(&ctrl);
+                    move |v| {
+                        ctrl_c.config.borrow_mut().dock.magnification = v;
+                        let req = build_appearance_request(&ctrl_c.config.borrow());
+                        ctrl_c.persist_and_sync(Some(req), "Updated dock magnification");
+                    }
+                },
+            ),
+            toggle_row(
+                "Show Desktop Icons",
+                "Display interactive files, folders, and shortcuts from ~/Desktop on the wallpaper.",
+                show_desktop_icons,
+                {
+                    let ctrl_c = Rc::clone(&ctrl);
+                    move |v| {
+                        ctrl_c.config.borrow_mut().desktop.show_desktop_icons = v;
+                        let req = build_appearance_request(&ctrl_c.config.borrow());
+                        ctrl_c.persist_and_sync(Some(req), "Updated desktop icons visibility");
+                    }
+                },
+            ),
+            dropdown_row(
+                "Dock Visibility",
+                "Always show the dock, auto-hide until bottom edge hover, or smart-hide when windows overlap it.",
+                &["Always Visible", "Auto-Hide", "Smart Hide (Intelligent)"],
+                dock_vis_idx,
+                {
+                    let ctrl_c = Rc::clone(&ctrl);
+                    move |idx| {
+                        {
+                            let mut cfg = ctrl_c.config.borrow_mut();
+                            cfg.dock.auto_hide = idx == 1;
+                            cfg.dock.intelligent_hide = idx == 2;
+                        }
+                        let req = build_appearance_request(&ctrl_c.config.borrow());
+                        let note = match idx {
+                            1 => "Dock set to Auto-Hide",
+                            2 => "Dock set to Smart Hide",
+                            _ => "Dock set to Always Visible",
+                        };
+                        ctrl_c.persist_and_sync(Some(req), note);
+                    }
+                },
+            ),
             slider_row(
                 "Dock Opacity",
-                "Background opacity of the floating bottom dock.",
-                0.20,
+                "Background tint opacity of the floating dock (0% = clear glass, 100% = solid).",
+                0.00,
                 1.00,
                 0.05,
                 dock_opacity,
@@ -68,10 +189,30 @@ pub fn build_page(ctrl: Rc<SettingsController>) -> ScrolledWindow {
                     }
                 },
             ),
+            toggle_row(
+                "Smart Hide Top Bar",
+                "Automatically hide the top bar when a window overlaps it; move pointer to the top edge to reveal.",
+                panel_smart_hide,
+                {
+                    let ctrl_c = Rc::clone(&ctrl);
+                    move |v| {
+                        ctrl_c.config.borrow_mut().panel.smart_hide = v;
+                        let req = build_appearance_request(&ctrl_c.config.borrow());
+                        ctrl_c.persist_and_sync(
+                            Some(req),
+                            if v {
+                                "Enabled Smart Hide Top Bar"
+                            } else {
+                                "Disabled Smart Hide Top Bar"
+                            },
+                        );
+                    }
+                },
+            ),
             slider_row(
                 "Top Bar Opacity",
-                "Background opacity of the top menu bar.",
-                0.20,
+                "Background tint opacity of the top menu bar (0% = clear glass, 100% = solid).",
+                0.00,
                 1.00,
                 0.05,
                 panel_opacity,

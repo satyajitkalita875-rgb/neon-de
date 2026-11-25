@@ -83,6 +83,17 @@ impl WindowRulesEngine {
                 ..Default::default()
             },
         });
+        engine.add_rule(WindowRule {
+            name: "center-neon-screencast-picker".into(),
+            matcher: WindowMatcher {
+                app_id_contains: Some("screencast-picker".into()),
+                ..Default::default()
+            },
+            action: WindowRuleAction {
+                center_on_open: true,
+                ..Default::default()
+            },
+        });
         engine
     }
 

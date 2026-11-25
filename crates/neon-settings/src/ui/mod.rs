@@ -178,19 +178,18 @@ pub fn slider_row(
     scale.set_value(initial.clamp(min, max));
 
     let cb = Rc::new(on_change);
-    let pending: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
+    let generation = Rc::new(Cell::new(0u64));
     scale.connect_value_changed(move |s| {
         let val = s.value();
-        if let Some(prev) = pending.borrow_mut().take() {
-            prev.remove();
-        }
+        let my_gen = generation.get().wrapping_add(1);
+        generation.set(my_gen);
         let cb_c = Rc::clone(&cb);
-        let pending_c = Rc::clone(&pending);
-        let id = glib::timeout_add_local_once(Duration::from_millis(45), move || {
-            *pending_c.borrow_mut() = None;
-            cb_c(val);
+        let gen_c = Rc::clone(&generation);
+        glib::timeout_add_local_once(Duration::from_millis(45), move || {
+            if gen_c.get() == my_gen {
+                cb_c(val);
+            }
         });
-        *pending.borrow_mut() = Some(id);
     });
     setting_row(title, subtitle, &scale)
 }

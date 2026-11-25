@@ -603,21 +603,30 @@ pub fn dispatch_tool(name: &str, args: &Value, bridge: &NeonBridge) -> Result<Va
             Ok(json!({ "ok": true, "locked": true }))
         }
         "update_appearance" => {
-            let req = IpcRequest::UpdateAppearance {
+            let req = IpcRequest::from(neon_ipc::AppearanceUpdate {
                 theme: opt_str(args, "theme"),
                 accent_color: opt_str(args, "accent_color"),
                 dock_transparency: opt_f32(args, "dock_transparency"),
+                dock_auto_hide: opt_bool(args, "dock_auto_hide"),
+                dock_smart_hide: opt_bool(args, "dock_smart_hide"),
+                dock_position: opt_str(args, "dock_position"),
+                dock_icon_size: opt_u32(args, "dock_icon_size"),
+                dock_magnification: opt_bool(args, "dock_magnification"),
                 panel_transparency: opt_f32(args, "panel_transparency"),
                 panel_visible: opt_bool(args, "panel_visible"),
+                panel_smart_hide: opt_bool(args, "panel_smart_hide"),
                 show_clock: opt_bool(args, "show_clock"),
+                clock_24h: opt_bool(args, "clock_24h"),
                 show_workspaces: opt_bool(args, "show_workspaces"),
+                show_desktop_icons: opt_bool(args, "show_desktop_icons"),
                 high_contrast: opt_bool(args, "high_contrast"),
                 wallpaper: opt_str(args, "wallpaper"),
                 reduce_blur: opt_bool(args, "reduce_blur"),
                 blur_strength: opt_f32(args, "blur_strength"),
                 cursor_theme: opt_str(args, "cursor_theme"),
                 cursor_size: opt_u32(args, "cursor_size"),
-            };
+                ..Default::default()
+            });
             match bridge.request(req)? {
                 IpcPayload::Appearance { appearance } => {
                     Ok(json!({ "ok": true, "appearance": appearance }))
@@ -803,11 +812,28 @@ fn handle_launch_app(args: &Value, bridge: &NeonBridge) -> Result<Value, String>
             format!("no installed XDG desktop application matched '{target}' (use list_apps first)")
         })?;
 
-    let (program, cmd_args) = parse_desktop_exec(&found.exec)
+    let (raw_program, raw_args) = parse_desktop_exec(&found.exec)
         .ok_or_else(|| format!("application '{}' has an invalid Exec line", found.name))?;
+
+    let (program, cmd_args) = if found.terminal {
+        neon_system::apps::wrap_terminal_command(&raw_program, &raw_args).ok_or_else(|| {
+            format!(
+                "application '{}' requires a terminal emulator, but none was found in PATH",
+                found.name
+            )
+        })?
+    } else {
+        (raw_program, raw_args)
+    };
 
     let mut cmd = Command::new(&program);
     cmd.args(&cmd_args);
+    if let Some(ref dir) = found.working_dir {
+        let p = Path::new(dir);
+        if p.is_dir() {
+            cmd.current_dir(p);
+        }
+    }
 
     // Wire the launched app cleanly onto the live NEON DE Wayland, IPC, and XWayland sockets.
     if let Ok(sock) = bridge.resolve_socket_path() {
@@ -1009,12 +1035,14 @@ mod tests {
                                 id: 1,
                                 index: 0,
                                 active: true,
+                                pinned: true,
                                 window_ids: vec![42],
                             },
                             WorkspaceInfo {
                                 id: 2,
                                 index: 1,
                                 active: false,
+                                pinned: false,
                                 window_ids: vec![],
                             },
                         ],

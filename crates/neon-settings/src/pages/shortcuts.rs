@@ -77,6 +77,11 @@ const ACTIVE_SHORTCUTS: &[ShortcutEntry] = &[
     // Workspaces
     ShortcutEntry {
         group: "Workspaces",
+        action: "Switch to Workspace 1–10",
+        keys: "Super + 1…0  /  Super + Numpad 1…0",
+    },
+    ShortcutEntry {
+        group: "Workspaces",
         action: "Next / Previous Workspace",
         keys: "Ctrl + Alt + Right/Left  /  Super + PgDn/PgUp",
     },

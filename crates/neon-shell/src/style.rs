@@ -9,28 +9,16 @@ use neon_ipc::AppearanceInfo;
 pub struct ShellThemeController {
     provider: CssProvider,
     last_applied: Option<AppearanceInfo>,
+    last_synced_light: Option<bool>,
 }
 
 impl ShellThemeController {
     pub fn init() -> Self {
         let provider = CssProvider::new();
-        let default_appearance = AppearanceInfo {
-            theme: "neon_dark".into(),
-            accent_color: "#38BDF8".into(),
-            dock_transparency: 0.78,
-            panel_transparency: 0.76,
-            panel_visible: true,
-            show_clock: true,
-            show_workspaces: true,
-            high_contrast: false,
-            wallpaper: None,
-            reduce_blur: false,
-            blur_strength: 1.0,
-            cursor_theme: Some("macOS".into()),
-            cursor_size: Some(20),
-        };
+        let default_appearance = AppearanceInfo::default();
         provider.load_from_string(&build_shell_css(&default_appearance));
         apply_gtk_settings(&default_appearance);
+        crate::desktop_apps::register_extra_icon_search_paths();
         if let Some(display) = Display::default() {
             gtk4::style_context_add_provider_for_display(
                 &display,
@@ -41,6 +29,7 @@ impl ShellThemeController {
         Self {
             provider,
             last_applied: Some(default_appearance),
+            last_synced_light: None,
         }
     }
 
@@ -51,6 +40,17 @@ impl ShellThemeController {
         apply_gtk_settings(appearance);
         self.provider.load_from_string(&build_shell_css(appearance));
         self.last_applied = Some(appearance.clone());
+
+        // Propagate Light/Dark theme live to XDG Desktop Portal (`org.freedesktop.appearance`),
+        // gsettings, and GTK3/GTK4 settings.ini so Chrome, Electron/Antigravity, Firefox, GTK,
+        // and Qt apps follow NEON DE's theme immediately.
+        let is_light = appearance.theme == "neon_light" || appearance.theme == "light";
+        if self.last_synced_light != Some(is_light) {
+            self.last_synced_light = Some(is_light);
+            std::thread::spawn(move || {
+                neon_system::portals::sync_system_color_scheme(is_light);
+            });
+        }
     }
 }
 
@@ -78,22 +78,22 @@ fn apply_gtk_settings(appearance: &AppearanceInfo) {
 pub fn build_shell_css(appearance: &AppearanceInfo) -> String {
     let is_light = appearance.theme == "neon_light" || appearance.theme == "light";
     let high_contrast = appearance.high_contrast;
-    let reduce_blur = appearance.reduce_blur || appearance.blur_strength <= 0.05;
+    let reduce_blur = appearance.reduce_blur || appearance.blur_strength <= 0.01;
     let blur_s = appearance.blur_strength.clamp(0.0, 2.0);
     let accent = &appearance.accent_color;
     let panel_a = if high_contrast {
         1.0
     } else if reduce_blur {
-        (appearance.panel_transparency * 0.94).clamp(0.76, 0.96)
+        appearance.panel_transparency.clamp(0.0, 1.0)
     } else {
-        (appearance.panel_transparency * 0.76).clamp(0.42, 0.94)
+        (appearance.panel_transparency * 0.62).clamp(0.0, 0.92)
     };
     let dock_a = if high_contrast {
         1.0
     } else if reduce_blur {
-        (appearance.dock_transparency * 0.92).clamp(0.74, 0.95)
+        appearance.dock_transparency.clamp(0.0, 1.0)
     } else {
-        (appearance.dock_transparency * 0.68).clamp(0.36, 0.92)
+        (appearance.dock_transparency * 0.56).clamp(0.0, 0.90)
     };
 
     let cc_blur_px = (14.0 * blur_s).clamp(2.0, 24.0);
@@ -298,7 +298,78 @@ pub fn build_shell_css(appearance: &AppearanceInfo) -> String {
         )
     };
 
-    let _ = (tahoe_glass_bg, tahoe_blur_filter, launchpad_blur_filter, slider_fill);
+    let (
+        qs_panel_bg,
+        qs_inner_bg,
+        qs_pill_bg,
+        qs_pill_hover,
+        qs_pill_active_bg,
+        qs_pill_active_fg,
+        pm_scrim_bg,
+    ) = if is_light {
+        (
+            if high_contrast { "#FFFFFF" } else { "rgba(244, 248, 255, 0.72)" },
+            if high_contrast { "#F1F5F9" } else { "rgba(255, 255, 255, 0.58)" },
+            if high_contrast { "#E2E8F0" } else { "rgba(255, 255, 255, 0.62)" },
+            "rgba(255, 255, 255, 0.84)",
+            accent.as_str(),
+            "#FFFFFF",
+            if high_contrast { "rgba(232, 238, 248, 0.90)" } else { "rgba(218, 226, 240, 0.42)" },
+        )
+    } else {
+        (
+            if high_contrast { "#0B1120" } else { "rgba(15, 20, 32, 0.62)" },
+            if high_contrast { "#111827" } else { "rgba(255, 255, 255, 0.08)" },
+            if high_contrast { "#1E293B" } else { "rgba(255, 255, 255, 0.11)" },
+            "rgba(255, 255, 255, 0.18)",
+            accent.as_str(),
+            "#FFFFFF",
+            if high_contrast { "rgba(6, 9, 16, 0.90)" } else { "rgba(7, 10, 18, 0.44)" },
+        )
+    };
+
+    let (ctx_bg, ctx_border, ctx_shadow, ctx_sub_open_bg, ctx_dialog_bg, ctx_input_bg) = if is_light
+    {
+        (
+            if high_contrast {
+                "#FFFFFF"
+            } else if reduce_blur {
+                "rgba(248, 250, 254, 0.96)"
+            } else {
+                "rgba(246, 248, 253, 0.74)"
+            },
+            if high_contrast {
+                "#0F172A"
+            } else {
+                "rgba(15, 23, 42, 0.14)"
+            },
+            "0 8px 20px rgba(15, 23, 42, 0.18), 0 2px 5px rgba(15, 23, 42, 0.10), inset 0 1px 0 rgba(255, 255, 255, 0.92)",
+            "rgba(15, 23, 42, 0.08)",
+            if high_contrast { "#FFFFFF" } else { "rgba(248, 250, 254, 0.95)" },
+            "rgba(15, 23, 42, 0.06)",
+        )
+    } else {
+        (
+            if high_contrast {
+                "#0B1120"
+            } else if reduce_blur {
+                "rgba(24, 28, 40, 0.95)"
+            } else {
+                "rgba(26, 30, 44, 0.70)"
+            },
+            if high_contrast {
+                "#F8FAFC"
+            } else {
+                "rgba(255, 255, 255, 0.18)"
+            },
+            "0 8px 20px rgba(0, 0, 0, 0.44), 0 2px 5px rgba(0, 0, 0, 0.26), inset 0 1px 0 rgba(255, 255, 255, 0.16)",
+            "rgba(255, 255, 255, 0.11)",
+            if high_contrast { "#0B1120" } else { "rgba(24, 28, 40, 0.94)" },
+            "rgba(255, 255, 255, 0.08)",
+        )
+    };
+
+    let _ = (tahoe_glass_bg, tahoe_blur_filter, launchpad_blur_filter, slider_fill, popover_bg);
 
     format!(
         r#"
@@ -310,14 +381,25 @@ window.neon-panel-window,
 window.neon-dock-window,
 window.neon-overview-window,
 window.neon-quicksettings-window,
+window.neon-workspaces-window,
+window.neon-powermenu-window,
+window.neon-edge-sensor-window,
 window.neon-toast-window,
 window.neon-screenshot-window,
-window.neon-contextmenu-window {{
+window.neon-contextmenu-window,
+window.neon-ctx-backdrop-window,
+window.neon-dialog-window {{
     background-color: transparent;
     background-image: none;
     box-shadow: none;
     border: none;
     outline: none;
+}}
+
+/* Almost-zero alpha guarantees GTK commits an interactive input buffer while staying 100% invisible */
+.neon-edge-sensor-strip {{
+    background-color: rgba(0, 0, 0, 0.004);
+    min-height: 3px;
 }}
 
 window.neon-wallpaper-window {{
@@ -337,7 +419,47 @@ window.neon-wallpaper-window {{
     transition: background-color 280ms cubic-bezier(0.22, 1.0, 0.36, 1.0),
                 border-color 280ms cubic-bezier(0.22, 1.0, 0.36, 1.0),
                 box-shadow 280ms cubic-bezier(0.22, 1.0, 0.36, 1.0),
-                color 280ms cubic-bezier(0.22, 1.0, 0.36, 1.0);
+                color 280ms cubic-bezier(0.22, 1.0, 0.36, 1.0),
+                transform 200ms cubic-bezier(0.22, 1.0, 0.36, 1.0),
+                opacity 180ms ease;
+}}
+
+.neon-top-panel.panel-hidden {{
+    transform: translateY(-34px);
+    opacity: 0;
+}}
+
+button.neon-rec-pill {{
+    background-image: none;
+    background-color: rgba(220, 38, 38, 0.90);
+    color: #FFFFFF;
+    border: 1px solid rgba(255, 255, 255, 0.28);
+    box-shadow: 0 2px 8px rgba(220, 38, 38, 0.42);
+    border-radius: 999px;
+    padding: 1px 10px;
+    min-height: 22px;
+    margin-right: 6px;
+    font-size: 11px;
+    font-weight: 700;
+    transition: background-color 140ms ease, transform 120ms ease;
+}}
+
+button.neon-rec-pill:hover {{
+    background-color: #EF4444;
+    transform: scale(1.03);
+}}
+
+.neon-rec-dot {{
+    background-color: #FFFFFF;
+    border-radius: 999px;
+    min-width: 7px;
+    min-height: 7px;
+}}
+
+.neon-rec-label {{
+    color: #FFFFFF;
+    font-size: 11px;
+    font-weight: 700;
 }}
 
 .neon-top-panel.drawer-open {{
@@ -450,6 +572,24 @@ button.neon-tray-btn.active {{
     color: {fg_primary};
 }}
 
+.neon-tray-apps {{
+    margin-right: 2px;
+}}
+
+button.neon-tray-app-btn {{
+    padding: 2px 5px;
+    min-width: 24px;
+    min-height: 22px;
+    border-radius: 6px;
+}}
+
+.neon-tray-sep {{
+    background-color: {border_subtle};
+    min-width: 1px;
+    min-height: 14px;
+    margin: 0 4px;
+}}
+
 button.neon-cc-toggle-btn {{
     padding: 2px 10px;
     border-radius: 999px;
@@ -475,18 +615,25 @@ button.neon-cc-toggle-btn.active {{
     background-image: none;
     border: none;
     box-shadow: none;
-    padding: 16px 24px 16px 24px;
+    padding: 7px 20px 5px 20px;
 }}
 
 .neon-dock-container {{
     background-color: {dock_bg};
     border: 1px solid {border_glass};
-    border-radius: 22px;
-    padding: 6px 12px 5px 12px;
+    border-radius: 20px;
+    padding: 5px 11px 4px 11px;
     box-shadow: 0 3px 10px rgba(0, 0, 0, 0.28), {specular_inset};
     transition: background-color 280ms cubic-bezier(0.22, 1.0, 0.36, 1.0),
                 border-color 280ms cubic-bezier(0.22, 1.0, 0.36, 1.0),
-                box-shadow 280ms cubic-bezier(0.22, 1.0, 0.36, 1.0);
+                box-shadow 280ms cubic-bezier(0.22, 1.0, 0.36, 1.0),
+                transform 210ms cubic-bezier(0.22, 1.0, 0.36, 1.0),
+                opacity 190ms ease;
+}}
+
+.neon-dock-container.dock-hidden {{
+    transform: translateY(96px);
+    opacity: 0;
 }}
 
 .neon-dock-container.drawer-open {{
@@ -499,22 +646,69 @@ button.neon-cc-toggle-btn.active {{
     background-color: rgba(255, 255, 255, 0.26);
 }}
 
+.neon-dock-wrapper.dock-vertical {{
+    padding: 16px 7px;
+}}
+
+.neon-dock-container.dock-vertical {{
+    padding: 8px 6px;
+}}
+
+.neon-dock-container.dock-vertical .neon-dock-separator {{
+    min-width: 24px;
+    min-height: 1px;
+    margin: 5px 8px;
+}}
+
 button.neon-dock-item {{
     background-image: none;
     background-color: transparent;
     border: none;
     box-shadow: none;
-    border-radius: 14px;
-    padding: 4px 6px 2px 6px;
-    min-width: 48px;
-    min-height: 52px;
+    border-radius: 12px;
+    padding: 3px 5px 2px 5px;
+    min-width: 24px;
+    min-height: 26px;
     color: {fg_primary};
     transition: transform 180ms cubic-bezier(0.22, 1.0, 0.36, 1.0), background-color 150ms ease;
 }}
 
+.neon-dock-container.dock-compact {{
+    border-radius: 15px;
+    padding: 3px 7px 2px 7px;
+}}
+
+.neon-dock-container.dock-compact button.neon-dock-item {{
+    border-radius: 9px;
+    padding: 2px 3px 1px 3px;
+    min-width: 22px;
+    min-height: 24px;
+}}
+
+.neon-dock-container.dock-compact .neon-dock-dot {{
+    min-width: 4px;
+    min-height: 4px;
+    margin-top: 2px;
+}}
+
+.neon-dock-container.dock-compact .neon-dock-dot.focused {{
+    min-width: 10px;
+}}
+
+.neon-dock-container.dock-compact .neon-dock-separator {{
+    margin: 5px 3px 6px 3px;
+}}
+
 button.neon-dock-item:hover {{
     background-color: rgba(255, 255, 255, 0.12);
-    transform: translateY(-5px) scale(1.13);
+}}
+
+.neon-dock-container.dock-magnify button.neon-dock-item:hover {{
+    transform: translateY(-6px) scale(1.18);
+}}
+
+.neon-dock-container.dock-vertical.dock-magnify button.neon-dock-item:hover {{
+    transform: scale(1.18);
 }}
 
 button.neon-dock-item:active {{
@@ -552,7 +746,9 @@ button.neon-dock-item.focused {{
 /* ===================== LIQUID GLASS FLOATING CONTROL CENTER ===================== */
 
 .neon-cc-backdrop {{
-    background-color: transparent;
+    /* Non-zero alpha (1/255, visually imperceptible) forces GTK4/GSK Vulkan & GL to
+       always paint and attach a full-screen wl_buffer so click-outside dismissal works. */
+    background-color: rgba(0, 0, 0, 0.005);
     background-image: none;
     border: none;
     box-shadow: none;
@@ -763,8 +959,8 @@ button.neon-cc-inline-icon-btn {{
     border: none;
     box-shadow: none;
     border-radius: 999px;
-    min-width: 22px;
-    min-height: 22px;
+    min-width: 24px;
+    min-height: 24px;
     padding: 0;
     margin: 0;
     color: {fg_primary};
@@ -779,14 +975,20 @@ button.neon-cc-inline-icon-btn.muted {{
     color: #F87171;
 }}
 
+.neon-cc-slider-divider {{
+    background-color: {border_subtle};
+    min-height: 1px;
+    margin: 1px 0;
+}}
+
 button.neon-cc-output-circle {{
     background-image: none;
     background-color: {cc_badge_idle};
     border: 1px solid {border_subtle};
     box-shadow: none;
     border-radius: 999px;
-    min-width: 28px;
-    min-height: 28px;
+    min-width: 22px;
+    min-height: 22px;
     padding: 0;
     margin: 0 0 0 2px;
     color: {fg_primary};
@@ -804,7 +1006,8 @@ scale.neon-cc-slider {{
     margin: 0;
 }}
 
-scale.neon-cc-slider trough {{
+scale.neon-cc-slider > trough {{
+    background-image: none;
     background-color: {cc_slider_trough};
     border: none;
     border-radius: 999px;
@@ -812,25 +1015,31 @@ scale.neon-cc-slider trough {{
     box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.16);
 }}
 
-scale.neon-cc-slider highlight {{
+scale.neon-cc-slider > trough > highlight {{
+    background-image: none;
     background-color: {cc_slider_fill};
+    border: none;
+    margin: 0;
     border-radius: 999px;
 }}
 
-scale.neon-cc-slider slider {{
+scale.neon-cc-slider > trough > slider,
+scale.neon-cc-slider > trough > slider:hover,
+scale.neon-cc-slider > trough > slider:active {{
     background-image: none;
     background-color: #FFFFFF;
-    border: 1px solid rgba(0, 0, 0, 0.08);
-    border-radius: 999px;
+    border: none;
+    outline: none;
+    border-radius: 9px;
     min-width: 18px;
     min-height: 18px;
     margin: -6px 0;
-    box-shadow: 0 2px 7px rgba(0, 0, 0, 0.30);
+    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.30);
     transition: transform 140ms ease;
 }}
 
-scale.neon-cc-slider:hover slider {{
-    transform: scale(1.12);
+scale.neon-cc-slider:hover > trough > slider {{
+    transform: scale(1.10);
 }}
 
 /* Compact System Power Glass Pill (exact 316 px border-box = 302+12+2) */
@@ -1181,138 +1390,181 @@ button.neon-close-button:hover {{
     color: #FFFFFF;
 }}
 
-/* ===================== WORKSPACES & DESKTOPS PANEL (TOP BAR NEON BUTTON) ===================== */
+/* ===================== COSMIC-STYLE LEFT WORKSPACES SIDEBAR ===================== */
 
-.neon-ws-panel-surface {{
-    background-color: {cc_glass_bg};
-    background-image: {cc_glass_grad};
-    border: 1px solid {cc_glass_border};
-    border-radius: 26px;
-    padding: 16px 18px 18px 18px;
-    box-shadow: {cc_glass_shadow};
-    color: {fg_primary};
-    min-width: 460px;
-    transition: opacity 220ms cubic-bezier(0.22, 1.0, 0.36, 1.0),
-                transform 260ms cubic-bezier(0.22, 1.0, 0.36, 1.0);
-}}
-
-.neon-ws-panel-surface.ws-closed {{
-    opacity: 0;
-    transform: translateY(-16px) scale(0.93);
-}}
-
-.neon-ws-panel-surface.ws-open {{
-    opacity: 1;
-    transform: translateY(0px) scale(1.0);
-}}
-
-.neon-ws-panel-title {{
-    color: {fg_primary};
-    font-size: 15px;
-    font-weight: 700;
-}}
-
-button.neon-ws-add-btn {{
+.neon-ws-sidebar {{
+    background-color: {qs_panel_bg};
     background-image: none;
-    background-color: {accent};
-    color: #FFFFFF;
+    border: 1px solid {border_glass};
+    border-radius: 16px;
+    padding: 9px 8px 9px 8px;
+    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.34), {specular_inset};
+    color: {fg_primary};
+}}
+
+.neon-ws-scroller,
+.neon-ws-scroller > viewport {{
+    background-color: transparent;
+    background-image: none;
     border: none;
-    box-shadow: 0 4px 14px alpha({accent}, 0.36);
+}}
+
+.neon-ws-scroller scrollbar {{
+    background-color: transparent;
+    border: none;
+}}
+
+.neon-ws-scroller scrollbar slider {{
+    background-color: rgba(255, 255, 255, 0.22);
     border-radius: 999px;
-    padding: 6px 14px;
+    min-width: 4px;
+    min-height: 24px;
+}}
+
+.neon-ws-cards-list {{
+    padding: 1px 1px;
+}}
+
+.neon-ws-card-sep {{
+    background-color: {border_subtle};
+    min-height: 1px;
+    margin: 2px 6px;
+}}
+
+.neon-ws-cosmic-card {{
+    background-color: transparent;
+    border: 2.5px solid transparent;
+    border-radius: 11px;
+    padding: 5px 5px 7px 5px;
+    transition: background-color 150ms ease,
+                border-color 160ms ease,
+                transform 160ms cubic-bezier(0.22, 1.0, 0.36, 1.0);
+}}
+
+.neon-ws-cosmic-card:hover {{
+    background-color: {qs_pill_bg};
+    border-color: {border_subtle};
+}}
+
+.neon-ws-cosmic-card.active {{
+    background-color: alpha({accent}, 0.11);
+    border-color: {accent};
+    box-shadow: none;
+}}
+
+.neon-ws-thumb-frame {{
+    background-color: rgba(10, 14, 24, 0.72);
+    border: 1px solid {border_subtle};
+    border-radius: 7px;
+}}
+
+.neon-ws-cosmic-card.active .neon-ws-thumb-frame {{
+    border-color: rgba(255, 255, 255, 0.18);
+}}
+
+.neon-ws-cosmic-footer {{
+    margin-top: 3px;
+    padding: 0 2px;
+}}
+
+.neon-ws-cosmic-label {{
+    color: {fg_muted};
+    font-size: 12px;
+    font-weight: 500;
+    letter-spacing: 0.1px;
+}}
+
+.neon-ws-cosmic-label.active {{
+    color: {fg_primary};
+    font-weight: 600;
+}}
+
+button.neon-ws-pin-btn {{
+    background-image: none;
+    background-color: transparent;
+    border: none;
+    box-shadow: none;
+    border-radius: 999px;
+    min-width: 22px;
+    min-height: 22px;
+    padding: 0;
+    margin: 0;
+    transition: background-color 150ms ease, transform 160ms cubic-bezier(0.34, 1.56, 0.64, 1.0);
+}}
+
+button.neon-ws-pin-btn:hover {{
+    background-color: {qs_pill_hover};
+    transform: scale(1.08);
+}}
+
+button.neon-ws-pin-btn:active {{
+    transform: scale(0.92);
+}}
+
+button.neon-ws-pin-btn.pinned {{
+    background-color: {accent};
+    box-shadow: 0 1px 5px alpha({accent}, 0.45);
+}}
+
+button.neon-ws-pin-btn.pinned:hover {{
+    background-color: {accent};
+    opacity: 0.92;
+    transform: scale(1.08);
+}}
+
+button.neon-ws-thumb-close {{
+    background-image: none;
+    background-color: rgba(10, 14, 24, 0.64);
+    color: rgba(255, 255, 255, 0.90);
+    border: 1px solid rgba(255, 255, 255, 0.18);
+    box-shadow: none;
+    border-radius: 999px;
+    min-width: 19px;
+    min-height: 19px;
+    padding: 0;
     font-size: 12px;
     font-weight: 700;
-    transition: transform 140ms ease, opacity 140ms ease;
+    opacity: 0;
+    transition: opacity 150ms ease, background-color 140ms ease, transform 140ms ease;
 }}
 
-button.neon-ws-add-btn:hover {{
-    transform: scale(1.03);
+.neon-ws-cosmic-card:hover button.neon-ws-thumb-close {{
+    opacity: 0.92;
 }}
 
-button.neon-ws-add-btn:active {{
-    transform: scale(0.96);
-}}
-
-button.neon-ws-add-btn:disabled {{
-    opacity: 0.42;
-}}
-
-.neon-ws-desktop-card {{
-    background-color: {cc_badge_idle};
-    border: 1px solid {border_subtle};
-    border-radius: 16px;
-    padding: 10px 12px;
-    transition: background-color 160ms ease, border-color 160ms ease, transform 150ms cubic-bezier(0.22, 1.0, 0.36, 1.0);
-}}
-
-.neon-ws-desktop-card:hover {{
-    background-color: {cc_glass_hover};
-    border-color: {cc_glass_border};
-    transform: translateY(-2px);
-}}
-
-.neon-ws-desktop-card.active {{
-    background-color: alpha({accent}, 0.24);
-    border-color: {accent};
-    box-shadow: 0 4px 14px alpha({accent}, 0.25);
-}}
-
-button.neon-ws-plus-card {{
-    background-image: none;
-    background-color: transparent;
-    border: 1px dashed {cc_glass_border};
-    box-shadow: none;
-    border-radius: 16px;
-    padding: 10px 12px;
-    color: {fg_primary};
-    transition: background-color 160ms ease, border-color 160ms ease, transform 150ms ease;
-}}
-
-button.neon-ws-plus-card:hover {{
-    background-color: {cc_badge_idle};
-    border-color: {accent};
-    transform: translateY(-2px);
-}}
-
-button.neon-ws-remove-btn {{
-    background-image: none;
-    background-color: transparent;
-    color: {fg_muted};
-    border: none;
-    box-shadow: none;
-    border-radius: 999px;
-    min-width: 20px;
-    min-height: 20px;
-    padding: 0;
-    font-size: 13px;
-    font-weight: 700;
-    transition: background-color 140ms ease, color 140ms ease;
-}}
-
-button.neon-ws-remove-btn:hover {{
-    background-color: rgba(239, 68, 68, 0.85);
+button.neon-ws-thumb-close:hover {{
+    opacity: 1.0;
+    background-color: rgba(239, 68, 68, 0.92);
+    border-color: rgba(255, 255, 255, 0.28);
     color: #FFFFFF;
+    transform: scale(1.08);
 }}
 
-.neon-ws-window-card {{
-    background-color: {cc_badge_idle};
-    border: 1px solid {border_subtle};
-    border-radius: 16px;
-    padding: 10px 12px;
+button.neon-ws-cosmic-add-btn {{
+    background-image: none;
+    background-color: {qs_pill_bg};
     color: {fg_primary};
+    border: 1px solid {border_subtle};
+    box-shadow: none;
+    border-radius: 10px;
+    padding: 7px 10px;
+    min-height: 30px;
+    font-size: 12px;
+    font-weight: 600;
+    transition: background-color 150ms ease, border-color 150ms ease, transform 140ms ease;
 }}
 
-.neon-ws-window-card.focused {{
+button.neon-ws-cosmic-add-btn:hover {{
+    background-color: {qs_pill_hover};
     border-color: {accent};
 }}
 
-.neon-ws-badge {{
-    background-color: alpha({accent}, 0.22);
-    color: {fg_primary};
-    border-radius: 6px;
-    padding: 1px 6px;
-    font-size: 10px;
-    font-weight: 700;
+button.neon-ws-cosmic-add-btn:active {{
+    transform: scale(0.97);
+}}
+
+button.neon-ws-cosmic-add-btn:disabled {{
+    opacity: 0.42;
 }}
 
 /* ===================== NOTIFICATION TOASTS ===================== */
@@ -1331,10 +1583,390 @@ button.neon-ws-remove-btn:hover {{
     border-color: #EF4444;
 }}
 
-/* ===================== GNOME 47 INTERACTIVE SCREENSHOT UI ===================== */
+/* ===================== FROSTED GLASS QUICK SETTINGS (MATERIAL 3 EXPRESSIVE) ===================== */
+
+.neon-qs-panel-card {{
+    background-color: {qs_panel_bg};
+    background-image: {cc_glass_grad};
+    border: 1px solid {cc_glass_border};
+    border-radius: 24px;
+    padding: 14px;
+    box-shadow: {specular_inset};
+    color: {fg_primary};
+}}
+
+.neon-qs-status-pill {{
+    background-color: {qs_inner_bg};
+    border: 1px solid {border_subtle};
+    border-radius: 999px;
+    padding: 4px 11px;
+    min-height: 24px;
+}}
+
+button.neon-qs-header-power-btn {{
+    background-image: none;
+    background-color: {qs_pill_bg};
+    border: 1px solid {border_subtle};
+    box-shadow: none;
+    border-radius: 999px;
+    padding: 4px 12px;
+    min-height: 28px;
+    color: {fg_primary};
+    transition: background-color 180ms ease,
+                border-color 180ms ease,
+                transform 280ms cubic-bezier(0.34, 1.56, 0.64, 1.0);
+}}
+
+button.neon-qs-header-power-btn:hover {{
+    background-color: {qs_pill_hover};
+    border-color: {cc_glass_border};
+    transform: scale(1.04);
+}}
+
+button.neon-qs-header-power-btn:active {{
+    transform: scale(0.94);
+}}
+
+.neon-qs-header-btn-lbl {{
+    font-size: 12px;
+    font-weight: 600;
+    color: {fg_primary};
+}}
+
+/* Equal-Length Split Connectivity Pills (Material 3 Expressive Shape Morphing) */
+.neon-qs-split-pill {{
+    background-color: {qs_pill_bg};
+    border: 1px solid {border_subtle};
+    border-radius: 16px;
+    min-height: 54px;
+    color: {fg_primary};
+    transition: background-color 220ms ease,
+                border-color 220ms ease,
+                border-radius 320ms cubic-bezier(0.34, 1.48, 0.46, 1.0),
+                transform 280ms cubic-bezier(0.34, 1.56, 0.64, 1.0);
+}}
+
+.neon-qs-split-pill.active {{
+    background-color: alpha({qs_pill_active_bg}, 0.88);
+    border-color: rgba(255, 255, 255, 0.28);
+    border-radius: 26px;
+    color: {qs_pill_active_fg};
+}}
+
+.neon-qs-split-pill.active .neon-qs-pill-title,
+.neon-qs-split-pill.active .neon-qs-pill-sub,
+.neon-qs-split-pill.active .neon-qs-split-icon,
+.neon-qs-split-pill.active button.neon-qs-split-main,
+.neon-qs-split-pill.active button.neon-qs-split-arrow {{
+    color: {qs_pill_active_fg};
+}}
+
+button.neon-qs-split-main {{
+    background-image: none;
+    background-color: transparent;
+    border: none;
+    box-shadow: none;
+    border-radius: 24px 0 0 24px;
+    padding: 8px 8px 8px 12px;
+    color: {fg_primary};
+    transition: background-color 150ms ease, transform 240ms cubic-bezier(0.34, 1.56, 0.64, 1.0);
+}}
+
+button.neon-qs-split-main:hover {{
+    background-color: rgba(255, 255, 255, 0.11);
+}}
+
+button.neon-qs-split-main:active {{
+    transform: scale(0.96);
+}}
+
+.neon-qs-split-sep {{
+    background-color: rgba(255, 255, 255, 0.16);
+    min-width: 1px;
+    margin: 10px 0;
+}}
+
+button.neon-qs-split-arrow {{
+    background-image: none;
+    background-color: transparent;
+    border: none;
+    box-shadow: none;
+    border-radius: 0 24px 24px 0;
+    min-width: 30px;
+    padding: 0 6px;
+    color: {fg_primary};
+    transition: background-color 150ms ease, transform 240ms cubic-bezier(0.34, 1.56, 0.64, 1.0);
+}}
+
+button.neon-qs-split-arrow:hover {{
+    background-color: rgba(255, 255, 255, 0.15);
+}}
+
+button.neon-qs-split-arrow:active {{
+    transform: scale(0.90);
+}}
+
+/* Material 3 Expressive Elastic Chevron Flip */
+.neon-qs-chevron {{
+    transform: rotate(0deg);
+    transition: transform 360ms cubic-bezier(0.34, 1.56, 0.64, 1.0);
+}}
+
+.neon-qs-chevron.expanded {{
+    transform: rotate(180deg);
+}}
+
+.neon-qs-pill-title {{
+    font-size: 13px;
+    font-weight: 700;
+    color: {fg_primary};
+}}
+
+.neon-qs-pill-sub {{
+    font-size: 11px;
+    font-weight: 500;
+    color: {fg_muted};
+    opacity: 0.90;
+}}
+
+/* Inline Expandable Dropdown Card (Material 3 Expressive Spring Reveal) */
+.neon-qs-dropdown-card {{
+    background-color: {qs_inner_bg};
+    border: 1px solid {border_subtle};
+    border-radius: 18px;
+    padding: 10px 12px;
+    transition: opacity 240ms cubic-bezier(0.20, 0.0, 0.0, 1.0),
+                transform 340ms cubic-bezier(0.28, 1.32, 0.36, 1.0),
+                border-radius 300ms cubic-bezier(0.34, 1.48, 0.46, 1.0);
+}}
+
+.neon-qs-dropdown-card.dd-closed {{
+    opacity: 0;
+    transform: translateY(-10px) scale(0.96);
+    border-radius: 12px;
+}}
+
+.neon-qs-dropdown-card.dd-swap {{
+    opacity: 0.45;
+    transform: translateY(-4px) scale(0.98);
+    transition: opacity 90ms ease, transform 90ms ease;
+}}
+
+.neon-qs-dropdown-card.dd-open {{
+    opacity: 1;
+    transform: translateY(0px) scale(1.0);
+    border-radius: 18px;
+}}
+
+button.neon-qs-dd-item {{
+    background-image: none;
+    background-color: transparent;
+    border: none;
+    box-shadow: none;
+    border-radius: 12px;
+    padding: 7px 9px;
+    color: {fg_primary};
+    transition: background-color 150ms ease,
+                transform 260ms cubic-bezier(0.34, 1.56, 0.64, 1.0),
+                border-radius 240ms cubic-bezier(0.34, 1.48, 0.46, 1.0);
+}}
+
+button.neon-qs-dd-item:hover {{
+    background-color: {qs_pill_hover};
+    transform: translateX(3px);
+}}
+
+button.neon-qs-dd-item:active {{
+    transform: scale(0.97);
+    border-radius: 16px;
+}}
+
+button.neon-qs-dd-item.connected {{
+    background-color: alpha({accent}, 0.22);
+    border-radius: 14px;
+}}
+
+.neon-qs-dd-name {{
+    font-size: 12.5px;
+    font-weight: 600;
+    color: {fg_primary};
+}}
+
+.neon-qs-dd-badge {{
+    background-color: alpha({accent}, 0.28);
+    color: {fg_primary};
+    border-radius: 999px;
+    padding: 2px 8px;
+    font-size: 10.5px;
+    font-weight: 700;
+}}
+
+.neon-qs-pw-entry {{
+    background-image: none;
+    background-color: {qs_pill_bg};
+    color: {fg_primary};
+    border: 1px solid {border_subtle};
+    border-radius: 12px;
+    padding: 4px 10px;
+    min-height: 28px;
+    font-size: 12px;
+    transition: border-color 180ms ease;
+}}
+
+.neon-qs-pw-entry:focus-within {{
+    border-color: {accent};
+}}
+
+/* Inner Glass Cards (Display & Sound stack, Power Mode) */
+.neon-qs-inner-card {{
+    background-color: {qs_inner_bg};
+    border: 1px solid {border_subtle};
+    border-radius: 18px;
+    padding: 10px 13px 11px 13px;
+}}
+
+.neon-qs-seg-track {{
+    background-color: {slider_trough};
+    border: 1px solid {border_subtle};
+    border-radius: 14px;
+    padding: 3px;
+}}
+
+button.neon-qs-seg-btn {{
+    background-image: none;
+    background-color: transparent;
+    border: none;
+    box-shadow: none;
+    border-radius: 10px;
+    padding: 6px 4px;
+    min-height: 26px;
+    color: {fg_muted};
+    font-size: 11.5px;
+    font-weight: 600;
+    transition: background-color 200ms ease,
+                color 180ms ease,
+                border-radius 280ms cubic-bezier(0.34, 1.48, 0.46, 1.0),
+                transform 260ms cubic-bezier(0.34, 1.56, 0.64, 1.0);
+}}
+
+button.neon-qs-seg-btn:hover {{
+    color: {fg_primary};
+    background-color: rgba(255, 255, 255, 0.08);
+}}
+
+button.neon-qs-seg-btn:active {{
+    transform: scale(0.95);
+}}
+
+button.neon-qs-seg-btn.active {{
+    background-color: {accent};
+    color: #FFFFFF;
+    border-radius: 12px;
+    box-shadow: 0 2px 10px alpha({accent}, 0.38);
+}}
+
+/* Bottom Equal-Length Pills (Material 3 Expressive Shape Morphing: Dark Mode + Screenshot) */
+button.neon-qs-action-pill {{
+    background-image: none;
+    background-color: {qs_pill_bg};
+    border: 1px solid {border_subtle};
+    box-shadow: none;
+    border-radius: 15px;
+    min-height: 44px;
+    padding: 0 12px;
+    color: {fg_primary};
+    transition: background-color 200ms ease,
+                border-color 200ms ease,
+                border-radius 320ms cubic-bezier(0.34, 1.48, 0.46, 1.0),
+                transform 280ms cubic-bezier(0.34, 1.56, 0.64, 1.0);
+}}
+
+button.neon-qs-action-pill:hover {{
+    background-color: {qs_pill_hover};
+    border-color: {cc_glass_border};
+    transform: scale(1.02);
+}}
+
+button.neon-qs-action-pill:active {{
+    transform: scale(0.95);
+    border-radius: 11px;
+}}
+
+button.neon-qs-action-pill.active {{
+    background-color: alpha({qs_pill_active_bg}, 0.88);
+    border-color: rgba(255, 255, 255, 0.28);
+    border-radius: 24px;
+    color: {qs_pill_active_fg};
+}}
+
+button.neon-qs-action-pill.active .neon-qs-pill-title {{
+    color: {qs_pill_active_fg};
+}}
+
+/* ===================== FULLSCREEN SIMPLE CENTERED POWER MENU ===================== */
+
+.neon-power-menu-backdrop {{
+    background-color: {pm_scrim_bg};
+}}
+
+.neon-power-menu-card {{
+    background-color: transparent;
+    background-image: none;
+    border: none;
+    box-shadow: none;
+    padding: 16px;
+    color: {fg_primary};
+}}
+
+button.neon-pm-action-btn {{
+    background-image: none;
+    background-color: transparent;
+    border: none;
+    box-shadow: none;
+    border-radius: 18px;
+    padding: 14px 12px;
+    color: #FFFFFF;
+    text-shadow: 0 2px 10px rgba(0, 0, 0, 0.45);
+    transition: background-color 140ms ease, transform 140ms cubic-bezier(0.22, 1.0, 0.36, 1.0), color 140ms ease;
+}}
+
+button.neon-pm-action-btn:hover {{
+    background-color: rgba(255, 255, 255, 0.14);
+    transform: scale(1.08);
+}}
+
+button.neon-pm-action-btn.danger:hover {{
+    background-color: alpha(#EF4444, 0.28);
+    color: #FCA5A5;
+}}
+
+button.neon-pm-action-btn:active {{
+    transform: scale(0.96);
+}}
+
+.neon-pm-action-lbl {{
+    font-size: 13px;
+    font-weight: 600;
+    color: #FFFFFF;
+    text-shadow: 0 1px 6px rgba(0, 0, 0, 0.55);
+}}
+
+.neon-power-menu-card .neon-cc-sub {{
+    color: rgba(255, 255, 255, 0.72);
+    text-shadow: 0 1px 6px rgba(0, 0, 0, 0.50);
+}}
+
+.neon-power-menu-confirm {{
+    background-color: rgba(15, 20, 32, 0.55);
+    border: 1px solid rgba(255, 255, 255, 0.22);
+    border-radius: 999px;
+    padding: 8px 16px;
+}}
+
+/* ===================== GNOME 47 INTERACTIVE SCREENSHOT & SCREEN RECORD UI ===================== */
 
 .neon-gnome-shot-bar {{
-    background-color: rgba(24, 26, 34, 0.88);
+    background-color: rgba(20, 23, 32, 0.90);
     border: 1px solid rgba(255, 255, 255, 0.22);
     border-radius: 26px;
     padding: 14px 20px;
@@ -1365,17 +1997,51 @@ button.neon-shot-mode-btn.active {{
     color: #FFFFFF;
 }}
 
+button.neon-shot-toggle-btn.active {{
+    background-color: rgba(239, 68, 68, 0.88);
+    color: #FFFFFF;
+}}
+
+.neon-shot-kind-track {{
+    background-color: rgba(255, 255, 255, 0.10);
+    border: 1px solid rgba(255, 255, 255, 0.16);
+    border-radius: 999px;
+    padding: 3px;
+}}
+
+button.neon-shot-kind-btn {{
+    background-image: none;
+    background-color: transparent;
+    color: #CBD5E1;
+    border: none;
+    box-shadow: none;
+    border-radius: 999px;
+    padding: 6px 13px;
+    font-size: 12.5px;
+    font-weight: 600;
+    transition: background-color 140ms ease, color 140ms ease;
+}}
+
+button.neon-shot-kind-btn:hover {{
+    color: #FFFFFF;
+}}
+
+button.neon-shot-kind-btn.active {{
+    background-color: rgba(255, 255, 255, 0.22);
+    color: #FFFFFF;
+}}
+
 button.neon-shot-shutter {{
     background-image: none;
     background-color: #FFFFFF;
     color: #0F172A;
     border: 4px solid rgba(255, 255, 255, 0.35);
     border-radius: 999px;
-    min-width: 54px;
-    min-height: 54px;
+    min-width: 56px;
+    min-height: 56px;
     padding: 0;
     box-shadow: 0 6px 20px rgba(0, 0, 0, 0.40);
-    transition: background-color 120ms ease, transform 120ms ease;
+    transition: background-color 140ms ease, border-color 140ms ease, transform 120ms ease;
 }}
 
 button.neon-shot-shutter:hover {{
@@ -1383,14 +2049,54 @@ button.neon-shot-shutter:hover {{
     transform: scale(1.05);
 }}
 
+button.neon-shot-shutter.record {{
+    background-color: #EF4444;
+    color: #FFFFFF;
+    border: 4px solid rgba(254, 202, 202, 0.45);
+}}
+
+button.neon-shot-shutter.record:hover {{
+    background-color: #DC2626;
+}}
+
+button.neon-shot-stop-btn {{
+    background-image: none;
+    background-color: #DC2626;
+    color: #FFFFFF;
+    border: 1px solid rgba(255, 255, 255, 0.25);
+    border-radius: 999px;
+    padding: 8px 16px;
+    font-size: 12.5px;
+    font-weight: 700;
+}}
+
+button.neon-shot-stop-btn:hover {{
+    background-color: #EF4444;
+}}
+
 /* ===================== MACOS RIGHT-CLICK CONTEXT MENU ===================== */
 
+.neon-ctx-backdrop-scrim {{
+    background-color: rgba(0, 0, 0, 0.005);
+    background-image: none;
+    border: none;
+    box-shadow: none;
+}}
+
+.neon-ctx-wrapper {{
+    background-color: transparent;
+    background-image: none;
+    border: none;
+    box-shadow: none;
+    padding: 22px;
+}}
+
 .neon-ctx-menu {{
-    background-color: {popover_bg};
-    border: 1px solid {border_glass};
-    border-radius: 14px;
-    padding: 6px;
-    box-shadow: 0 18px 42px rgba(0, 0, 0, 0.48), {specular_inset};
+    background-color: {ctx_bg};
+    border: 1px solid {ctx_border};
+    border-radius: 13px;
+    padding: 5px;
+    box-shadow: {ctx_shadow};
     color: {fg_primary};
 }}
 
@@ -1400,28 +2106,47 @@ button.neon-ctx-item {{
     color: {fg_primary};
     border: none;
     box-shadow: none;
-    border-radius: 8px;
-    padding: 6px 10px;
-    min-height: 24px;
+    border-radius: 7px;
+    padding: 5px 9px;
+    min-height: 26px;
     font-size: 13px;
     font-weight: 500;
-    transition: background-color 90ms ease, color 90ms ease;
+    transition: background-color 80ms ease, color 80ms ease;
 }}
 
-button.neon-ctx-item:hover {{
+button.neon-ctx-item:hover,
+button.neon-ctx-item.focused {{
     background-color: {accent};
     color: #FFFFFF;
 }}
 
-button.neon-ctx-item:hover .neon-ctx-shortcut {{
-    color: rgba(255, 255, 255, 0.82);
+button.neon-ctx-item.submenu-open {{
+    background-color: {ctx_sub_open_bg};
+}}
+
+button.neon-ctx-item.submenu-open:hover,
+button.neon-ctx-item.submenu-open.focused {{
+    background-color: {accent};
+    color: #FFFFFF;
+}}
+
+button.neon-ctx-item:hover .neon-ctx-shortcut,
+button.neon-ctx-item.focused .neon-ctx-shortcut,
+button.neon-ctx-item:hover .neon-ctx-chevron,
+button.neon-ctx-item.focused .neon-ctx-chevron {{
+    color: rgba(255, 255, 255, 0.88);
+}}
+
+button.neon-ctx-item.disabled {{
+    opacity: 0.42;
 }}
 
 button.neon-ctx-item.destructive {{
     color: #F87171;
 }}
 
-button.neon-ctx-item.destructive:hover {{
+button.neon-ctx-item.destructive:hover,
+button.neon-ctx-item.destructive.focused {{
     background-color: #EF4444;
     color: #FFFFFF;
 }}
@@ -1430,17 +2155,154 @@ button.neon-ctx-item.destructive:hover {{
     opacity: 0.90;
 }}
 
+.neon-ctx-check {{
+    opacity: 0.96;
+}}
+
+.neon-ctx-chevron {{
+    opacity: 0.72;
+    margin-left: 8px;
+}}
+
 .neon-ctx-shortcut {{
     color: {fg_muted};
     font-size: 11px;
     font-weight: 500;
-    margin-left: 14px;
+    margin-left: 16px;
+}}
+
+.neon-ctx-header {{
+    color: {fg_muted};
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.3px;
+    padding: 4px 10px 3px 10px;
 }}
 
 .neon-ctx-sep {{
     background-color: {border_subtle};
     min-height: 1px;
     margin: 4px 8px;
+}}
+
+/* ===================== MACOS MODAL DIALOGS (RENAME / NEW FOLDER / INFO) ===================== */
+
+.neon-dialog-card {{
+    background-color: {ctx_dialog_bg};
+    border: 1px solid {ctx_border};
+    border-radius: 16px;
+    padding: 18px 20px;
+    margin: 12px;
+    box-shadow: {ctx_shadow};
+    color: {fg_primary};
+}}
+
+.neon-dialog-title {{
+    font-size: 15px;
+    font-weight: 700;
+    color: {fg_primary};
+}}
+
+.neon-dialog-sub {{
+    font-size: 12px;
+    color: {fg_muted};
+}}
+
+.neon-dialog-key {{
+    font-size: 12px;
+    font-weight: 600;
+    color: {fg_muted};
+}}
+
+.neon-dialog-val {{
+    font-size: 12.5px;
+    color: {fg_primary};
+}}
+
+.neon-dialog-error {{
+    font-size: 12px;
+    font-weight: 600;
+    color: #F87171;
+}}
+
+entry.neon-dialog-entry {{
+    background-color: {ctx_input_bg};
+    color: {fg_primary};
+    border: 1px solid {ctx_border};
+    border-radius: 9px;
+    padding: 7px 11px;
+    font-size: 13px;
+    min-height: 32px;
+}}
+
+entry.neon-dialog-entry:focus-within {{
+    border-color: {accent};
+    box-shadow: 0 0 0 2px alpha({accent}, 0.28);
+}}
+
+button.neon-dialog-btn {{
+    background-image: none;
+    background-color: {ctx_input_bg};
+    color: {fg_primary};
+    border: 1px solid {ctx_border};
+    border-radius: 9px;
+    padding: 6px 15px;
+    min-height: 30px;
+    font-size: 13px;
+    font-weight: 600;
+    transition: background-color 110ms ease;
+}}
+
+button.neon-dialog-btn:hover {{
+    background-color: {ctx_sub_open_bg};
+}}
+
+button.neon-dialog-btn.primary {{
+    background-color: {accent};
+    color: #FFFFFF;
+    border-color: transparent;
+}}
+
+button.neon-dialog-btn.destructive {{
+    background-color: #EF4444;
+    color: #FFFFFF;
+    border-color: transparent;
+}}
+
+/* ===================== INTERACTIVE DESKTOP ICONS LAYER ===================== */
+
+.neon-desktop-icons-layer {{
+    background-color: transparent;
+    padding: 46px 22px 92px 22px;
+}}
+
+button.neon-desktop-icon-tile {{
+    background-image: none;
+    background-color: transparent;
+    border: 1px solid transparent;
+    box-shadow: none;
+    border-radius: 12px;
+    padding: 8px 6px;
+    min-width: 88px;
+    min-height: 92px;
+    transition: background-color 120ms ease, border-color 120ms ease, transform 120ms ease;
+}}
+
+button.neon-desktop-icon-tile:hover {{
+    background-color: rgba(255, 255, 255, 0.14);
+    border-color: rgba(255, 255, 255, 0.22);
+}}
+
+button.neon-desktop-icon-tile.selected {{
+    background-color: alpha({accent}, 0.30);
+    border-color: alpha({accent}, 0.72);
+}}
+
+.neon-desktop-icon-label {{
+    color: #FFFFFF;
+    font-size: 12px;
+    font-weight: 600;
+    text-shadow: 0 1px 4px rgba(0, 0, 0, 0.82), 0 0 2px rgba(0, 0, 0, 0.65);
 }}
 "#
     )

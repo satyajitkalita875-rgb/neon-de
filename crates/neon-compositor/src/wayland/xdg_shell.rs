@@ -137,8 +137,17 @@ impl XdgShellHandler for NeonState {
                     .map(|w| w.is_visible_on(self.wm.active_workspace_id()))
                     .unwrap_or(false)
             {
-                self.space
-                    .map_element(window, from_wm_point(new_loc), false);
+                self.map_preserving_z_order(window.clone(), from_wm_point(new_loc));
+            }
+            if parent_id.is_some()
+                && self
+                    .wm
+                    .get(id)
+                    .map(|w| w.is_visible_on(self.wm.active_workspace_id()))
+                    .unwrap_or(false)
+            {
+                self.space.raise_element(&window, false);
+                self.sync_x11_stacking_order();
             }
             debug!(?id, ?parent_id, "Window parent updated");
         }
@@ -172,7 +181,7 @@ impl XdgShellHandler for NeonState {
         let Ok(root) = find_popup_root_surface(&popup) else {
             return;
         };
-        let Ok(mut grab) = self.popups.grab_popup(root, popup, &seat, serial) else {
+        let Ok(mut grab) = self.popups.grab_popup(root.into(), popup, &seat, serial) else {
             return;
         };
 
@@ -272,7 +281,7 @@ impl XdgShellHandler for NeonState {
 
     fn maximize_request(&mut self, surface: ToplevelSurface) {
         if let Some((id, _)) = self.find_window_by_surface(surface.wl_surface()) {
-            let work_area = self.work_area();
+            let work_area = self.effective_work_area_for(id);
             if let Some(update) = self.wm.set_maximized(id, true, work_area) {
                 self.apply_layout_update(&update);
                 return;
@@ -283,7 +292,7 @@ impl XdgShellHandler for NeonState {
 
     fn unmaximize_request(&mut self, surface: ToplevelSurface) {
         if let Some((id, _)) = self.find_window_by_surface(surface.wl_surface()) {
-            let work_area = self.work_area();
+            let work_area = self.effective_work_area_for(id);
             if let Some(update) = self.wm.set_maximized(id, false, work_area) {
                 self.apply_layout_update(&update);
                 return;
@@ -294,9 +303,10 @@ impl XdgShellHandler for NeonState {
 
     fn fullscreen_request(&mut self, surface: ToplevelSurface, _output: Option<WlOutput>) {
         if let Some((id, _)) = self.find_window_by_surface(surface.wl_surface()) {
-            let work_area = self.work_area();
-            if let Some(update) = self.wm.set_fullscreen(id, true, work_area) {
+            let full = self.output_full_rect();
+            if let Some(update) = self.wm.set_fullscreen(id, true, full) {
                 self.apply_layout_update(&update);
+                self.needs_redraw = true;
                 return;
             }
         }
@@ -305,9 +315,10 @@ impl XdgShellHandler for NeonState {
 
     fn unfullscreen_request(&mut self, surface: ToplevelSurface) {
         if let Some((id, _)) = self.find_window_by_surface(surface.wl_surface()) {
-            let work_area = self.work_area();
+            let work_area = self.effective_work_area_for(id);
             if let Some(update) = self.wm.set_fullscreen(id, false, work_area) {
                 self.apply_layout_update(&update);
+                self.needs_redraw = true;
                 return;
             }
         }
@@ -323,39 +334,35 @@ impl XdgShellHandler for NeonState {
 
 impl XdgDecorationHandler for NeonState {
     fn new_decoration(&mut self, toplevel: ToplevelSurface) {
+        // Prefer Client-Side Decorations (matching GNOME/Mutter) so modern applications
+        // (Chrome, Electron/Antigravity, GTK, Qt/OBS, Kitty, Firefox) render their own
+        // native integrated header/navigation bar with close/minimize/maximize controls
+        // rather than a separate server-side strip glued above the app.
         toplevel.with_pending_state(|state| {
-            state.decoration_mode = Some(DecorationMode::ServerSide);
+            state.decoration_mode = Some(DecorationMode::ClientSide);
         });
         if let Some((id, _)) = self.find_window_by_surface(toplevel.wl_surface()) {
-            self.enable_ssd_for_window(id);
+            self.ssd_windows.remove(&id);
         }
         toplevel.send_configure();
     }
 
-    fn request_mode(&mut self, toplevel: ToplevelSurface, mode: DecorationMode) {
-        let effective = match mode {
-            DecorationMode::ClientSide => DecorationMode::ClientSide,
-            _ => DecorationMode::ServerSide,
-        };
+    fn request_mode(&mut self, toplevel: ToplevelSurface, _mode: DecorationMode) {
         toplevel.with_pending_state(|state| {
-            state.decoration_mode = Some(effective);
+            state.decoration_mode = Some(DecorationMode::ClientSide);
         });
         if let Some((id, _)) = self.find_window_by_surface(toplevel.wl_surface()) {
-            if effective == DecorationMode::ServerSide {
-                self.enable_ssd_for_window(id);
-            } else {
-                self.ssd_windows.remove(&id);
-            }
+            self.ssd_windows.remove(&id);
         }
         toplevel.send_configure();
     }
 
     fn unset_mode(&mut self, toplevel: ToplevelSurface) {
         toplevel.with_pending_state(|state| {
-            state.decoration_mode = Some(DecorationMode::ServerSide);
+            state.decoration_mode = Some(DecorationMode::ClientSide);
         });
         if let Some((id, _)) = self.find_window_by_surface(toplevel.wl_surface()) {
-            self.enable_ssd_for_window(id);
+            self.ssd_windows.remove(&id);
         }
         toplevel.send_configure();
     }
@@ -421,7 +428,10 @@ fn check_grab(
     }
     let start_data = pointer.grab_start_data()?;
     let (focus, _) = start_data.focus.as_ref()?;
-    if !focus.id().same_client_as(&surface.id()) {
+    if !focus
+        .wl_surface_id()
+        .is_some_and(|fid| fid.same_client_as(&surface.id()))
+    {
         return None;
     }
     Some(start_data)

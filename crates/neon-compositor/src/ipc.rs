@@ -7,7 +7,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use neon_config::{FocusMode, ThemeMode};
+use neon_config::{DockPosition, FocusMode, ThemeMode};
 use neon_ipc::{
     AppearanceInfo, DesktopSnapshot, DiagnosticsInfo, EffectsInfo, EventTopic, IpcEvent,
     IpcPayload, IpcRequest, IpcRequestEnvelope, IpcResult, IpcServerMessage, MAX_FRAME_BYTES,
@@ -349,7 +349,7 @@ fn handle_ipc_request(
             },
         },
         IpcRequest::SwitchWorkspace { index } => {
-            if state.wm.workspaces().len() > index {
+            if index < neon_workspaces::MAX_WORKSPACES {
                 state.switch_workspace_index(index, serial);
                 IpcResult::Ok {
                     payload: IpcPayload::Ack,
@@ -382,6 +382,18 @@ fn handle_ipc_request(
                 IpcResult::Err {
                     code: "invalid_workspace".into(),
                     message: format!("Cannot remove desktop at index {index}"),
+                }
+            }
+        }
+        IpcRequest::TogglePinWorkspace { index } => {
+            if state.toggle_pin_workspace(index, serial).is_some() {
+                IpcResult::Ok {
+                    payload: IpcPayload::Ack,
+                }
+            } else {
+                IpcResult::Err {
+                    code: "invalid_workspace".into(),
+                    message: format!("Cannot pin desktop at index {index}"),
                 }
             }
         }
@@ -511,6 +523,20 @@ fn handle_ipc_request(
                 }
             }
         }
+        IpcRequest::ToggleFullscreenWindow { window_id } => {
+            let id = WindowId(window_id);
+            if state.wm.get(id).is_some() {
+                state.toggle_fullscreen_window(id);
+                IpcResult::Ok {
+                    payload: IpcPayload::Ack,
+                }
+            } else {
+                IpcResult::Err {
+                    code: "window_not_found".into(),
+                    message: format!("Window {window_id} does not exist"),
+                }
+            }
+        }
         IpcRequest::SnapWindow { window_id, region } => {
             let id = WindowId(window_id);
             let parsed = match region.to_lowercase().as_str() {
@@ -539,6 +565,67 @@ fn handle_ipc_request(
                 }
             }
         }
+        IpcRequest::ToggleAlwaysOnTop { window_id } => {
+            let id = WindowId(window_id);
+            if state.toggle_always_on_top_by_id(id, serial).is_some() {
+                IpcResult::Ok {
+                    payload: IpcPayload::Ack,
+                }
+            } else {
+                IpcResult::Err {
+                    code: "window_not_found".into(),
+                    message: format!("Window {window_id} does not exist"),
+                }
+            }
+        }
+        IpcRequest::CenterWindow { window_id } => {
+            let id = WindowId(window_id);
+            if state.center_window_by_id(id) {
+                IpcResult::Ok {
+                    payload: IpcPayload::Ack,
+                }
+            } else {
+                IpcResult::Err {
+                    code: "window_not_found".into(),
+                    message: format!("Window {window_id} does not exist"),
+                }
+            }
+        }
+        IpcRequest::SetFloatingWindow { window_id } => {
+            let id = WindowId(window_id);
+            if state.wm.get(id).is_some() {
+                let _ = state.set_floating_window_by_id(id);
+                IpcResult::Ok {
+                    payload: IpcPayload::Ack,
+                }
+            } else {
+                IpcResult::Err {
+                    code: "window_not_found".into(),
+                    message: format!("Window {window_id} does not exist"),
+                }
+            }
+        }
+        IpcRequest::MoveWindowToOutput {
+            window_id,
+            output_name,
+        } => {
+            let id = WindowId(window_id);
+            if state.wm.get(id).is_none() {
+                IpcResult::Err {
+                    code: "window_not_found".into(),
+                    message: format!("Window {window_id} does not exist"),
+                }
+            } else if state.move_window_to_output_by_name(id, &output_name) {
+                IpcResult::Ok {
+                    payload: IpcPayload::Ack,
+                }
+            } else {
+                IpcResult::Err {
+                    code: "output_not_found".into(),
+                    message: format!("Output '{output_name}' not found"),
+                }
+            }
+        }
         IpcRequest::ToggleOverview => {
             let open = state.toggle_overview(serial);
             IpcResult::Ok {
@@ -563,12 +650,60 @@ fn handle_ipc_request(
                 payload: IpcPayload::Ack,
             }
         }
+        IpcRequest::AnimateOverlay { namespace, opening } => {
+            state.pending_overlay_anims.push((namespace, opening));
+            state.needs_redraw = true;
+            IpcResult::Ok {
+                payload: IpcPayload::Ack,
+            }
+        }
         IpcRequest::TakeScreenshot { path, region } => {
             let dest = state.request_screenshot(path.map(std::path::PathBuf::from), region);
             IpcResult::Ok {
                 payload: IpcPayload::Screenshot {
                     path: dest.to_string_lossy().into_owned(),
                 },
+            }
+        }
+        IpcRequest::GetScreencastTarget => IpcResult::Ok {
+            payload: IpcPayload::ScreencastTarget {
+                target: state.screencast_target.clone(),
+            },
+        },
+        IpcRequest::SetScreencastTarget { target } => {
+            info!(?target, "Updated active NEON DE screencast capture target");
+            state.screencast_target = target.clone();
+            state.needs_redraw = true;
+            IpcResult::Ok {
+                payload: IpcPayload::ScreencastTarget { target },
+            }
+        }
+        IpcRequest::CaptureScreencastPreview {
+            target,
+            path,
+            max_width,
+            max_height,
+        } => {
+            let p = std::path::PathBuf::from(&path);
+            if !p.is_absolute() || path.contains("..") || !path.ends_with(".png") {
+                return IpcResult::Err {
+                    code: "invalid_path".into(),
+                    message: "preview path must be an absolute .png path without '..'".into(),
+                };
+            }
+            let mw = max_width.unwrap_or(320).clamp(64, 640);
+            let mh = max_height.unwrap_or(200).clamp(64, 480);
+            state
+                .pending_screencast_previews
+                .push(crate::state::PendingPreviewCapture {
+                    target,
+                    path: p,
+                    max_width: mw,
+                    max_height: mh,
+                });
+            state.needs_redraw = true;
+            IpcResult::Ok {
+                payload: IpcPayload::Ack,
             }
         }
         IpcRequest::ConfigureOutput {
@@ -639,9 +774,21 @@ fn handle_ipc_request(
             }
             if let Some(v) = blur_enabled {
                 state.effects.config.blur_enabled = v;
+                state.config.effects.blur_enabled = v;
+                if v {
+                    state.config.appearance.reduce_blur = false;
+                }
             }
             if let Some(v) = blur_strength {
-                state.effects.config.blur_strength = v.clamp(0.0, 2.0);
+                let clamped = v.clamp(0.0, 2.0);
+                state.effects.config.blur_strength = clamped;
+                state.config.effects.blur_strength = clamped;
+                if blur_enabled.is_none() {
+                    let on = clamped > 0.01;
+                    state.effects.config.blur_enabled = on;
+                    state.config.effects.blur_enabled = on;
+                    state.config.appearance.reduce_blur = !on;
+                }
             }
             if let Some(v) = inactive_opacity {
                 state.effects.config.inactive_opacity = v.clamp(0.4, 1.0);
@@ -652,6 +799,7 @@ fn handle_ipc_request(
             if let Some(v) = speed_scale {
                 state.effects.config.speed_scale = v.clamp(0.1, 5.0);
             }
+            state.needs_redraw = true;
             IpcResult::Ok {
                 payload: IpcPayload::Effects {
                     effects: build_effects(state),
@@ -662,10 +810,25 @@ fn handle_ipc_request(
             theme,
             accent_color,
             dock_transparency,
+            dock_auto_hide,
+            dock_smart_hide,
+            dock_position,
+            dock_icon_size,
+            dock_magnification,
+            dock_pinned_apps,
             panel_transparency,
             panel_visible,
+            panel_smart_hide,
             show_clock,
+            clock_24h,
             show_workspaces,
+            show_app_title,
+            show_system_tray,
+            show_battery,
+            show_quick_settings,
+            show_desktop_icons,
+            desktop_sort_by,
+            desktop_auto_arrange,
             high_contrast,
             wallpaper,
             reduce_blur,
@@ -686,17 +849,76 @@ fn handle_ipc_request(
             if let Some(v) = dock_transparency {
                 state.config.dock.transparency = v;
             }
+            let mut work_area_policy_changed = false;
+            if let Some(v) = dock_auto_hide {
+                work_area_policy_changed |= state.config.dock.auto_hide != v;
+                state.config.dock.auto_hide = v;
+            }
+            if let Some(v) = dock_smart_hide {
+                work_area_policy_changed |= state.config.dock.intelligent_hide != v;
+                state.config.dock.intelligent_hide = v;
+            }
+            if let Some(pos) = dock_position {
+                let parsed = match pos.to_lowercase().as_str() {
+                    "left" => DockPosition::Left,
+                    "right" => DockPosition::Right,
+                    _ => DockPosition::Bottom,
+                };
+                work_area_policy_changed |= state.config.dock.position != parsed;
+                state.config.dock.position = parsed;
+            }
+            if let Some(sz) = dock_icon_size {
+                state.config.dock.icon_size = sz.clamp(22, 64);
+            }
+            if let Some(mag) = dock_magnification {
+                state.config.dock.magnification = mag;
+            }
+            if let Some(pinned) = dock_pinned_apps {
+                state.config.dock.pinned_apps = pinned;
+            }
             if let Some(v) = panel_transparency {
                 state.config.panel.transparency = v;
             }
             if let Some(v) = panel_visible {
+                work_area_policy_changed |= state.config.panel.visible != v;
                 state.config.panel.visible = v;
+            }
+            if let Some(v) = panel_smart_hide {
+                work_area_policy_changed |= state.config.panel.smart_hide != v;
+                state.config.panel.smart_hide = v;
+            }
+            if work_area_policy_changed {
+                state.relayout_non_floating_windows();
             }
             if let Some(v) = show_clock {
                 state.config.panel.show_clock = v;
             }
+            if let Some(v) = clock_24h {
+                state.config.panel.clock_24h = v;
+            }
             if let Some(v) = show_workspaces {
                 state.config.panel.show_workspaces = v;
+            }
+            if let Some(v) = show_app_title {
+                state.config.panel.show_app_title = v;
+            }
+            if let Some(v) = show_system_tray {
+                state.config.panel.show_system_tray = v;
+            }
+            if let Some(v) = show_battery {
+                state.config.panel.show_battery = v;
+            }
+            if let Some(v) = show_quick_settings {
+                state.config.panel.show_quick_settings = v;
+            }
+            if let Some(v) = show_desktop_icons {
+                state.config.desktop.show_desktop_icons = v;
+            }
+            if let Some(s) = desktop_sort_by {
+                state.config.desktop.desktop_sort_by = s;
+            }
+            if let Some(v) = desktop_auto_arrange {
+                state.config.desktop.desktop_auto_arrange = v;
             }
             if let Some(v) = high_contrast {
                 state.config.privacy_accessibility.high_contrast = v;
@@ -706,11 +928,21 @@ fn handle_ipc_request(
             }
             if let Some(rb) = reduce_blur {
                 state.config.appearance.reduce_blur = rb;
+                if rb && blur_strength.is_none() {
+                    state.config.effects.blur_enabled = false;
+                    state.effects.config.blur_enabled = false;
+                }
             }
             if let Some(bs) = blur_strength {
                 let clamped = bs.clamp(0.0, 2.0);
                 state.config.effects.blur_strength = clamped;
                 state.effects.config.blur_strength = clamped;
+                let on = clamped > 0.01 && !reduce_blur.unwrap_or(false);
+                state.config.effects.blur_enabled = on;
+                state.effects.config.blur_enabled = on;
+                if reduce_blur.is_none() {
+                    state.config.appearance.reduce_blur = !on;
+                }
             }
             if let Some(ct) = cursor_theme
                 && !ct.trim().is_empty()
@@ -721,6 +953,12 @@ fn handle_ipc_request(
                 state.config.appearance.cursor_size = cs.clamp(16, 48);
             }
             state.config.validate_and_clamp();
+            if state.backend_name != "headless" {
+                let cfg_path = neon_config::default_config_path();
+                if let Err(err) = neon_config::save_atomic(&cfg_path, &state.config) {
+                    warn!(?err, "Failed to persist live appearance config update");
+                }
+            }
             state.needs_redraw = true;
             IpcResult::Ok {
                 payload: IpcPayload::Appearance {
@@ -803,6 +1041,7 @@ fn build_windows(state: &NeonState) -> Vec<WindowInfo> {
                 minimized: w.mode.is_minimized(),
                 maximized: w.mode.is_maximized(),
                 fullscreen: w.mode.is_fullscreen(),
+                always_on_top: w.always_on_top,
             })
         })
         .collect()
@@ -820,6 +1059,7 @@ fn build_workspaces(state: &NeonState) -> Vec<WorkspaceInfo> {
             id: ws.id.0,
             index,
             active: index == active_idx,
+            pinned: ws.pinned,
             window_ids: ws.windows().iter().map(|w| w.0).collect(),
         })
         .collect()
@@ -868,14 +1108,35 @@ fn build_appearance(state: &NeonState) -> AppearanceInfo {
         ThemeMode::NeonLight => "neon_light",
         ThemeMode::Auto => "auto",
     };
+    let dock_position = match state.config.dock.position {
+        DockPosition::Bottom => "bottom",
+        DockPosition::Left => "left",
+        DockPosition::Right => "right",
+    };
     AppearanceInfo {
+        protocol_rev: neon_ipc::APPEARANCE_PROTOCOL_REV,
         theme: theme.into(),
         accent_color: state.config.appearance.accent_color.clone(),
         dock_transparency: state.config.dock.transparency,
+        dock_auto_hide: state.config.dock.auto_hide,
+        dock_smart_hide: state.config.dock.intelligent_hide,
+        dock_position: dock_position.into(),
+        dock_icon_size: state.config.dock.icon_size,
+        dock_magnification: state.config.dock.magnification,
+        dock_pinned_apps: state.config.dock.pinned_apps.clone(),
         panel_transparency: state.config.panel.transparency,
         panel_visible: state.config.panel.visible,
+        panel_smart_hide: state.config.panel.smart_hide,
         show_clock: state.config.panel.show_clock,
+        clock_24h: state.config.panel.clock_24h,
         show_workspaces: state.config.panel.show_workspaces,
+        show_app_title: state.config.panel.show_app_title,
+        show_system_tray: state.config.panel.show_system_tray,
+        show_battery: state.config.panel.show_battery,
+        show_quick_settings: state.config.panel.show_quick_settings,
+        show_desktop_icons: state.config.desktop.show_desktop_icons,
+        desktop_sort_by: state.config.desktop.desktop_sort_by.clone(),
+        desktop_auto_arrange: state.config.desktop.desktop_auto_arrange,
         high_contrast: state.config.privacy_accessibility.high_contrast,
         wallpaper: state.config.appearance.wallpaper_path.clone(),
         reduce_blur: state.config.appearance.reduce_blur,

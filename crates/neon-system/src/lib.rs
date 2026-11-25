@@ -19,6 +19,7 @@ pub mod notifications;
 pub mod polkit;
 pub mod portals;
 pub mod storage;
+pub mod tray;
 pub mod updates;
 pub mod users;
 

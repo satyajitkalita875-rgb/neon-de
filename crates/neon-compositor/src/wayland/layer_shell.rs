@@ -41,6 +41,7 @@ impl WlrLayerShellHandler for NeonState {
             return;
         };
 
+        let prev_work_area = self.work_area();
         let desktop_layer = LayerSurface::new(surface, namespace.clone());
         {
             let mut map = layer_map_for_output(&output);
@@ -56,7 +57,10 @@ impl WlrLayerShellHandler for NeonState {
             output = output.name(),
             "Mapped zwlr_layer_shell_v1 surface"
         );
-        self.relayout_non_floating_windows();
+        if self.work_area() != prev_work_area {
+            self.relayout_non_floating_windows();
+        }
+        self.needs_redraw = true;
     }
 
     fn new_popup(&mut self, parent: WlrLayerSurface, popup: PopupSurface) {
@@ -84,6 +88,7 @@ impl WlrLayerShellHandler for NeonState {
 
     fn layer_destroyed(&mut self, surface: WlrLayerSurface) {
         let destroyed_id = surface.wl_surface().id();
+        let prev_work_area = self.work_area();
         let mut removed = false;
         if let Some(output) = self.primary_output.clone() {
             let mut map = layer_map_for_output(&output);
@@ -99,17 +104,50 @@ impl WlrLayerShellHandler for NeonState {
 
         if removed {
             debug!("Unmapped destroyed zwlr_layer_shell_v1 surface");
-            self.relayout_non_floating_windows();
+            if self.work_area() != prev_work_area {
+                self.relayout_non_floating_windows();
+            }
+            self.needs_redraw = true;
 
             let kbd_held_by_destroyed = self
                 .seat
                 .get_keyboard()
                 .and_then(|k| k.current_focus())
-                .map(|s| s.id() == destroyed_id)
+                .and_then(|s| s.wl_surface_id())
+                .map(|id| id == destroyed_id)
                 .unwrap_or(false);
             if kbd_held_by_destroyed {
                 self.focus_topmost_window(SERIAL_COUNTER.next_serial());
             }
+
+            // Defer pointer hover refresh to the next idle turn (never synchronously inside
+            // `layer_destroyed`, which may run inside `wl_client_destroy`'s C destructor) so
+            // underlying windows regain hover immediately once an overlay/backdrop unmaps.
+            self.loop_handle.insert_idle(|state| {
+                if state.is_locked() {
+                    return;
+                }
+                if let Some(pointer) = state.seat.get_pointer()
+                    && !pointer.is_grabbed()
+                {
+                    let pos = state.pointer_location;
+                    let under = state.surface_under(pos);
+                    let cur_id = pointer.current_focus().and_then(|f| f.wl_surface_id());
+                    let under_id = under.as_ref().and_then(|(f, _)| f.wl_surface_id());
+                    if cur_id != under_id {
+                        pointer.motion(
+                            state,
+                            under,
+                            &smithay::input::pointer::MotionEvent {
+                                location: pos,
+                                serial: SERIAL_COUNTER.next_serial(),
+                                time: state.clock.now().as_millis(),
+                            },
+                        );
+                        pointer.frame(state);
+                    }
+                }
+            });
         }
     }
 }

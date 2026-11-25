@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 /// Current NEON DE configuration schema version.
-pub const CURRENT_SCHEMA_VERSION: u32 = 2;
+pub const CURRENT_SCHEMA_VERSION: u32 = 3;
 
 /// Built-in NEON DE color theme modes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -221,6 +221,8 @@ pub struct DesktopWorkspaceConfig {
     pub hot_corner_top_left: String,
     pub hot_corner_top_right: String,
     pub show_desktop_icons: bool,
+    pub desktop_sort_by: String,
+    pub desktop_auto_arrange: bool,
     pub desktop_right_click_menu: bool,
 }
 
@@ -239,7 +241,9 @@ impl Default for DesktopWorkspaceConfig {
             overview_show_all_workspaces: true,
             hot_corner_top_left: "overview".into(),
             hot_corner_top_right: "none".into(),
-            show_desktop_icons: false,
+            show_desktop_icons: true,
+            desktop_sort_by: "name".into(),
+            desktop_auto_arrange: true,
             desktop_right_click_menu: true,
         }
     }
@@ -318,8 +322,8 @@ impl EffectsConfigData {
                 self.reduced_motion = false;
                 self.shadows_enabled = true;
                 self.borders_enabled = true;
-                self.blur_enabled = false;
-                self.blur_strength = 0.5;
+                self.blur_enabled = true;
+                self.blur_strength = 0.8;
                 self.inactive_opacity = 0.96;
                 self.corner_radius = 12.0;
                 self.speed_scale = 1.1;
@@ -443,7 +447,7 @@ impl Default for DockConfigData {
     fn default() -> Self {
         Self {
             position: DockPosition::Bottom,
-            icon_size: 44,
+            icon_size: 36,
             auto_hide: false,
             intelligent_hide: false,
             magnification: true,
@@ -490,13 +494,16 @@ pub struct PanelConfigData {
     pub position: PanelPosition,
     pub height: u32,
     pub visible: bool,
+    pub smart_hide: bool,
     pub transparency: f32,
     pub show_clock: bool,
     pub clock_24h: bool,
     pub show_date: bool,
     pub show_seconds: bool,
     pub show_workspaces: bool,
+    pub show_app_title: bool,
     pub show_system_tray: bool,
+    pub show_battery: bool,
     pub show_notifications: bool,
     pub show_quick_settings: bool,
     pub extra_panels: Vec<ExtraPanelConfig>,
@@ -508,13 +515,16 @@ impl Default for PanelConfigData {
             position: PanelPosition::Top,
             height: 36,
             visible: true,
+            smart_hide: false,
             transparency: 0.86,
             show_clock: true,
             clock_24h: true,
             show_date: true,
             show_seconds: false,
             show_workspaces: true,
+            show_app_title: true,
             show_system_tray: true,
+            show_battery: true,
             show_notifications: true,
             show_quick_settings: true,
             extra_panels: Vec::new(),
@@ -643,6 +653,14 @@ pub fn default_shortcuts() -> Vec<ShortcutBindingConfig> {
             category: "Windows".into(),
             label: "Switch Windows".into(),
             accelerator: "Alt+Tab".into(),
+            command: None,
+            custom: false,
+        },
+        ShortcutBindingConfig {
+            id: "ws_switch_num".into(),
+            category: "Workspaces".into(),
+            label: "Switch to Workspace 1–10".into(),
+            accelerator: "Super+1..0 / Super+Numpad".into(),
             command: None,
             custom: false,
         },
@@ -973,11 +991,11 @@ impl NeonConfig {
         self.windows.snap_gap = self.windows.snap_gap.clamp(0, 48);
         self.windows.static_workspace_count = self.windows.static_workspace_count.clamp(1, 16);
 
-        self.dock.icon_size = self.dock.icon_size.clamp(28, 72);
-        self.dock.transparency = clamp_finite_f32(self.dock.transparency, 0.25, 1.0, 0.84);
+        self.dock.icon_size = self.dock.icon_size.clamp(22, 64);
+        self.dock.transparency = clamp_finite_f32(self.dock.transparency, 0.0, 1.0, 0.68);
 
         self.panel.height = self.panel.height.clamp(24, 56);
-        self.panel.transparency = clamp_finite_f32(self.panel.transparency, 0.25, 1.0, 0.86);
+        self.panel.transparency = clamp_finite_f32(self.panel.transparency, 0.0, 1.0, 0.68);
 
         self.input.keyboard_repeat_rate = self.input.keyboard_repeat_rate.clamp(5, 100);
         self.input.keyboard_repeat_delay = self.input.keyboard_repeat_delay.clamp(100, 2000);
@@ -1112,6 +1130,13 @@ fn migrate_toml_value(value: &mut toml::Value) {
             .get("schema_version")
             .and_then(|v| v.as_integer())
             .unwrap_or(0);
+        if version < 3 {
+            // Schema v1/v2 configs inherited `show_desktop_icons = false` before desktop icons
+            // existed; enable them automatically once during migration to v3.
+            if let Some(desktop) = table.get_mut("desktop").and_then(|v| v.as_table_mut()) {
+                desktop.insert("show_desktop_icons".into(), toml::Value::Boolean(true));
+            }
+        }
         if version < CURRENT_SCHEMA_VERSION as i64 {
             table.insert(
                 "schema_version".into(),
@@ -1216,5 +1241,28 @@ shadows_enabled = false
         assert!(hit.is_some());
         assert_eq!(hit.unwrap().id, "overview");
         assert!(find_shortcut_conflict(&list, "overview", "super+space").is_none());
+    }
+
+    #[test]
+    fn schema_v2_migrates_desktop_icons_on_while_v3_respects_explicit_false() {
+        let v2_raw = r#"
+schema_version = 2
+[desktop]
+show_desktop_icons = false
+[dock]
+icon_size = 24
+"#;
+        let migrated = NeonConfig::from_toml_str(v2_raw).unwrap();
+        assert_eq!(migrated.schema_version, CURRENT_SCHEMA_VERSION);
+        assert!(migrated.desktop.show_desktop_icons);
+        assert_eq!(migrated.dock.icon_size, 24);
+
+        let v3_raw = r#"
+schema_version = 3
+[desktop]
+show_desktop_icons = false
+"#;
+        let explicit_off = NeonConfig::from_toml_str(v3_raw).unwrap();
+        assert!(!explicit_off.desktop.show_desktop_icons);
     }
 }

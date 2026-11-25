@@ -68,7 +68,16 @@ pub fn start_ipc_bridge(socket_path: PathBuf) -> (IpcCommandSender, Receiver<She
                 }
                 if let Some(c) = client.as_mut() {
                     match c.request(req.clone()) {
-                        Ok(res) => debug!(?req, ?res, "IPC command completed"),
+                        Ok(res) => {
+                            debug!(?req, ?res, "IPC command completed");
+                            if let IpcResult::Ok {
+                                payload: IpcPayload::Appearance { ref appearance },
+                            } = res
+                                && appearance.protocol_rev < neon_ipc::APPEARANCE_PROTOCOL_REV
+                            {
+                                persist_legacy_appearance_update(&req);
+                            }
+                        }
                         Err(err) => {
                             warn!(?err, "IPC command failed; reconnecting next time");
                             client = None;
@@ -159,4 +168,115 @@ pub fn start_ipc_bridge(socket_path: PathBuf) -> (IpcCommandSender, Receiver<She
     }
 
     (IpcCommandSender { tx: cmd_tx }, update_rx)
+}
+
+/// Persists newer shell appearance fields directly to `config.toml` when talking to an older
+/// running `neon-compositor` (`protocol_rev < APPEARANCE_PROTOCOL_REV`) so right-click menu
+/// updates take effect immediately without requiring a full session logout.
+fn persist_legacy_appearance_update(req: &IpcRequest) {
+    let IpcRequest::UpdateAppearance {
+        dock_position,
+        dock_icon_size,
+        dock_magnification,
+        dock_pinned_apps,
+        clock_24h,
+        show_app_title,
+        show_system_tray,
+        show_battery,
+        show_quick_settings,
+        show_desktop_icons,
+        desktop_sort_by,
+        desktop_auto_arrange,
+        ..
+    } = req
+    else {
+        return;
+    };
+
+    let has_new_field = dock_position.is_some()
+        || dock_icon_size.is_some()
+        || dock_magnification.is_some()
+        || dock_pinned_apps.is_some()
+        || clock_24h.is_some()
+        || show_app_title.is_some()
+        || show_system_tray.is_some()
+        || show_battery.is_some()
+        || show_quick_settings.is_some()
+        || show_desktop_icons.is_some()
+        || desktop_sort_by.is_some()
+        || desktop_auto_arrange.is_some();
+    if !has_new_field {
+        return;
+    }
+
+    let cfg_path = neon_config::default_config_path();
+    let mut cfg = neon_config::load_or_default(&cfg_path);
+    if let Some(pos) = dock_position {
+        cfg.dock.position = match pos.to_lowercase().as_str() {
+            "left" => neon_config::DockPosition::Left,
+            "right" => neon_config::DockPosition::Right,
+            _ => neon_config::DockPosition::Bottom,
+        };
+    }
+    if let Some(sz) = dock_icon_size {
+        cfg.dock.icon_size = (*sz).clamp(22, 64);
+    }
+    if let Some(mag) = dock_magnification {
+        cfg.dock.magnification = *mag;
+    }
+    if let Some(pins) = dock_pinned_apps {
+        cfg.dock.pinned_apps = pins.clone();
+    }
+    if let Some(v) = clock_24h {
+        cfg.panel.clock_24h = *v;
+    }
+    if let Some(v) = show_app_title {
+        cfg.panel.show_app_title = *v;
+    }
+    if let Some(v) = show_system_tray {
+        cfg.panel.show_system_tray = *v;
+    }
+    if let Some(v) = show_battery {
+        cfg.panel.show_battery = *v;
+    }
+    if let Some(v) = show_quick_settings {
+        cfg.panel.show_quick_settings = *v;
+    }
+    if let Some(v) = show_desktop_icons {
+        cfg.desktop.show_desktop_icons = *v;
+    }
+    if let Some(s) = desktop_sort_by {
+        cfg.desktop.desktop_sort_by = s.clone();
+    }
+    if let Some(v) = desktop_auto_arrange {
+        cfg.desktop.desktop_auto_arrange = *v;
+    }
+    let _ = neon_config::save_atomic(&cfg_path, &cfg);
+}
+
+/// Overlays newer shell appearance fields from `NeonConfig` onto a snapshot emitted by an older
+/// pre-restart `neon-compositor` (`protocol_rev < APPEARANCE_PROTOCOL_REV`).
+pub fn overlay_legacy_appearance(
+    appearance: &mut neon_ipc::AppearanceInfo,
+    cfg: &neon_config::NeonConfig,
+) {
+    if appearance.protocol_rev >= neon_ipc::APPEARANCE_PROTOCOL_REV {
+        return;
+    }
+    appearance.dock_position = match cfg.dock.position {
+        neon_config::DockPosition::Left => "left".into(),
+        neon_config::DockPosition::Right => "right".into(),
+        neon_config::DockPosition::Bottom => "bottom".into(),
+    };
+    appearance.dock_icon_size = cfg.dock.icon_size.clamp(22, 64);
+    appearance.dock_magnification = cfg.dock.magnification;
+    appearance.dock_pinned_apps = cfg.dock.pinned_apps.clone();
+    appearance.clock_24h = cfg.panel.clock_24h;
+    appearance.show_app_title = cfg.panel.show_app_title;
+    appearance.show_system_tray = cfg.panel.show_system_tray;
+    appearance.show_battery = cfg.panel.show_battery;
+    appearance.show_quick_settings = cfg.panel.show_quick_settings;
+    appearance.show_desktop_icons = cfg.desktop.show_desktop_icons;
+    appearance.desktop_sort_by = cfg.desktop.desktop_sort_by.clone();
+    appearance.desktop_auto_arrange = cfg.desktop.desktop_auto_arrange;
 }

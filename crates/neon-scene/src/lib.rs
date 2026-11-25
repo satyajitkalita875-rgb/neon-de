@@ -128,6 +128,7 @@ pub struct SceneNode {
     pub shadow: Option<ShadowStyle>,
     pub border: Option<BorderStyle>,
     pub titlebar: Option<TitlebarStyle>,
+    pub corner_radius: f32,
     pub content: NodeContent,
 }
 
@@ -177,6 +178,16 @@ impl SceneNode {
     }
 }
 
+/// Active full-desktop horizontal workspace slide offsets in logical pixels.
+///
+/// Both the departing desktop (wallpaper + windows + dock) and incoming desktop
+/// (wallpaper + windows + dock) pan together horizontally across the display.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WorkspaceSlide {
+    pub outgoing_dx: f64,
+    pub incoming_dx: f64,
+}
+
 /// Retained desktop scene graph with dirty tracking and deterministic Z-order traversal.
 #[derive(Debug)]
 pub struct SceneGraph {
@@ -184,6 +195,7 @@ pub struct SceneGraph {
     nodes: HashMap<NodeId, SceneNode>,
     window_nodes: HashMap<WindowId, NodeId>,
     backdrop_node: Option<NodeId>,
+    workspace_slide: Option<WorkspaceSlide>,
     dirty: bool,
     dirty_regions: Vec<Rect>,
 }
@@ -201,9 +213,21 @@ impl SceneGraph {
             nodes: HashMap::new(),
             window_nodes: HashMap::new(),
             backdrop_node: None,
+            workspace_slide: None,
             dirty: true,
             dirty_regions: Vec::new(),
         }
+    }
+
+    pub fn set_workspace_slide(&mut self, slide: Option<WorkspaceSlide>) {
+        if self.workspace_slide != slide {
+            self.workspace_slide = slide;
+            self.dirty = true;
+        }
+    }
+
+    pub fn workspace_slide(&self) -> Option<WorkspaceSlide> {
+        self.workspace_slide
     }
 
     pub fn is_dirty(&self) -> bool {
@@ -255,6 +279,7 @@ impl SceneGraph {
                 shadow: None,
                 border: None,
                 titlebar: None,
+                corner_radius: 0.0,
                 content,
             },
         );
@@ -281,11 +306,12 @@ impl SceneGraph {
         shadow: Option<ShadowStyle>,
         border: Option<BorderStyle>,
     ) -> NodeId {
-        let existing_titlebar = self
+        let (existing_titlebar, existing_corner_radius) = self
             .window_nodes
             .get(&window_id)
             .and_then(|nid| self.nodes.get(nid))
-            .and_then(|n| n.titlebar);
+            .map(|n| (n.titlebar, n.corner_radius))
+            .unwrap_or((None, 0.0));
         let new_node = |id| SceneNode {
             id,
             layer: SceneLayer::Windows,
@@ -299,6 +325,7 @@ impl SceneGraph {
             shadow: if fullscreen { None } else { shadow },
             border: if fullscreen { None } else { border },
             titlebar: if fullscreen { None } else { existing_titlebar },
+            corner_radius: if fullscreen { 0.0 } else { existing_corner_radius },
             content: NodeContent::Window {
                 window_id,
                 focused,
@@ -348,6 +375,23 @@ impl SceneGraph {
                 self.dirty = true;
                 self.dirty_regions.push(old_dmg);
                 self.dirty_regions.push(new_dmg);
+            }
+        }
+    }
+
+    /// Updates the GPU rounded-corner clip radius (in logical pixels) for a managed window node.
+    pub fn set_window_corner_radius(&mut self, window_id: WindowId, corner_radius: f32) {
+        if let Some(&id) = self.window_nodes.get(&window_id)
+            && let Some(node) = self.nodes.get_mut(&id)
+        {
+            let target = match &node.content {
+                NodeContent::Window { fullscreen: true, .. } => 0.0,
+                _ => corner_radius.max(0.0),
+            };
+            if (node.corner_radius - target).abs() > 1e-4 {
+                node.corner_radius = target;
+                self.dirty = true;
+                self.dirty_regions.push(node.damage_bounds());
             }
         }
     }
@@ -465,6 +509,7 @@ mod tests {
             shadow: None,
             border: None,
             titlebar: None,
+            corner_radius: 0.0,
             content: NodeContent::SolidRect {
                 color: [0.1, 0.1, 0.1, 0.9],
             },

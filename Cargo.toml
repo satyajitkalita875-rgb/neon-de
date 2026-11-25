@@ -16,6 +16,7 @@ members = [
     "crates/neon-settings",
     "crates/neon-session",
     "crates/neon-mcp",
+    "crates/neon-screencast-picker",
 ]
 
 [workspace.package]

@@ -1738,6 +1738,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "neon-screencast-picker"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "gtk4",
+ "gtk4-layer-shell",
+ "neon-ipc",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "neon-session"
 version = "0.1.0"
 dependencies = [
@@ -1773,6 +1785,7 @@ dependencies = [
  "clap",
  "gtk4",
  "gtk4-layer-shell",
+ "neon-config",
  "neon-ipc",
  "neon-system",
  "tempfile",

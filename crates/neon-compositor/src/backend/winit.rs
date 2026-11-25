@@ -375,7 +375,9 @@ fn render_frame(
     let size = backend.window_size();
     let full_damage = Rectangle::from_size(size);
     let blur = BlurSettings {
-        enabled: state.effects.config.blur_enabled && !state.config.appearance.reduce_blur,
+        enabled: state.effects.config.blur_enabled
+            && !state.config.appearance.reduce_blur
+            && state.effects.config.blur_strength > 0.01,
         strength: state.effects.config.blur_strength,
         corner_radius: state.effects.config.corner_radius,
     };
@@ -383,6 +385,11 @@ fn render_frame(
         &state.config.appearance.cursor_theme,
         state.config.appearance.cursor_size,
     );
+    if !state.pending_overlay_anims.is_empty() {
+        for (ns, opening) in std::mem::take(&mut state.pending_overlay_anims) {
+            neon_renderer.trigger_overlay_anim(&ns, opening);
+        }
+    }
 
     let (should_submit, render_damage) = {
         let age = backend.buffer_age().unwrap_or(0);
@@ -404,6 +411,16 @@ fn render_frame(
                         Ok(()) => state.notify_screenshot_saved(shot_path),
                         Err(err) => warn!(%err, "Failed to capture winit screenshot"),
                     }
+                }
+                if !state.pending_screencast_previews.is_empty() {
+                    let previews = std::mem::take(&mut state.pending_screencast_previews);
+                    crate::wayland::screencopy::fulfill_screencast_previews(
+                        renderer,
+                        neon_renderer,
+                        output,
+                        state,
+                        previews,
+                    );
                 }
                 if !state.pending_screencopy_frames.is_empty() {
                     let frames = std::mem::take(&mut state.pending_screencopy_frames);
@@ -442,26 +459,57 @@ fn render_frame(
                         } else {
                             Vec::new()
                         };
-                        if let Err(err) = capture_output_rgba(
-                            renderer,
-                            neon_renderer,
-                            output,
-                            &state.scene,
-                            blur,
-                            is_locked,
-                            lock_surface,
-                            &or_popups,
-                            extra_top,
-                            |id| state.managed_windows.get(&id),
-                            |rgba, w, h| {
-                                crate::wayland::screencopy::complete_screencopy_frame(
-                                    &pending, rgba, w, h, now_dur,
-                                );
-                                Ok(())
-                            },
-                        ) {
-                            warn!(%err, "Failed to capture zwlr_screencopy_frame_v1 on winit");
-                            pending.frame.failed();
+                        match &pending.target {
+                            crate::wayland::screencopy::ScreencopyTarget::Dmabuf(dmabuf) => {
+                                let mut dmabuf = dmabuf.clone();
+                                match crate::wayland::screencopy::fulfill_screencopy_dmabuf(
+                                    renderer,
+                                    neon_renderer,
+                                    output,
+                                    state,
+                                    blur,
+                                    is_locked,
+                                    lock_surface,
+                                    &or_popups,
+                                    extra_top,
+                                    pending.overlay_cursor,
+                                    now_dur,
+                                    &mut dmabuf,
+                                ) {
+                                    Ok(()) => {
+                                        crate::wayland::screencopy::emit_screencopy_ready(
+                                            &pending, now_dur,
+                                        );
+                                    }
+                                    Err(err) => {
+                                        warn!(%err, "Failed DMA-BUF zwlr_screencopy_frame_v1 on winit");
+                                        pending.frame.failed();
+                                    }
+                                }
+                            }
+                            crate::wayland::screencopy::ScreencopyTarget::Shm(buffer) => {
+                                if let Err(err) = capture_output_rgba(
+                                    renderer,
+                                    neon_renderer,
+                                    output,
+                                    &state.scene,
+                                    blur,
+                                    is_locked,
+                                    lock_surface,
+                                    &or_popups,
+                                    extra_top,
+                                    |id| state.managed_windows.get(&id),
+                                    |rgba, w, h| {
+                                        crate::wayland::screencopy::complete_screencopy_shm_frame(
+                                            &pending, buffer, rgba, w, h, now_dur,
+                                        );
+                                        Ok(())
+                                    },
+                                ) {
+                                    warn!(%err, "Failed SHM zwlr_screencopy_frame_v1 on winit");
+                                    pending.frame.failed();
+                                }
+                            }
                         }
                     }
                 }
@@ -497,7 +545,7 @@ fn render_frame(
                         |id| state.managed_windows.get(&id),
                     )
                 };
-                match result {
+                let outcome = match result {
                     Ok(res) => match res.damage {
                         Some(damage) => (true, Some(damage.clone())),
                         None => (!*presented_once, None),
@@ -506,7 +554,11 @@ fn render_frame(
                         warn!(?err, "Scene render error");
                         (true, Some(vec![full_damage]))
                     }
+                };
+                if neon_renderer.has_active_overlay_animation() {
+                    state.needs_redraw = true;
                 }
+                outcome
             }
             Err(err) => {
                 warn!(?err, "Failed to bind winit EGL surface");

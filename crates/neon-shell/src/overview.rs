@@ -24,7 +24,11 @@ use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 use neon_ipc::{AppearanceInfo, DesktopSnapshot, IpcRequest};
 
 use crate::{
-    desktop_apps::{DesktopApp, load_app_icon},
+    context_menu::ContextMenuOverlay,
+    desktop_apps::{
+        DesktopApp, compute_apps_dir_signature, discover_applications, load_app_icon,
+        register_extra_icon_search_paths,
+    },
     ipc_bridge::IpcCommandSender,
     wallpaper::{load_blurred_texture, resolve_wallpaper_path},
 };
@@ -34,6 +38,7 @@ const LAUNCHPAD_ROWS: usize = 5;
 const APPS_PER_PAGE: usize = LAUNCHPAD_COLS * LAUNCHPAD_ROWS;
 
 type BoolCallback = Rc<RefCell<Option<Box<dyn Fn(bool)>>>>;
+type VoidCallback = Rc<RefCell<Option<Box<dyn Fn()>>>>;
 
 /// Pure 60 FPS fullscreen blurred App Drawer (Launchpad).
 pub struct Overview {
@@ -46,19 +51,27 @@ pub struct Overview {
     anim_gen: Rc<Cell<u64>>,
     on_layer_elevate: BoolCallback,
     on_bg_hidden: BoolCallback,
+    on_apps_refreshed: VoidCallback,
     search_entry: SearchEntry,
     page_stack: Stack,
     dots_box: GtkBox,
-    all_apps: Rc<Vec<DesktopApp>>,
+    all_apps: Rc<RefCell<Vec<DesktopApp>>>,
+    last_apps_sig: Cell<u64>,
     current_page: Rc<Cell<usize>>,
     page_count: Rc<Cell<usize>>,
     dot_buttons: Rc<RefCell<Vec<Button>>>,
     last_scroll_at: Rc<RefCell<Instant>>,
+    context_menu: ContextMenuOverlay,
     ipc: IpcCommandSender,
 }
 
 impl Overview {
-    pub fn build(app: &Application, apps: Vec<DesktopApp>, ipc: IpcCommandSender) -> Rc<Self> {
+    pub fn build(
+        app: &Application,
+        apps: Rc<RefCell<Vec<DesktopApp>>>,
+        ipc: IpcCommandSender,
+        context_menu: ContextMenuOverlay,
+    ) -> Rc<Self> {
         let window = ApplicationWindow::builder()
             .application(app)
             .title("NEON DE App Drawer")
@@ -166,10 +179,12 @@ impl Overview {
             anim_gen: Rc::new(Cell::new(0)),
             on_layer_elevate: Rc::new(RefCell::new(None)),
             on_bg_hidden: Rc::new(RefCell::new(None)),
+            on_apps_refreshed: Rc::new(RefCell::new(None)),
             search_entry,
             page_stack,
             dots_box,
-            all_apps: Rc::new(apps),
+            all_apps: apps,
+            last_apps_sig: Cell::new(compute_apps_dir_signature()),
             current_page: Rc::new(Cell::new(0)),
             page_count: Rc::new(Cell::new(1)),
             dot_buttons: Rc::new(RefCell::new(Vec::new())),
@@ -178,6 +193,7 @@ impl Overview {
                     .checked_sub(Duration::from_secs(1))
                     .unwrap_or_else(Instant::now),
             )),
+            context_menu,
             ipc,
         });
 
@@ -286,14 +302,46 @@ impl Overview {
         *self.on_bg_hidden.borrow_mut() = Some(Box::new(on_bg_hidden));
     }
 
+    /// Registers a callback invoked whenever newly installed/removed `.desktop` entries
+    /// trigger an automatic application list refresh.
+    pub fn set_on_apps_refreshed<F>(&self, cb: F)
+    where
+        F: Fn() + 'static,
+    {
+        *self.on_apps_refreshed.borrow_mut() = Some(Box::new(cb));
+    }
+
+    /// Re-scans XDG/Flatpak/Snap application directories if any `.desktop` file was added,
+    /// edited, or removed since the last check, and rebuilds the App Drawer grid live.
+    pub fn refresh_apps(self: &Rc<Self>) -> bool {
+        let sig = compute_apps_dir_signature();
+        if sig == self.last_apps_sig.get() {
+            return false;
+        }
+        self.last_apps_sig.set(sig);
+        register_extra_icon_search_paths();
+        let fresh = discover_applications();
+        tracing::info!(
+            app_count = fresh.len(),
+            "Detected desktop application changes; refreshing App Drawer & Dock"
+        );
+        *self.all_apps.borrow_mut() = fresh;
+        self.rebuild_launchpad();
+        if let Some(cb) = self.on_apps_refreshed.borrow().as_ref() {
+            cb();
+        }
+        true
+    }
+
     pub fn update_appearance(&self, appearance: &AppearanceInfo) {
         let light = appearance.theme == "neon_light" || appearance.theme == "light";
-        let radius = if appearance.high_contrast {
+        let radius = if appearance.high_contrast
+            || appearance.reduce_blur
+            || appearance.blur_strength <= 0.01
+        {
             0
-        } else if appearance.reduce_blur {
-            6
         } else {
-            ((11.0 * appearance.blur_strength.clamp(0.4, 2.0)).round() as usize).clamp(4, 18)
+            ((10.0 * appearance.blur_strength.clamp(0.0, 2.0)).round() as usize).clamp(1, 20)
         };
         let sig_key = radius as u32;
 
@@ -302,8 +350,9 @@ impl Overview {
             let next_sig = (wp.clone(), light, sig_key);
             if self.current_wp_sig.borrow().as_ref() != Some(&next_sig) {
                 let (brightness, saturation) = if light { (0.90, 1.25) } else { (0.78, 1.36) };
+                let (w, h) = if radius == 0 { (1280, 720) } else { (320, 180) };
                 if let Some(tex) =
-                    load_blurred_texture(&wp, 320, 180, radius, brightness, saturation)
+                    load_blurred_texture(&wp, w, h, radius, brightness, saturation)
                 {
                     self.blur_picture.set_paintable(Some(&tex));
                 } else {
@@ -314,12 +363,12 @@ impl Overview {
         }
     }
 
-    pub fn request_close(&self) {
+    pub fn request_close(self: &Rc<Self>) {
         self.set_open(false);
         self.ipc.send(IpcRequest::SetOverview { open: false });
     }
 
-    pub fn set_open(&self, open: bool) {
+    pub fn set_open(self: &Rc<Self>, open: bool) {
         if self.desired_open.get() == open && self.window.is_visible() == open {
             return;
         }
@@ -328,6 +377,9 @@ impl Overview {
         self.desired_open.set(open);
 
         if open {
+            // Immediately detect any newly installed Flatpak/Snap/system/PWA apps before presenting
+            let _ = self.refresh_apps();
+
             // 1. Elevate Top Bar & Dock above the App Drawer immediately so they stay on top
             if let Some(cb) = self.on_layer_elevate.borrow().as_ref() {
                 cb(true);
@@ -417,7 +469,7 @@ impl Overview {
         }
     }
 
-    pub fn update(&self, snapshot: &DesktopSnapshot) {
+    pub fn update(self: &Rc<Self>, snapshot: &DesktopSnapshot) {
         self.update_appearance(&snapshot.appearance);
         if self.desired_open.get() != snapshot.overview_open {
             self.set_open(snapshot.overview_open);
@@ -427,6 +479,7 @@ impl Overview {
     fn filtered_apps(&self) -> Vec<DesktopApp> {
         let query = self.search_entry.text().to_string();
         self.all_apps
+            .borrow()
             .iter()
             .filter(|a| a.matches_query(&query))
             .cloned()
@@ -526,6 +579,31 @@ impl Overview {
                     app_clone.launch();
                     ov.request_close();
                 });
+
+                // Right-clicking any App Drawer tile opens the unified macOS Application menu
+                // (Open, App Actions, Pin/Unpin to Dock, Launch at Login).
+                let rc = GestureClick::new();
+                rc.set_button(3);
+                {
+                    let cm = self.context_menu.clone();
+                    let app_rc = (*app).clone();
+                    let win_c = self.window.clone();
+                    let tile_c = tile.clone();
+                    rc.connect_pressed(move |gesture, _, lx, ly| {
+                        gesture.set_state(gtk4::EventSequenceState::Claimed);
+                        let (sx, sy) = tile_c
+                            .compute_bounds(&win_c)
+                            .map(|b| {
+                                (
+                                    (b.x() as f64 + lx).round() as i32,
+                                    (b.y() as f64 + ly).round() as i32,
+                                )
+                            })
+                            .unwrap_or((lx.round() as i32 + 120, ly.round() as i32 + 120));
+                        cm.open_app_menu(sx, sy, app_rc.clone());
+                    });
+                }
+                tile.add_controller(rc);
 
                 apps_grid.attach(&tile, col, row, 1, 1);
             }

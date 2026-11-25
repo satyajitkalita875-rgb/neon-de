@@ -28,7 +28,7 @@ use smithay::{
         calloop::{LoopHandle, LoopSignal},
         wayland_protocols::xdg::shell::server::xdg_toplevel,
         wayland_server::{
-            Display, DisplayHandle, Resource,
+            Display, DisplayHandle,
             backend::{ClientData, ClientId, DisconnectReason},
             protocol::wl_surface::WlSurface,
         },
@@ -59,12 +59,12 @@ use smithay::{
         viewporter::ViewporterState,
         xwayland_shell::XWaylandShellState,
     },
-    xwayland::X11Wm,
+    xwayland::{X11Wm, xwm::WmWindowType},
 };
 use tracing::{debug, info, warn};
 
 use crate::{
-    wayland::session_lock::SessionLockState,
+    wayland::{seat::FocusTarget, session_lock::SessionLockState},
     window::{
         SnapRegion, WindowId, WindowLayoutUpdate, WindowManager, WindowMode, WmRect, from_wm_point,
         from_wm_size, to_wm_point, to_wm_rect, to_wm_size, window_id, window_matches_surface,
@@ -107,6 +107,28 @@ pub enum TitlebarHit {
     Minimize,
     Maximize,
     Drag,
+}
+
+/// Snapshot of a window from the previous workspace kept visually alive during a
+/// Hyprland-style dual-workspace `slidefade` transition (strictly non-interactive).
+#[derive(Debug, Clone)]
+pub struct OutgoingWorkspaceWindow {
+    pub id: WindowId,
+    pub bounds: WmRect,
+    pub z_index: i32,
+    pub fullscreen: bool,
+    pub maximized: bool,
+    pub was_focused: bool,
+    pub is_frameless_special: bool,
+}
+
+/// Queued fast GPU preview thumbnail capture requested by `neon-screencast-picker`.
+#[derive(Debug, Clone)]
+pub struct PendingPreviewCapture {
+    pub target: neon_ipc::ScreencastTarget,
+    pub path: PathBuf,
+    pub max_width: u32,
+    pub max_height: u32,
 }
 
 /// Callback invoked when the user presses `Ctrl+Alt+F1..F12` on a bare-metal TTY session.
@@ -164,6 +186,8 @@ pub struct NeonState {
     pub minimizing_windows: HashMap<WindowId, Duration>,
     /// Windows currently playing their popout close animation (`id -> (deadline, close_sent)`).
     pub closing_windows: HashMap<WindowId, (Duration, bool)>,
+    /// Outgoing workspace windows gliding off-screen simultaneously during a Hyprland workspace switch.
+    pub outgoing_workspace_windows: Vec<OutgoingWorkspaceWindow>,
     /// Window whose macOS SSD traffic-light button cluster is currently hovered by the pointer.
     pub hovered_titlebar_window: Option<WindowId>,
     /// Flag indicating fresh input/state changes that warrant an immediate VBlank-synced frame.
@@ -202,10 +226,20 @@ pub struct NeonState {
     pub pending_screenshot: Option<(PathBuf, Option<[i32; 4]>)>,
     /// Queued `zwlr_screencopy_frame_v1` frames awaiting GPU frame capture (OBS / portals / grim).
     pub pending_screencopy_frames: Vec<crate::wayland::screencopy::PendingScreencopyFrame>,
+    /// Active PipeWire/DMA-BUF screencast capture target (Display, isolated Window, or Workspace).
+    pub screencast_target: neon_ipc::ScreencastTarget,
+    /// Queued live preview thumbnail captures for `neon-screencast-picker`.
+    pub pending_screencast_previews: Vec<PendingPreviewCapture>,
     /// Signals `neon-shell` to open the GNOME-style interactive screenshot overlay.
     pub pending_screenshot_ui: bool,
     /// Signals `neon-shell` to open the OS-level right-click context menu at `(x, y)`.
     pub pending_context_menu: Option<(i32, i32, neon_ipc::ContextMenuTarget)>,
+    /// Last committed logical height of `neon-panel` (0 until a top panel has mapped).
+    pub last_panel_height: i32,
+    /// Last committed bottom exclusive zone of `neon-dock` (0 until a dock has mapped).
+    pub last_dock_exclusive: i32,
+    /// Queued compositor-driven GPU open/close animation triggers `(namespace, opening)`.
+    pub pending_overlay_anims: Vec<(String, bool)>,
 }
 
 impl NeonState {
@@ -284,6 +318,7 @@ impl NeonState {
             last_rendered_rects: HashMap::new(),
             minimizing_windows: HashMap::new(),
             closing_windows: HashMap::new(),
+            outgoing_workspace_windows: Vec::new(),
             hovered_titlebar_window: None,
             needs_redraw: true,
             wm: WindowManager::new(WorkspacePolicy::default()),
@@ -307,8 +342,13 @@ impl NeonState {
             vt_switch_hook: None,
             pending_screenshot: None,
             pending_screencopy_frames: Vec::new(),
+            screencast_target: neon_ipc::ScreencastTarget::default(),
+            pending_screencast_previews: Vec::new(),
             pending_screenshot_ui: false,
             pending_context_menu: None,
+            last_panel_height: 0,
+            last_dock_exclusive: 0,
+            pending_overlay_anims: Vec::new(),
         }
     }
 
@@ -445,6 +485,7 @@ impl NeonState {
             .map(|p| p.is_grabbed())
             .unwrap_or(false);
         let mut visible_ids: HashSet<WindowId> = HashSet::new();
+        let mut active_space_ids: HashSet<WindowId> = HashSet::new();
 
         for (z_idx, window) in self.space.elements().enumerate() {
             let Some(id) = window_id(window) else {
@@ -473,6 +514,8 @@ impl NeonState {
                 self.last_rendered_rects.insert(id, bounds);
             }
 
+            let is_frameless_special = is_window_frameless_special(window);
+
             let is_focused = focused_id == Some(id);
             let mode = self
                 .wm
@@ -482,37 +525,40 @@ impl NeonState {
             let fullscreen = mode.is_fullscreen();
             let maximized = mode.is_maximized();
             let visual = self.effects.sample_window(id, is_focused, now);
-            let opacity = if is_focused || fullscreen {
+            let opacity = if is_focused || fullscreen || is_frameless_special {
                 visual.opacity
             } else {
                 visual.opacity * fx_cfg.inactive_opacity.clamp(0.4, 1.0)
             };
 
-            let shadow = if fx_cfg.shadows_enabled && !fullscreen && !maximized {
-                Some(ShadowStyle::for_window(
-                    visual.focus_progress,
-                    fx_cfg.corner_radius,
-                ))
-            } else {
-                None
-            };
+            let shadow =
+                if fx_cfg.shadows_enabled && !fullscreen && !maximized && !is_frameless_special {
+                    Some(ShadowStyle::for_window(
+                        visual.focus_progress,
+                        fx_cfg.corner_radius,
+                    ))
+                } else {
+                    None
+                };
 
-            let border = if fx_cfg.borders_enabled && !fullscreen && !maximized {
-                let mut style =
-                    BorderStyle::for_window(visual.focus_progress, fx_cfg.corner_radius);
-                if let Some([ar, ag, ab]) = parse_hex_rgb(&self.config.appearance.accent_color) {
-                    let f = visual.focus_progress.clamp(0.0, 1.0);
-                    style.color = [
-                        0.28 * (1.0 - f) + ar * f,
-                        0.32 * (1.0 - f) + ag * f,
-                        0.40 * (1.0 - f) + ab * f,
-                        0.35 * (1.0 - f) + 0.88 * f,
-                    ];
-                }
-                Some(style)
-            } else {
-                None
-            };
+            let border =
+                if fx_cfg.borders_enabled && !fullscreen && !maximized && !is_frameless_special {
+                    let mut style =
+                        BorderStyle::for_window(visual.focus_progress, fx_cfg.corner_radius);
+                    if let Some([ar, ag, ab]) = parse_hex_rgb(&self.config.appearance.accent_color)
+                    {
+                        let f = visual.focus_progress.clamp(0.0, 1.0);
+                        style.color = [
+                            0.28 * (1.0 - f) + ar * f,
+                            0.32 * (1.0 - f) + ag * f,
+                            0.40 * (1.0 - f) + ab * f,
+                            0.35 * (1.0 - f) + 0.88 * f,
+                        ];
+                    }
+                    Some(style)
+                } else {
+                    None
+                };
 
             self.scene.upsert_window(
                 id,
@@ -528,23 +574,131 @@ impl NeonState {
                 shadow,
                 border,
             );
-            let titlebar = if !fullscreen && self.ssd_windows.contains(&id) {
-                Some(TitlebarStyle {
-                    height: MACOS_TITLEBAR_HEIGHT,
-                    corner_radius: if maximized { 0.0 } else { fx_cfg.corner_radius },
-                    focused: is_focused,
-                    light_theme: self.config.appearance.theme == ThemeMode::NeonLight,
-                    hover_controls: self.hovered_titlebar_window == Some(id),
-                })
-            } else {
-                None
-            };
+            let titlebar =
+                if !fullscreen && !is_frameless_special && self.ssd_windows.contains(&id) {
+                    Some(TitlebarStyle {
+                        height: MACOS_TITLEBAR_HEIGHT,
+                        corner_radius: fx_cfg.corner_radius,
+                        focused: is_focused,
+                        light_theme: self.config.appearance.theme == ThemeMode::NeonLight,
+                        hover_controls: self.hovered_titlebar_window == Some(id),
+                    })
+                } else {
+                    None
+                };
             self.scene.set_window_titlebar(id, titlebar);
+            let window_corner_radius = if !fullscreen && !is_frameless_special {
+                fx_cfg.corner_radius
+            } else {
+                0.0
+            };
+            self.scene.set_window_corner_radius(id, window_corner_radius);
             visible_ids.insert(id);
+            active_space_ids.insert(id);
+        }
+
+        // Emit outgoing workspace windows and full-desktop slide state (for wallpaper + dock panning)
+        // during a Hyprland-style horizontal workspace switch.
+        if let Some(out_ws) = self.effects.sample_workspace_outgoing(now) {
+            let in_ws = self.effects.sample_workspace_incoming(now);
+            self.scene
+                .set_workspace_slide(Some(neon_scene::WorkspaceSlide {
+                    outgoing_dx: out_ws.offset_x,
+                    incoming_dx: in_ws.offset_x,
+                }));
+            let accent_rgb = parse_hex_rgb(&self.config.appearance.accent_color);
+            let light_theme = self.config.appearance.theme == ThemeMode::NeonLight;
+            for out in &self.outgoing_workspace_windows {
+                if visible_ids.contains(&out.id)
+                    || !self.managed_windows.contains_key(&out.id)
+                    || out.bounds.size.w <= 0
+                    || out.bounds.size.h <= 0
+                {
+                    continue;
+                }
+                let focus_prog = if out.was_focused { 1.0_f32 } else { 0.0_f32 };
+                let opacity = if out.was_focused || out.fullscreen || out.is_frameless_special {
+                    out_ws.opacity
+                } else {
+                    out_ws.opacity * fx_cfg.inactive_opacity.clamp(0.4, 1.0)
+                };
+                if opacity <= 0.005 {
+                    continue;
+                }
+                let shadow = if fx_cfg.shadows_enabled
+                    && !out.fullscreen
+                    && !out.maximized
+                    && !out.is_frameless_special
+                {
+                    Some(ShadowStyle::for_window(focus_prog, fx_cfg.corner_radius))
+                } else {
+                    None
+                };
+                let border = if fx_cfg.borders_enabled
+                    && !out.fullscreen
+                    && !out.maximized
+                    && !out.is_frameless_special
+                {
+                    let mut style = BorderStyle::for_window(focus_prog, fx_cfg.corner_radius);
+                    if let Some([ar, ag, ab]) = accent_rgb {
+                        style.color = [
+                            0.28 * (1.0 - focus_prog) + ar * focus_prog,
+                            0.32 * (1.0 - focus_prog) + ag * focus_prog,
+                            0.40 * (1.0 - focus_prog) + ab * focus_prog,
+                            0.35 * (1.0 - focus_prog) + 0.88 * focus_prog,
+                        ];
+                    }
+                    Some(style)
+                } else {
+                    None
+                };
+                self.scene.upsert_window(
+                    out.id,
+                    out.bounds,
+                    -1000 + out.z_index,
+                    true,
+                    opacity,
+                    (out_ws.offset_x, 0.0),
+                    (out_ws.scale, out_ws.scale),
+                    out.was_focused,
+                    focus_prog,
+                    out.fullscreen,
+                    shadow,
+                    border,
+                );
+                let titlebar = if !out.fullscreen
+                    && !out.is_frameless_special
+                    && self.ssd_windows.contains(&out.id)
+                {
+                    Some(TitlebarStyle {
+                        height: MACOS_TITLEBAR_HEIGHT,
+                        corner_radius: fx_cfg.corner_radius,
+                        focused: out.was_focused,
+                        light_theme,
+                        hover_controls: false,
+                    })
+                } else {
+                    None
+                };
+                self.scene.set_window_titlebar(out.id, titlebar);
+                let corner_radius = if !out.fullscreen && !out.is_frameless_special {
+                    fx_cfg.corner_radius
+                } else {
+                    0.0
+                };
+                self.scene.set_window_corner_radius(out.id, corner_radius);
+                visible_ids.insert(out.id);
+            }
+            animating = true;
+        } else {
+            self.scene.set_workspace_slide(None);
+            if !self.outgoing_workspace_windows.is_empty() {
+                self.outgoing_workspace_windows.clear();
+            }
         }
 
         self.last_rendered_rects
-            .retain(|id, _| visible_ids.contains(id));
+            .retain(|id, _| active_space_ids.contains(id));
         self.scene.retain_windows(|id| visible_ids.contains(&id));
         animating
     }
@@ -630,8 +784,7 @@ impl NeonState {
                 if let Some(window) = self.find_window_by_id(wid)
                     && rec.is_visible_on(self.wm.active_workspace_id())
                 {
-                    self.space
-                        .map_element(window, from_wm_point(clamped), false);
+                    self.map_preserving_z_order(window, from_wm_point(clamped));
                 }
             }
         }
@@ -693,17 +846,181 @@ impl NeonState {
             .unwrap_or_else(|| (1280, 800).into())
     }
 
+    /// Returns the full logical rectangle `(0, 0, w, h)` of the active primary output
+    /// (used for true edge-to-edge fullscreen windows).
+    pub fn output_full_rect(&self) -> WmRect {
+        to_wm_rect(Rectangle::from_size(self.output_logical_size()))
+    }
+
     /// Returns the active output work area excluding `zwlr_layer_shell_v1` exclusive zones
     /// (such as the top panel and dock).
+    ///
+    /// When the top bar is enabled and `panel.smart_hide` is OFF, guarantees `loc.y` stays
+    /// strictly below the top bar height so maximized/snapped windows never extend behind
+    /// or above the top bar even during fullscreen transitions or exclusive-zone renegotiation.
     pub fn work_area(&self) -> WmRect {
-        if let Some(output) = self.primary_output.as_ref() {
+        let mut rect = if let Some(output) = self.primary_output.as_ref() {
             let map = layer_map_for_output(output);
             let zone = map.non_exclusive_zone();
             if zone.size.w > 0 && zone.size.h > 0 {
-                return to_wm_rect(zone);
+                to_wm_rect(zone)
+            } else {
+                self.output_full_rect()
+            }
+        } else {
+            self.output_full_rect()
+        };
+
+        if self.config.panel.visible && !self.config.panel.smart_hide {
+            let panel_h = self
+                .primary_output
+                .as_ref()
+                .and_then(|output| {
+                    let map = layer_map_for_output(output);
+                    map.layers()
+                        .find(|l| l.namespace() == "neon-panel")
+                        .and_then(|l| map.layer_geometry(l))
+                        .map(|g| g.loc.y + g.size.h)
+                })
+                .filter(|&h| h > 0)
+                .unwrap_or(self.last_panel_height);
+
+            if panel_h > 0 && rect.loc.y < panel_h {
+                let delta = panel_h - rect.loc.y;
+                rect.loc.y = panel_h;
+                rect.size.h = (rect.size.h - delta).max(200);
             }
         }
-        to_wm_rect(Rectangle::from_size(self.output_logical_size()))
+
+        // Also protect the bottom dock zone whenever dock is Always Visible so maximized apps
+        // never overlap the floating dock.
+        if !self.config.dock.auto_hide
+            && !self.config.dock.intelligent_hide
+            && self.last_dock_exclusive > 0
+        {
+            let full = self.output_full_rect();
+            let max_bottom = (full.loc.y + full.size.h - self.last_dock_exclusive).max(rect.loc.y + 200);
+            let cur_bottom = rect.loc.y + rect.size.h;
+            if cur_bottom > max_bottom {
+                rect.size.h = (max_bottom - rect.loc.y).max(200);
+            }
+        }
+
+        rect
+    }
+
+    /// Returns `true` when any visible window on the active workspace is in fullscreen mode
+    /// and the App Drawer (Overview) is closed.
+    pub fn has_visible_fullscreen_window(&self) -> bool {
+        if self.overview_open {
+            return false;
+        }
+        let active_ws = self.wm.active_workspace_id();
+        self.space.elements().any(|w| {
+            window_id(w)
+                .and_then(|id| self.wm.get(id))
+                .map(|rec| rec.is_visible_on(active_ws) && rec.mode.is_fullscreen())
+                .unwrap_or(false)
+        })
+    }
+
+    /// Moves or maps `window` to `loc` in `self.space` WITHOUT disturbing existing window Z-order.
+    ///
+    /// In Smithay 0.7, `Space::map_element` always removes and re-pushes the element to the top
+    /// of the stack even when `activate == false`. Preserving relative Z-order avoids windows
+    /// jumping behind/over each other on relayouts, App Drawer transitions, and X11 configure events.
+    pub fn map_preserving_z_order(&mut self, window: Window, loc: Point<i32, Logical>) {
+        if let Some(current_loc) = self.space.element_location(&window) {
+            if current_loc == loc {
+                return;
+            }
+            let elements: Vec<Window> = self.space.elements().cloned().collect();
+            if let Some(idx) = elements.iter().position(|w| w == &window) {
+                let above = &elements[idx + 1..];
+                self.space.map_element(window, loc, false);
+                for w in above {
+                    self.space.raise_element(w, false);
+                }
+                self.sync_x11_stacking_order();
+                return;
+            }
+        }
+        self.space.map_element(window, loc, false);
+        self.sync_x11_stacking_order();
+    }
+
+    /// Synchronizes XWayland's internal X11 window stacking order with `self.space` (bottom -> top)
+    /// so overlapping X11 windows and transient dialogs route pointer/keyboard input and paint
+    /// consistently.
+    ///
+    /// Note: in Smithay 0.7, `X11Wm::update_stacking_order_upwards` uses `StackMode::ABOVE` and
+    /// expects windows in **bottom -> top** order (matching `Space::elements()`), whereas
+    /// `update_stacking_order_downwards` uses `StackMode::BELOW` (top -> bottom).
+    pub fn sync_x11_stacking_order(&mut self) {
+        if let Some(xwm) = self.xwm.as_mut() {
+            let x11_order: Vec<&smithay::xwayland::X11Surface> = self
+                .space
+                .elements()
+                .filter_map(|w| w.x11_surface())
+                .collect();
+            if !x11_order.is_empty() {
+                let _ = xwm.update_stacking_order_upwards(x11_order.into_iter());
+            }
+        }
+    }
+
+    /// Resolves a managed NEON DE [`WindowId`] from an X11 window ID (`XID`).
+    pub fn find_x11_window_id(&self, xid: u32) -> Option<WindowId> {
+        self.managed_windows
+            .iter()
+            .find(|(_, w)| {
+                w.x11_surface()
+                    .map(|s| s.window_id() == xid)
+                    .unwrap_or(false)
+            })
+            .map(|(&id, _)| id)
+    }
+
+    /// Returns visible windows on workspace `ws_index` ordered front-to-back with their logical
+    /// locations and fullscreen flags (used for isolated Workspace screencasts & live previews).
+    pub fn workspace_windows_front_to_back(
+        &self,
+        ws_index: usize,
+    ) -> Vec<(&Window, Point<i32, Logical>, bool)> {
+        let Some(ws) = self.wm.workspaces().workspaces().get(ws_index) else {
+            return Vec::new();
+        };
+        let ws_id = ws.id;
+        self.wm
+            .visible_windows_mru_order_for(ws_id)
+            .into_iter()
+            .rev()
+            .filter_map(|wid| {
+                let win = self.managed_windows.get(&wid)?;
+                let rec = self.wm.get(wid)?;
+                let loc = self
+                    .space
+                    .element_location(win)
+                    .unwrap_or_else(|| from_wm_point(rec.current_geometry.loc));
+                Some((win, loc, rec.mode.is_fullscreen()))
+            })
+            .collect()
+    }
+
+    /// Checks whether an upper `zwlr_layer_shell_v1` surface sits above regular windows at `pos`.
+    ///
+    /// When a fullscreen window is active (and Overview is closed), regular `Layer::Top` surfaces
+    /// (such as the top panel and dock) yield visually and interactively to the fullscreen window,
+    /// while `Layer::Overlay` surfaces (notifications, quick settings, context menus) remain on top.
+    pub fn upper_layer_surface_under(
+        &self,
+        pos: Point<f64, Logical>,
+    ) -> Option<(WlSurface, Point<f64, Logical>, KeyboardInteractivity)> {
+        if self.has_visible_fullscreen_window() {
+            self.layer_surface_under(pos, &[WlrLayer::Overlay])
+        } else {
+            self.layer_surface_under(pos, &[WlrLayer::Overlay, WlrLayer::Top])
+        }
     }
 
     /// Checks whether a `zwlr_layer_shell_v1` surface sits under `pos` on one of `layers`.
@@ -715,19 +1032,43 @@ impl NeonState {
         let output = self.primary_output.as_ref()?;
         let map = layer_map_for_output(output);
         for &wlr_layer in layers {
-            if let Some(layer) = map.layer_under(wlr_layer, pos)
-                && let Some(geo) = map.layer_geometry(layer)
-                && let Some((surface, surf_loc)) =
-                    layer.surface_under(pos - geo.loc.to_f64(), WindowSurfaceType::ALL)
-            {
-                let interactivity = with_states(layer.wl_surface(), |states| {
-                    states
-                        .cached_state
-                        .get::<LayerSurfaceCachedState>()
-                        .current()
-                        .keyboard_interactivity
-                });
-                return Some((surface, (geo.loc + surf_loc).to_f64(), interactivity));
+            // Check foreground layers first, then fullscreen click-catcher backdrops so
+            // `"neon-quick-settings"` and `"neon-workspaces-panel"` always receive input above
+            // their click-catcher backdrops.
+            let ordered_layers: Vec<_> = {
+                let mut top_fg = Vec::new();
+                let mut fg = Vec::new();
+                let mut bg = Vec::new();
+                for layer in map.layers_on(wlr_layer).rev() {
+                    match layer.namespace() {
+                        "neon-context-submenu" => top_fg.push(layer.clone()),
+                        "neon-context-menu" => fg.insert(0, layer.clone()),
+                        "neon-quick-settings-backdrop"
+                        | "neon-workspaces-backdrop"
+                        | "neon-screencast-picker-backdrop"
+                        | "neon-context-menu-backdrop" => bg.push(layer.clone()),
+                        _ => fg.push(layer.clone()),
+                    }
+                }
+                top_fg.extend(fg);
+                top_fg.extend(bg);
+                top_fg
+            };
+            for layer in ordered_layers {
+                if let Some(geo) = map.layer_geometry(&layer)
+                    && geo.to_f64().contains(pos)
+                    && let Some((surface, surf_loc)) =
+                        layer.surface_under(pos - geo.loc.to_f64(), WindowSurfaceType::ALL)
+                {
+                    let interactivity = with_states(layer.wl_surface(), |states| {
+                        states
+                            .cached_state
+                            .get::<LayerSurfaceCachedState>()
+                            .current()
+                            .keyboard_interactivity
+                    });
+                    return Some((surface, (geo.loc + surf_loc).to_f64(), interactivity));
+                }
             }
         }
         None
@@ -739,11 +1080,9 @@ impl NeonState {
     pub fn surface_under(
         &self,
         pos: Point<f64, Logical>,
-    ) -> Option<(WlSurface, Point<f64, Logical>)> {
-        if let Some((surf, loc, _)) =
-            self.layer_surface_under(pos, &[WlrLayer::Overlay, WlrLayer::Top])
-        {
-            return Some((surf, loc));
+    ) -> Option<(FocusTarget, Point<f64, Logical>)> {
+        if let Some((surf, loc, _)) = self.upper_layer_surface_under(pos) {
+            return Some((FocusTarget::Wayland(surf), loc));
         }
 
         // Check XWayland override-redirect popups (context menus / dropdowns) above regular windows.
@@ -758,7 +1097,7 @@ impl NeonState {
                 && let Some((surface, surface_loc)) =
                     or_win.surface_under(pos - loc.to_f64(), WindowSurfaceType::ALL)
             {
-                return Some((surface, (loc + surface_loc).to_f64()));
+                return Some((FocusTarget::Wayland(surface), (loc + surface_loc).to_f64()));
             }
         }
 
@@ -768,14 +1107,16 @@ impl NeonState {
             .and_then(|(window, location)| {
                 window
                     .surface_under(pos - location.to_f64(), WindowSurfaceType::ALL)
-                    .map(|(surface, surface_loc)| (surface, (location + surface_loc).to_f64()))
+                    .map(|(surface, surface_loc)| {
+                        (FocusTarget::Wayland(surface), (location + surface_loc).to_f64())
+                    })
             })
         {
             return Some(win_hit);
         }
 
         self.layer_surface_under(pos, &[WlrLayer::Bottom, WlrLayer::Background])
-            .map(|(surf, loc, _)| (surf, loc))
+            .map(|(surf, loc, _)| (FocusTarget::Wayland(surf), loc))
     }
 
     /// Toggles Activities Overview state (synced with `neon-shell` over IPC).
@@ -887,7 +1228,7 @@ impl NeonState {
 
         if update.visible_on_active_workspace {
             if let Some(loc) = update.target_location {
-                self.space.map_element(window, from_wm_point(loc), false);
+                self.map_preserving_z_order(window, from_wm_point(loc));
             }
         } else {
             self.space.unmap_elem(&window);
@@ -907,13 +1248,24 @@ impl NeonState {
             let Some(record) = self.wm.get(id) else {
                 continue;
             };
-            if record.is_visible_on(active_ws) {
-                let loc = from_wm_point(record.current_geometry.loc);
-                self.space.map_element(window, loc, false);
-            } else {
+            if !record.is_visible_on(active_ws) {
                 self.space.unmap_elem(&window);
             }
         }
+
+        // Map active workspace windows in deterministic MRU order (oldest -> newest) so the
+        // most-recently focused window always stacks on top after workspace switches.
+        for id in self.wm.active_visible_windows_mru_order() {
+            let Some(window) = self.find_window_by_id(id) else {
+                continue;
+            };
+            let Some(record) = self.wm.get(id) else {
+                continue;
+            };
+            let loc = from_wm_point(record.current_geometry.loc);
+            self.space.map_element(window, loc, false);
+        }
+        self.sync_x11_stacking_order();
 
         self.focus_topmost_window(serial);
 
@@ -951,14 +1303,16 @@ impl NeonState {
         }
         let prev_focused = self.wm.focused_id();
         let target_id = target.and_then(window_id);
-        let target_surface = target.and_then(|w| w.wl_surface().map(|s| s.into_owned()));
+        let target_focus: Option<FocusTarget> = target.and_then(|w| {
+            if let Some(x11) = w.x11_surface() {
+                Some(FocusTarget::X11(x11.clone()))
+            } else {
+                w.wl_surface().map(|s| FocusTarget::Wayland(s.into_owned()))
+            }
+        });
 
-        for window in self.managed_windows.values() {
-            let is_target = target
-                .and_then(|t| t.wl_surface().map(|s| s.id()))
-                .zip(window.wl_surface().map(|s| s.id()))
-                .map(|(a, b)| a == b)
-                .unwrap_or(false);
+        for (&win_id, window) in &self.managed_windows {
+            let is_target = target_id.is_some_and(|tid| tid == win_id);
 
             if let Some(toplevel) = window.toplevel() {
                 let changed = toplevel.with_pending_state(|state| {
@@ -978,6 +1332,31 @@ impl NeonState {
 
         if raise && let Some(window) = target {
             self.space.raise_element(window, true);
+            // Keep any visible transient child dialogs stacked above their parent so focusing
+            // or clicking a parent window never buries its modal / sub-dialogs (e.g. DaVinci Resolve).
+            if let Some(tid) = target_id {
+                for child_id in self.wm.visible_transient_children(tid) {
+                    if let Some(child_win) = self.find_window_by_id(child_id) {
+                        self.space.raise_element(&child_win, false);
+                    }
+                }
+            }
+            // Keep any visible `always_on_top` windows stacked above regular windows.
+            let active_ws = self.wm.active_workspace_id();
+            let target_is_aot = target_id
+                .and_then(|tid| self.wm.get(tid))
+                .map(|w| w.always_on_top)
+                .unwrap_or(false);
+            if !target_is_aot {
+                for aot_id in self.wm.visible_always_on_top_windows(active_ws) {
+                    if Some(aot_id) != target_id
+                        && let Some(aot_win) = self.find_window_by_id(aot_id)
+                    {
+                        self.space.raise_element(&aot_win, false);
+                    }
+                }
+            }
+            self.sync_x11_stacking_order();
         }
 
         let now = self.now_duration();
@@ -993,7 +1372,7 @@ impl NeonState {
         self.wm.mark_focused(target_id);
 
         if let Some(keyboard) = self.seat.get_keyboard() {
-            keyboard.set_focus(self, target_surface, serial);
+            keyboard.set_focus(self, target_focus, serial);
         }
     }
 
@@ -1074,7 +1453,7 @@ impl NeonState {
             if let Some(window) = self.find_window_by_id(id)
                 && rec.is_visible_on(self.wm.active_workspace_id())
             {
-                self.space.map_element(window, from_wm_point(new_loc), false);
+                self.map_preserving_z_order(window, from_wm_point(new_loc));
             }
         }
         self.needs_redraw = true;
@@ -1174,10 +1553,44 @@ impl NeonState {
         let Some(id) = self.wm.focused_id() else {
             return;
         };
-        let work_area = self.work_area();
-        if let Some(update) = self.wm.toggle_fullscreen(id, work_area) {
+        self.toggle_fullscreen_window(id);
+    }
+
+    pub fn toggle_fullscreen_window(&mut self, id: WindowId) {
+        let currently_fs = self
+            .wm
+            .get(id)
+            .map(|r| r.mode.is_fullscreen())
+            .unwrap_or(false);
+        let entering_fs = !currently_fs;
+
+        if let Some(window) = self.find_window_by_id(id)
+            && let Some(x11) = window.x11_surface()
+        {
+            if entering_fs {
+                self.ssd_windows.remove(&id);
+            } else if crate::wayland::xwayland::x11_wants_ssd_non_fullscreen(x11) {
+                self.ssd_windows.insert(id);
+            }
+        }
+
+        let target_rect = if entering_fs {
+            self.output_full_rect()
+        } else {
+            self.effective_work_area_for(id)
+        };
+        if let Some(update) = self.wm.set_fullscreen(id, entering_fs, target_rect) {
             info!(?id, mode = ?update.mode, "Toggled fullscreen on focused window");
+            if let Some(window) = self.find_window_by_id(id)
+                && let Some(x11) = window.x11_surface()
+            {
+                let _ = x11.set_fullscreen(update.mode.is_fullscreen());
+                if let (Some(loc), Some(sz)) = (update.target_location, update.configure_size) {
+                    let _ = x11.configure(Rectangle::new(from_wm_point(loc), from_wm_size(sz)));
+                }
+            }
             self.apply_layout_update(&update);
+            self.needs_redraw = true;
         }
     }
 
@@ -1201,6 +1614,91 @@ impl NeonState {
             return;
         };
         self.snap_window_by_id(id, region);
+    }
+
+    pub fn toggle_always_on_top_by_id(&mut self, id: WindowId, serial: Serial) -> Option<bool> {
+        let enabled = self.wm.toggle_always_on_top(id)?;
+        info!(?id, always_on_top = enabled, "Toggled window Always on Top");
+        self.sync_active_workspace_space(serial);
+        self.needs_redraw = true;
+        Some(enabled)
+    }
+
+    pub fn center_window_by_id(&mut self, id: WindowId) -> bool {
+        let work_area = self.effective_work_area_for(id);
+        let Some(update) = self.wm.center_window(id, work_area) else {
+            return false;
+        };
+        if let Some(window) = self.find_window_by_id(id)
+            && let Some(x11) = window.x11_surface()
+        {
+            let _ = x11.set_maximized(false);
+            let _ = x11.set_fullscreen(false);
+            if let (Some(loc), Some(sz)) = (update.target_location, update.configure_size) {
+                let _ = x11.configure(Rectangle::new(from_wm_point(loc), from_wm_size(sz)));
+            }
+        }
+        self.apply_layout_update(&update);
+        self.needs_redraw = true;
+        true
+    }
+
+    pub fn set_floating_window_by_id(&mut self, id: WindowId) -> bool {
+        let work_area = self.effective_work_area_for(id);
+        let Some(update) = self.wm.set_floating(id, work_area) else {
+            return false;
+        };
+        if let Some(window) = self.find_window_by_id(id)
+            && let Some(x11) = window.x11_surface()
+        {
+            let _ = x11.set_maximized(false);
+            let _ = x11.set_fullscreen(false);
+            if let (Some(loc), Some(sz)) = (update.target_location, update.configure_size) {
+                let _ = x11.configure(Rectangle::new(from_wm_point(loc), from_wm_size(sz)));
+            }
+        }
+        self.apply_layout_update(&update);
+        self.needs_redraw = true;
+        true
+    }
+
+    pub fn move_window_to_output_by_name(&mut self, id: WindowId, output_name: &str) -> bool {
+        let Some(out) = self
+            .output_manager
+            .all_outputs()
+            .into_iter()
+            .find(|o| o.name == output_name)
+        else {
+            return false;
+        };
+        let logical = out.logical_size();
+        let top_pad = if out.primary && self.config.panel.visible && !self.config.panel.smart_hide {
+            31
+        } else {
+            0
+        };
+        let bot_pad = if out.primary && !self.config.dock.auto_hide && !self.config.dock.intelligent_hide
+        {
+            self.last_dock_exclusive.max(0)
+        } else {
+            0
+        };
+        let target_area = WmRect::new(
+            crate::window::WmPoint::new(out.position.x, out.position.y + top_pad),
+            crate::window::WmSize::new(logical.w.max(320), (logical.h - top_pad - bot_pad).max(200)),
+        );
+        let Some(update) = self.wm.move_window_to_area(id, target_area) else {
+            return false;
+        };
+        if let Some(window) = self.find_window_by_id(id)
+            && let Some(x11) = window.x11_surface()
+            && let (Some(loc), Some(sz)) = (update.target_location, update.configure_size)
+        {
+            let _ = x11.configure(Rectangle::new(from_wm_point(loc), from_wm_size(sz)));
+        }
+        self.apply_layout_update(&update);
+        self.needs_redraw = true;
+        true
     }
 
     pub fn unmaximize_or_minimize_focused(&mut self, serial: Serial) {
@@ -1267,7 +1765,21 @@ impl NeonState {
 
     /// Restores a specific minimized window with a smooth Material 3 spring rise from the Dock.
     pub fn restore_minimized_window(&mut self, id: WindowId, serial: Serial) -> bool {
-        let work_area = self.work_area();
+        let restores_to_fs = self
+            .wm
+            .get(id)
+            .map(|r| {
+                matches!(
+                    &r.mode,
+                    WindowMode::Minimized { restore_mode } if restore_mode.is_fullscreen()
+                )
+            })
+            .unwrap_or(false);
+        let work_area = if restores_to_fs {
+            self.output_full_rect()
+        } else {
+            self.effective_work_area_for(id)
+        };
         let Some(update) = self.wm.restore_window(id, work_area) else {
             return false;
         };
@@ -1286,7 +1798,13 @@ impl NeonState {
 
     pub fn restore_last_minimized(&mut self, serial: Serial) {
         let work_area = self.work_area();
-        if let Some(update) = self.wm.restore_last_minimized(work_area) {
+        if let Some(mut update) = self.wm.restore_last_minimized(work_area) {
+            if update.mode.is_fullscreen() {
+                let full = self.output_full_rect();
+                if let Some(fs_upd) = self.wm.apply_mode(update.id, WindowMode::Fullscreen, full) {
+                    update = fs_upd;
+                }
+            }
             info!(id = ?update.id, mode = ?update.mode, "Restored minimized window");
             self.minimizing_windows.remove(&update.id);
             self.last_rendered_rects.remove(&update.id);
@@ -1301,12 +1819,66 @@ impl NeonState {
         }
     }
 
+    /// Captures currently mapped windows on the departing workspace and initiates a
+    /// Hyprland-style simultaneous dual-workspace `slidefade` animation across the display width.
+    fn begin_workspace_transition(&mut self, direction: i32, exclude_id: Option<WindowId>) {
+        let now = self.now_duration();
+        let output_w = self.output_logical_size().w.max(640) as f64;
+        let focused_id = self.wm.focused_id();
+
+        let snapshot: Vec<OutgoingWorkspaceWindow> = self
+            .space
+            .elements()
+            .enumerate()
+            .filter_map(|(z_idx, window)| {
+                let id = window_id(window)?;
+                if exclude_id == Some(id) || self.minimizing_windows.contains_key(&id) {
+                    return None;
+                }
+                let loc = self.space.element_location(window)?;
+                let win_size = window.geometry().size;
+                if win_size.w <= 0 || win_size.h <= 0 {
+                    return None;
+                }
+                let mode = self
+                    .wm
+                    .get(id)
+                    .map(|w| w.mode.clone())
+                    .unwrap_or(WindowMode::Floating);
+                Some(OutgoingWorkspaceWindow {
+                    id,
+                    bounds: WmRect::new(to_wm_point(loc), to_wm_size(win_size)),
+                    z_index: z_idx as i32,
+                    fullscreen: mode.is_fullscreen(),
+                    maximized: mode.is_maximized(),
+                    was_focused: focused_id == Some(id),
+                    is_frameless_special: is_window_frameless_special(window),
+                })
+            })
+            .collect();
+
+        if self
+            .effects
+            .animate_workspace_switch_with_width(direction, output_w, now)
+        {
+            self.outgoing_workspace_windows = snapshot;
+            self.needs_redraw = true;
+        } else {
+            self.outgoing_workspace_windows.clear();
+        }
+    }
+
     pub fn switch_workspace_index(&mut self, index: usize, serial: Serial) -> Option<WorkspaceId> {
         let old_idx = self.wm.workspaces().active_index();
-        let new_ws = self.wm.switch_workspace_index(index)?;
-        let direction = if index >= old_idx { 1 } else { -1 };
-        let now = self.now_duration();
-        self.effects.animate_workspace_switch(direction, now);
+        let old_ws = self.wm.active_workspace_id();
+        if old_idx == index {
+            return Some(old_ws);
+        }
+        let new_ws = self.wm.switch_workspace_index_or_create(index)?;
+        if new_ws != old_ws {
+            let direction = if index > old_idx { 1 } else { -1 };
+            self.begin_workspace_transition(direction, None);
+        }
         info!(
             workspace = ?new_ws,
             index = self.wm.workspaces().active_index(),
@@ -1318,9 +1890,11 @@ impl NeonState {
     }
 
     pub fn switch_workspace_next(&mut self, serial: Serial) -> Option<WorkspaceId> {
+        let old_ws = self.wm.active_workspace_id();
         let new_ws = self.wm.switch_workspace_next()?;
-        let now = self.now_duration();
-        self.effects.animate_workspace_switch(1, now);
+        if new_ws != old_ws {
+            self.begin_workspace_transition(1, None);
+        }
         info!(
             workspace = ?new_ws,
             index = self.wm.workspaces().active_index(),
@@ -1332,9 +1906,11 @@ impl NeonState {
     }
 
     pub fn switch_workspace_prev(&mut self, serial: Serial) -> Option<WorkspaceId> {
+        let old_ws = self.wm.active_workspace_id();
         let new_ws = self.wm.switch_workspace_prev()?;
-        let now = self.now_duration();
-        self.effects.animate_workspace_switch(-1, now);
+        if new_ws != old_ws {
+            self.begin_workspace_transition(-1, None);
+        }
         info!(
             workspace = ?new_ws,
             index = self.wm.workspaces().active_index(),
@@ -1363,6 +1939,7 @@ impl NeonState {
         if !self.wm.remove_workspace(index) {
             return false;
         }
+        self.outgoing_workspace_windows.clear();
         self.sync_active_workspace_space(serial);
         self.needs_redraw = true;
         info!(
@@ -1373,16 +1950,30 @@ impl NeonState {
         true
     }
 
+    /// Toggles pinned persistence on the desktop at `index` (COSMIC-style workspace pin).
+    pub fn toggle_pin_workspace(&mut self, index: usize, serial: Serial) -> Option<bool> {
+        let pinned = self.wm.toggle_pin_workspace(index)?;
+        self.sync_active_workspace_space(serial);
+        self.needs_redraw = true;
+        info!(
+            index,
+            pinned,
+            total = self.wm.workspaces().len(),
+            "Toggled workspace pin"
+        );
+        Some(pinned)
+    }
+
     pub fn move_focused_to_next_workspace(
         &mut self,
         follow: bool,
         serial: Serial,
     ) -> Option<WorkspaceId> {
         let id = self.wm.focused_id()?;
+        let old_ws = self.wm.active_workspace_id();
         let new_ws = self.wm.move_window_to_next_workspace(id, follow)?;
-        if follow {
-            let now = self.now_duration();
-            self.effects.animate_workspace_switch(1, now);
+        if follow && new_ws != old_ws {
+            self.begin_workspace_transition(1, Some(id));
         }
         info!(
             ?id,
@@ -1404,10 +1995,10 @@ impl NeonState {
         serial: Serial,
     ) -> Option<WorkspaceId> {
         let id = self.wm.focused_id()?;
+        let old_ws = self.wm.active_workspace_id();
         let new_ws = self.wm.move_window_to_prev_workspace(id, follow)?;
-        if follow {
-            let now = self.now_duration();
-            self.effects.animate_workspace_switch(-1, now);
+        if follow && new_ws != old_ws {
+            self.begin_workspace_transition(-1, Some(id));
         }
         info!(
             ?id,
@@ -1423,9 +2014,10 @@ impl NeonState {
         Some(new_ws)
     }
 
-    /// Re-lays out maximized/fullscreen/snapped windows when the output is resized.
+    /// Re-lays out maximized/fullscreen/snapped windows when the output or exclusive zone changes,
+    /// strictly preserving existing window Z-order.
     pub fn relayout_non_floating_windows(&mut self) {
-        let work_area = self.work_area();
+        let full_rect = self.output_full_rect();
         let ids: Vec<(WindowId, WindowMode)> = self
             .wm
             .all_window_ids()
@@ -1437,7 +2029,18 @@ impl NeonState {
             .collect();
 
         for (id, mode) in ids {
-            if let Some(update) = self.wm.apply_mode(id, mode, work_area) {
+            let target_rect = if mode.is_fullscreen() {
+                full_rect
+            } else {
+                self.effective_work_area_for(id)
+            };
+            if let Some(update) = self.wm.apply_mode(id, mode, target_rect) {
+                if let Some(window) = self.find_window_by_id(id)
+                    && let Some(x11) = window.x11_surface()
+                    && let (Some(loc), Some(sz)) = (update.target_location, update.configure_size)
+                {
+                    let _ = x11.configure(Rectangle::new(from_wm_point(loc), from_wm_size(sz)));
+                }
                 self.apply_layout_update(&update);
             }
         }
@@ -1635,6 +2238,7 @@ impl NeonState {
             self.wm.remove_window(id);
             self.effects.remove_window(id);
             self.scene.remove_window(id);
+            self.outgoing_workspace_windows.retain(|w| w.id != id);
             debug!(?id, "Cleaned up dead window");
         }
 
@@ -1676,4 +2280,25 @@ fn parse_hex_rgb(hex: &str) -> Option<[f32; 3]> {
     let g = u8::from_str_radix(&stripped[2..4], 16).ok()?;
     let b = u8::from_str_radix(&stripped[4..6], 16).ok()?;
     Some([r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0])
+}
+
+fn is_window_frameless_special(window: &Window) -> bool {
+    window
+        .x11_surface()
+        .map(|x11| {
+            x11.is_popup()
+                || matches!(
+                    x11.window_type(),
+                    Some(
+                        WmWindowType::Splash
+                            | WmWindowType::Notification
+                            | WmWindowType::Tooltip
+                            | WmWindowType::PopupMenu
+                            | WmWindowType::DropdownMenu
+                            | WmWindowType::Menu
+                            | WmWindowType::Toolbar
+                    )
+                )
+        })
+        .unwrap_or(false)
 }

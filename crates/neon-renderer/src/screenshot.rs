@@ -8,28 +8,336 @@
 use std::{
     fs::{self, File},
     io::BufWriter,
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 use neon_scene::SceneGraph;
 use neon_window_manager::WindowId;
 use smithay::{
     backend::{
-        allocator::Fourcc,
+        allocator::{Fourcc, dmabuf::Dmabuf},
         renderer::{
-            Bind, ExportMem, Offscreen,
+            Bind, Color32F, ExportMem, Offscreen,
             damage::OutputDamageTracker,
+            element::{
+                AsRenderElements, surface::WaylandSurfaceRenderElement, utils::RescaleRenderElement,
+            },
             gles::{GlesRenderer, GlesTexture},
         },
     },
-    desktop::Window,
+    desktop::{Window, layer_map_for_output},
+    input::pointer::CursorImageStatus,
     output::Output,
-    utils::{Buffer as BufferCoord, Logical, Point, Rectangle, Size},
-    wayland::session_lock::LockSurface,
+    utils::{Buffer as BufferCoord, Logical, Physical, Point, Rectangle, Scale, Size, Transform},
+    wayland::{session_lock::LockSurface, shell::wlr_layer::Layer as WlrLayer},
 };
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::{BlurSettings, FALLBACK_CLEAR_COLOR, LOCK_CURTAIN_COLOR, NeonRenderElement, NeonRenderer};
+
+/// Clean obsidian letterbox background used behind isolated window captures.
+pub const WINDOW_CAPTURE_BG_COLOR: Color32F = Color32F::new(0.043, 0.055, 0.078, 1.0);
+
+/// Renders an arbitrary front-to-back list of [`NeonRenderElement`]s directly into a client
+/// `Dmabuf` with hardware fence synchronization.
+pub fn render_elements_to_dmabuf(
+    renderer: &mut GlesRenderer,
+    output: &Output,
+    elements: &[NeonRenderElement],
+    clear: Color32F,
+    dmabuf: &mut Dmabuf,
+) -> Result<(), String> {
+    let mut tracker = OutputDamageTracker::from_output(output);
+    let mut target = renderer
+        .bind(dmabuf)
+        .map_err(|e| format!("DMA-BUF screencopy framebuffer bind failed: {e:?}"))?;
+    let render_res = tracker
+        .render_output(renderer, &mut target, 0, elements, clear)
+        .map_err(|e| format!("DMA-BUF screencopy render failed: {e:?}"))?;
+    let _ = render_res.sync.wait();
+    Ok(())
+}
+
+/// Collects front-to-back render elements for a single isolated [`Window`], aspect-fitted and
+/// centered inside `(target_w, target_h)` physical pixels (with optional mapped cursor overlay).
+#[allow(clippy::too_many_arguments)]
+pub fn collect_window_capture_elements(
+    renderer: &mut GlesRenderer,
+    neon_renderer: &mut NeonRenderer,
+    window: &Window,
+    target_w: i32,
+    target_h: i32,
+    output_scale: f64,
+    cursor_info: Option<(Point<f64, Logical>, Point<i32, Logical>, &CursorImageStatus)>,
+) -> Vec<NeonRenderElement> {
+    let mut elements = Vec::new();
+    let win_geo = window.geometry();
+    let win_w = win_geo.size.w.max(1) as f64;
+    let win_h = win_geo.size.h.max(1) as f64;
+    if target_w <= 0 || target_h <= 0 {
+        return elements;
+    }
+
+    let out_s = output_scale.max(0.01);
+    let nat_w = win_w * out_s;
+    let nat_h = win_h * out_s;
+    let fit = (target_w as f64 / nat_w).min(target_h as f64 / nat_h);
+    let dest_w = (nat_w * fit).round() as i32;
+    let dest_h = (nat_h * fit).round() as i32;
+    let dest_x = (target_w - dest_w) / 2;
+    let dest_y = (target_h - dest_h) / 2;
+
+    // Optional cursor mapped cleanly into the isolated window's fitted coordinate space.
+    if let Some((pointer_loc, window_screen_loc, cursor_status)) = cursor_info {
+        let rel_x = pointer_loc.x - window_screen_loc.x as f64;
+        let rel_y = pointer_loc.y - window_screen_loc.y as f64;
+        if rel_x >= 0.0 && rel_x <= win_w && rel_y >= 0.0 && rel_y <= win_h {
+            let mapped_logical: Point<f64, Logical> = (
+                (dest_x as f64 / out_s) + rel_x * fit,
+                (dest_y as f64 / out_s) + rel_y * fit,
+            )
+                .into();
+            elements.extend(neon_renderer.cursor_elements(
+                renderer,
+                mapped_logical,
+                (0, 0).into(),
+                out_s,
+                cursor_status,
+            ));
+        }
+    }
+
+    let base_phys: Point<i32, Physical> = (
+        dest_x - (win_geo.loc.x as f64 * out_s).round() as i32,
+        dest_y - (win_geo.loc.y as f64 * out_s).round() as i32,
+    )
+        .into();
+
+    let surf_elems = AsRenderElements::<GlesRenderer>::render_elements::<
+        WaylandSurfaceRenderElement<GlesRenderer>,
+    >(window, renderer, base_phys, Scale::from(out_s), 1.0);
+
+    if (fit - 1.0).abs() > 0.001 {
+        let origin_phys: Point<i32, Physical> = (dest_x, dest_y).into();
+        let rescale = Scale::from((fit, fit));
+        elements.extend(surf_elems.into_iter().map(|elem| {
+            NeonRenderElement::from(RescaleRenderElement::from_element(
+                elem,
+                origin_phys,
+                rescale,
+            ))
+        }));
+    } else {
+        elements.extend(surf_elems.into_iter().map(NeonRenderElement::from));
+    }
+    elements
+}
+
+/// Collects front-to-back render elements for an arbitrary workspace (including inactive
+/// background workspaces) or downscaled display preview at `render_scale`.
+pub fn collect_workspace_capture_elements(
+    renderer: &mut GlesRenderer,
+    output: &Output,
+    windows_front_to_back: &[(&Window, Point<i32, Logical>, bool)],
+    render_scale: f64,
+    include_top_chrome: bool,
+) -> Vec<NeonRenderElement> {
+    let scale = Scale::from(render_scale);
+    let mut elements = Vec::new();
+    let has_fullscreen = windows_front_to_back.iter().any(|(_, _, fs)| *fs);
+
+    let (upper_layers, lower_layers) = {
+        let layer_map = layer_map_for_output(output);
+        let mut upper = Vec::new();
+        let mut lower = Vec::new();
+        if include_top_chrome && !has_fullscreen {
+            for layer in layer_map.layers_on(WlrLayer::Top).rev() {
+                if layer.namespace() == "neon-overview" {
+                    continue;
+                }
+                if let Some(geo) = layer_map.layer_geometry(layer) {
+                    upper.push((layer.clone(), geo.loc));
+                }
+            }
+        }
+        for wlr_layer in [WlrLayer::Bottom, WlrLayer::Background] {
+            for layer in layer_map.layers_on(wlr_layer).rev() {
+                if let Some(geo) = layer_map.layer_geometry(layer) {
+                    lower.push((layer.clone(), geo.loc));
+                }
+            }
+        }
+        (upper, lower)
+    };
+
+    for (layer, loc) in &upper_layers {
+        let phys_loc: Point<i32, Physical> = loc.to_physical_precise_round(render_scale);
+        let layer_elems = AsRenderElements::<GlesRenderer>::render_elements::<
+            WaylandSurfaceRenderElement<GlesRenderer>,
+        >(layer, renderer, phys_loc, scale, 1.0);
+        elements.extend(layer_elems.into_iter().map(NeonRenderElement::from));
+    }
+
+    for &(window, loc, _fs) in windows_front_to_back {
+        let win_geo = window.geometry();
+        let render_loc: Point<i32, Logical> = (loc.x - win_geo.loc.x, loc.y - win_geo.loc.y).into();
+        let phys_loc: Point<i32, Physical> = render_loc.to_physical_precise_round(render_scale);
+        let surf_elems = AsRenderElements::<GlesRenderer>::render_elements::<
+            WaylandSurfaceRenderElement<GlesRenderer>,
+        >(window, renderer, phys_loc, scale, 1.0);
+        elements.extend(surf_elems.into_iter().map(NeonRenderElement::from));
+    }
+
+    for (layer, loc) in &lower_layers {
+        let phys_loc: Point<i32, Physical> = loc.to_physical_precise_round(render_scale);
+        let layer_elems = AsRenderElements::<GlesRenderer>::render_elements::<
+            WaylandSurfaceRenderElement<GlesRenderer>,
+        >(layer, renderer, phys_loc, scale, 1.0);
+        elements.extend(layer_elems.into_iter().map(NeonRenderElement::from));
+    }
+
+    elements
+}
+
+/// Hardware zero-copy capture of a single isolated window directly into a client `Dmabuf`.
+#[allow(clippy::too_many_arguments)]
+pub fn capture_window_to_dmabuf(
+    renderer: &mut GlesRenderer,
+    neon_renderer: &mut NeonRenderer,
+    output: &Output,
+    window: Option<&Window>,
+    cursor_info: Option<(Point<f64, Logical>, Point<i32, Logical>, &CursorImageStatus)>,
+    dmabuf: &mut Dmabuf,
+) -> Result<(), String> {
+    let mode = output
+        .current_mode()
+        .ok_or_else(|| "Output has no active mode".to_string())?;
+    let scale_f = output.current_scale().fractional_scale();
+    let elements = if let Some(win) = window {
+        collect_window_capture_elements(
+            renderer,
+            neon_renderer,
+            win,
+            mode.size.w,
+            mode.size.h,
+            scale_f,
+            cursor_info,
+        )
+    } else {
+        Vec::new()
+    };
+    render_elements_to_dmabuf(renderer, output, &elements, WINDOW_CAPTURE_BG_COLOR, dmabuf)
+}
+
+/// Hardware zero-copy capture of a specific workspace directly into a client `Dmabuf`.
+pub fn capture_workspace_to_dmabuf(
+    renderer: &mut GlesRenderer,
+    output: &Output,
+    windows_front_to_back: &[(&Window, Point<i32, Logical>, bool)],
+    extra_top_elements: Vec<NeonRenderElement>,
+    dmabuf: &mut Dmabuf,
+) -> Result<(), String> {
+    let scale_f = output.current_scale().fractional_scale();
+    let mut elements = extra_top_elements;
+    elements.extend(collect_workspace_capture_elements(
+        renderer,
+        output,
+        windows_front_to_back,
+        scale_f,
+        true,
+    ));
+    render_elements_to_dmabuf(renderer, output, &elements, FALLBACK_CLEAR_COLOR, dmabuf)
+}
+
+/// Renders a front-to-back list of preview elements into a compact offscreen GPU texture
+/// (`width x height`), reads back the small RGBA buffer, and encodes/writes the PNG atomically
+/// on a background thread so the compositor render loop never stalls.
+pub fn capture_preview_png_async(
+    renderer: &mut GlesRenderer,
+    elements: &[NeonRenderElement],
+    clear: Color32F,
+    width: i32,
+    height: i32,
+    scale_f: f64,
+    dest_path: PathBuf,
+) -> Result<(), String> {
+    if width <= 0 || height <= 0 {
+        return Err("Invalid preview thumbnail dimensions".to_string());
+    }
+    let buf_size: Size<i32, BufferCoord> = (width, height).into();
+    let mut offscreen: GlesTexture = renderer
+        .create_buffer(Fourcc::Abgr8888, buf_size)
+        .map_err(|e| format!("Preview texture alloc failed: {e:?}"))?;
+
+    let mut tracker = OutputDamageTracker::new(
+        Size::from((width, height)),
+        Scale::from(scale_f.max(0.01)),
+        Transform::Normal,
+    );
+    let mapping = {
+        let mut target = renderer
+            .bind(&mut offscreen)
+            .map_err(|e| format!("Preview framebuffer bind failed: {e:?}"))?;
+        tracker
+            .render_output(renderer, &mut target, 0, elements, clear)
+            .map_err(|e| format!("Preview render failed: {e:?}"))?;
+        renderer
+            .copy_framebuffer(&target, Rectangle::from_size(buf_size), Fourcc::Abgr8888)
+            .map_err(|e| format!("Preview readback failed: {e:?}"))?
+    };
+
+    let pixels = renderer
+        .map_texture(&mapping)
+        .map_err(|e| format!("Preview pixel map failed: {e:?}"))?
+        .to_vec();
+
+    let w = width as u32;
+    let h = height as u32;
+    std::thread::spawn(move || {
+        if let Err(err) = write_rgba_png(&dest_path, w, h, &pixels) {
+            warn!(path = %dest_path.display(), %err, "Failed to write screencast preview PNG");
+        }
+    });
+    Ok(())
+}
+
+/// Hardware zero-copy render of an output directly into a client `Dmabuf` (powering 60 FPS
+/// OBS Studio / `xdg-desktop-portal-wlr` / PipeWire screencast with zero CPU readback).
+#[allow(clippy::too_many_arguments)]
+pub fn capture_output_to_dmabuf<'a, F>(
+    renderer: &mut GlesRenderer,
+    neon_renderer: &mut NeonRenderer,
+    output: &Output,
+    scene: &SceneGraph,
+    blur: BlurSettings,
+    is_locked: bool,
+    lock_surface: Option<&LockSurface>,
+    override_redirect_popups: &[(&Window, Point<i32, Logical>)],
+    extra_top_elements: Vec<NeonRenderElement>,
+    resolve_window: F,
+    dmabuf: &mut Dmabuf,
+) -> Result<(), String>
+where
+    F: FnMut(WindowId) -> Option<&'a Window>,
+{
+    let mut elements = extra_top_elements;
+    let clear = if is_locked {
+        elements.extend(neon_renderer.collect_locked_elements(output, renderer, lock_surface));
+        LOCK_CURTAIN_COLOR
+    } else {
+        elements.extend(neon_renderer.collect_scene_elements_with_popups(
+            output,
+            renderer,
+            scene,
+            blur,
+            override_redirect_popups,
+            resolve_window,
+        ));
+        FALLBACK_CLEAR_COLOR
+    };
+
+    render_elements_to_dmabuf(renderer, output, &elements, clear, dmabuf)
+}
 
 /// Renders the current output scene into a reusable offscreen `GlesTexture`, reads back RGBA8
 /// pixels, and passes `(rgba_pixels, width, height)` to `on_rgba` without an extra heap copy.

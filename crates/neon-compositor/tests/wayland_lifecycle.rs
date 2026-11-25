@@ -631,9 +631,10 @@ fn multiple_windows_cascade_focus_and_cycle() {
         .seat
         .get_keyboard()
         .and_then(|k| k.current_focus())
+        .and_then(|f| f.wl_surface_id())
         .expect("keyboard focus must point to Window Two");
     let win2 = state.find_window_by_id(remaining_focus).unwrap();
-    assert_eq!(kbd_focus.id(), win2.toplevel().unwrap().wl_surface().id());
+    assert_eq!(kbd_focus, win2.toplevel().unwrap().wl_surface().id());
 
     allow_exit.store(true, Ordering::SeqCst);
     while !client_handle.is_finished() && Instant::now() < deadline {
@@ -1004,7 +1005,8 @@ fn scene_graph_and_animations_sync_with_window_and_workspace_events() {
         "floating window must have focus border"
     );
 
-    // Switching to empty workspace 1 removes window node from SceneGraph and triggers slide animation.
+    // Switching to empty workspace 1 immediately unmaps the window from interactive Space while
+    // keeping it gliding off-screen in the SceneGraph during the Hyprland `slidefade` transition.
     state
         .switch_workspace_next(SERIAL_COUNTER.next_serial())
         .expect("switch to dynamic workspace 1");
@@ -1014,9 +1016,27 @@ fn scene_graph_and_animations_sync_with_window_and_workspace_events() {
         "workspace transition animation should be active"
     );
     assert_eq!(
+        state.space.elements().count(),
+        0,
+        "departing workspace window must be immediately non-interactive on workspace 1"
+    );
+    assert_eq!(
+        state.scene.collect_front_to_back().len(),
+        2,
+        "backdrop + outgoing workspace window gliding off-screen mid-transition"
+    );
+
+    // Once the Hyprland workspace transition completes, the outgoing window is pruned cleanly.
+    thread::sleep(Duration::from_millis(430));
+    state.sync_scene_graph();
+    assert!(
+        state.outgoing_workspace_windows.is_empty(),
+        "outgoing workspace snapshot must clear after slide completes"
+    );
+    assert_eq!(
         state.scene.collect_front_to_back().len(),
         1,
-        "only backdrop remains visible on empty workspace 1"
+        "only backdrop remains visible on empty workspace 1 after slide settles"
     );
 
     allow_exit.store(true, Ordering::SeqCst);
@@ -1108,7 +1128,7 @@ fn ipc_server_state_overview_workspace_and_effects_roundtrip() {
 
         // Live appearance & window behavior updates (used by neon-settings)
         let app_res = client
-            .request(IpcRequest::UpdateAppearance {
+            .request(IpcRequest::from(neon_ipc::AppearanceUpdate {
                 theme: Some("neon_light".into()),
                 accent_color: Some("#A855F7".into()),
                 dock_transparency: Some(0.9),
@@ -1117,12 +1137,12 @@ fn ipc_server_state_overview_workspace_and_effects_roundtrip() {
                 show_clock: Some(true),
                 show_workspaces: Some(true),
                 high_contrast: Some(true),
-                wallpaper: None,
                 reduce_blur: Some(true),
                 blur_strength: Some(0.4),
                 cursor_theme: Some("macOS".into()),
                 cursor_size: Some(20),
-            })
+                ..Default::default()
+            }))
             .unwrap();
         let IpcResult::Ok {
             payload: IpcPayload::Appearance { appearance },
@@ -1567,4 +1587,643 @@ fn relative_pointer_motion_and_vt_switch_work_for_bare_metal_input() {
         );
     }
     assert_eq!(*switched_vt.lock().unwrap(), Some(3));
+}
+
+#[test]
+fn app_drawer_and_relayout_preserve_maximized_window_z_order() {
+    let (_event_loop, mut display, mut state) = create_headless_server();
+    let (server_sock, client_sock) = UnixStream::pair().unwrap();
+    state.insert_client(server_sock);
+
+    let mapped = Arc::new(AtomicBool::new(false));
+    let mapped_clone = Arc::clone(&mapped);
+    let allow_exit = Arc::new(AtomicBool::new(false));
+    let allow_exit_clone = Arc::clone(&allow_exit);
+
+    let client_handle = thread::spawn(move || {
+        let conn = Connection::from_socket(client_sock).unwrap();
+        let mut queue = conn.new_event_queue::<TestClientState>();
+        let qh = queue.handle();
+        let mut cstate = TestClientState::default();
+
+        let _registry = conn.display().get_registry(&qh, ());
+        queue.roundtrip(&mut cstate).unwrap();
+
+        let compositor = cstate.compositor.clone().unwrap();
+        let shm = cstate.shm.clone().unwrap();
+        let wm_base = cstate.wm_base.clone().unwrap();
+
+        let mut windows = Vec::new();
+        for title in ["Chrome", "Editor", "Terminal"] {
+            let surface = compositor.create_surface(&qh, ());
+            let xdg_surface = wm_base.get_xdg_surface(&surface, &qh, ());
+            let toplevel = xdg_surface.get_toplevel(&qh, ());
+            toplevel.set_title(title.into());
+            toplevel.set_maximized();
+            surface.commit();
+            queue.roundtrip(&mut cstate).unwrap();
+
+            let (f, pool, buffer) = create_shm_buffer(&shm, &qh, 1280, 800);
+            surface.attach(Some(&buffer), 0, 0);
+            surface.commit();
+            queue.roundtrip(&mut cstate).unwrap();
+            windows.push((surface, xdg_surface, toplevel, f, pool, buffer));
+        }
+
+        mapped_clone.store(true, Ordering::SeqCst);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !allow_exit_clone.load(Ordering::SeqCst) && Instant::now() < deadline {
+            queue.roundtrip(&mut cstate).unwrap();
+            thread::sleep(Duration::from_millis(10));
+        }
+        for (surface, xdg_surface, toplevel, _f, pool, buffer) in windows {
+            toplevel.destroy();
+            xdg_surface.destroy();
+            buffer.destroy();
+            pool.destroy();
+            surface.destroy();
+        }
+        conn.flush().unwrap();
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !mapped.load(Ordering::SeqCst) && Instant::now() < deadline {
+        pump_server(&mut display, &mut state);
+        thread::sleep(Duration::from_millis(5));
+    }
+    pump_server(&mut display, &mut state);
+
+    // Find Chrome (lowest WindowId) and focus/raise it above Editor and Terminal.
+    let mut ids = state.wm.all_window_ids();
+    ids.sort_by_key(|w| w.0);
+    assert_eq!(ids.len(), 3);
+    let chrome_id = ids[0];
+    let chrome_win = state.find_window_by_id(chrome_id).unwrap();
+    state.focus_window(Some(&chrome_win), SERIAL_COUNTER.next_serial());
+
+    let stack_before: Vec<_> = state
+        .space
+        .elements()
+        .filter_map(|w| state.window_id_for_window(w))
+        .collect();
+    assert_eq!(stack_before.last(), Some(&chrome_id));
+
+    // Simulate opening & closing the App Drawer AND firing relayout_non_floating_windows().
+    state.set_overview_open(true, SERIAL_COUNTER.next_serial());
+    state.relayout_non_floating_windows();
+    state.set_overview_open(false, SERIAL_COUNTER.next_serial());
+    state.relayout_non_floating_windows();
+
+    let stack_after: Vec<_> = state
+        .space
+        .elements()
+        .filter_map(|w| state.window_id_for_window(w))
+        .collect();
+    assert_eq!(
+        stack_after, stack_before,
+        "App Drawer open/close and relayout must never bury the active window behind other windows"
+    );
+    assert_eq!(state.wm.focused_id(), Some(chrome_id));
+
+    allow_exit.store(true, Ordering::SeqCst);
+    while !client_handle.is_finished() && Instant::now() < deadline {
+        pump_server(&mut display, &mut state);
+        thread::sleep(Duration::from_millis(5));
+    }
+    client_handle.join().unwrap();
+}
+
+#[test]
+fn transient_child_dialog_stays_above_fullscreen_parent() {
+    let (_event_loop, mut display, mut state) = create_headless_server();
+    let (server_sock, client_sock) = UnixStream::pair().unwrap();
+    state.insert_client(server_sock);
+
+    let mapped = Arc::new(AtomicBool::new(false));
+    let mapped_clone = Arc::clone(&mapped);
+    let allow_exit = Arc::new(AtomicBool::new(false));
+    let allow_exit_clone = Arc::clone(&allow_exit);
+
+    let client_handle = thread::spawn(move || {
+        let conn = Connection::from_socket(client_sock).unwrap();
+        let mut queue = conn.new_event_queue::<TestClientState>();
+        let qh = queue.handle();
+        let mut cstate = TestClientState::default();
+
+        let _registry = conn.display().get_registry(&qh, ());
+        queue.roundtrip(&mut cstate).unwrap();
+
+        let compositor = cstate.compositor.clone().unwrap();
+        let shm = cstate.shm.clone().unwrap();
+        let wm_base = cstate.wm_base.clone().unwrap();
+
+        // 1. Main fullscreen window (e.g. DaVinci Resolve main window)
+        let p_surf = compositor.create_surface(&qh, ());
+        let p_xdg = wm_base.get_xdg_surface(&p_surf, &qh, ());
+        let p_top = p_xdg.get_toplevel(&qh, ());
+        p_top.set_title("Main App".into());
+        p_top.set_fullscreen(None);
+        p_surf.commit();
+        queue.roundtrip(&mut cstate).unwrap();
+        let (_pf, p_pool, p_buf) = create_shm_buffer(&shm, &qh, 1280, 800);
+        p_surf.attach(Some(&p_buf), 0, 0);
+        p_surf.commit();
+        queue.roundtrip(&mut cstate).unwrap();
+
+        // 2. Child transient dialog (e.g. "New Project")
+        let d_surf = compositor.create_surface(&qh, ());
+        let d_xdg = wm_base.get_xdg_surface(&d_surf, &qh, ());
+        let d_top = d_xdg.get_toplevel(&qh, ());
+        d_top.set_title("New Project".into());
+        d_top.set_parent(Some(&p_top));
+        d_surf.commit();
+        queue.roundtrip(&mut cstate).unwrap();
+        let (_df, d_pool, d_buf) = create_shm_buffer(&shm, &qh, 480, 320);
+        d_surf.attach(Some(&d_buf), 0, 0);
+        d_surf.commit();
+        queue.roundtrip(&mut cstate).unwrap();
+
+        mapped_clone.store(true, Ordering::SeqCst);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !allow_exit_clone.load(Ordering::SeqCst) && Instant::now() < deadline {
+            queue.roundtrip(&mut cstate).unwrap();
+            thread::sleep(Duration::from_millis(10));
+        }
+        d_top.destroy();
+        d_xdg.destroy();
+        d_buf.destroy();
+        d_pool.destroy();
+        d_surf.destroy();
+        p_top.destroy();
+        p_xdg.destroy();
+        p_buf.destroy();
+        p_pool.destroy();
+        p_surf.destroy();
+        conn.flush().unwrap();
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !mapped.load(Ordering::SeqCst) && Instant::now() < deadline {
+        pump_server(&mut display, &mut state);
+        thread::sleep(Duration::from_millis(5));
+    }
+    pump_server(&mut display, &mut state);
+
+    let mut ids = state.wm.all_window_ids();
+    ids.sort_by_key(|w| w.0);
+    assert_eq!(ids.len(), 2);
+    let parent_id = ids[0];
+    let dialog_id = ids[1];
+
+    // Parent must be full-output fullscreen (0,0,1280,800) and trigger fullscreen layer yielding.
+    let parent_rec = state.wm.get(parent_id).unwrap();
+    assert_eq!(parent_rec.mode, WindowMode::Fullscreen);
+    assert_eq!(parent_rec.current_geometry.loc.x, 0);
+    assert_eq!(parent_rec.current_geometry.loc.y, 0);
+    assert_eq!(parent_rec.current_geometry.size.w, 1280);
+    assert_eq!(parent_rec.current_geometry.size.h, 800);
+    assert!(state.has_visible_fullscreen_window());
+
+    // Dialog must be stacked above parent.
+    let parent_win = state.find_window_by_id(parent_id).unwrap();
+    let z_order = |s: &NeonState| -> Vec<_> {
+        s.space
+            .elements()
+            .filter_map(|w| s.window_id_for_window(w))
+            .collect()
+    };
+    assert_eq!(z_order(&state), vec![parent_id, dialog_id]);
+
+    // Even if the parent is clicked/re-focused or reconfigured, its transient dialog stays on top!
+    state.focus_window(Some(&parent_win), SERIAL_COUNTER.next_serial());
+    assert_eq!(
+        z_order(&state),
+        vec![parent_id, dialog_id],
+        "Transient dialog must stay above parent when parent is focused"
+    );
+    state.map_preserving_z_order(parent_win, (0, 0).into());
+    assert_eq!(
+        z_order(&state),
+        vec![parent_id, dialog_id],
+        "Parent configure must never jump above its transient dialog"
+    );
+
+    allow_exit.store(true, Ordering::SeqCst);
+    while !client_handle.is_finished() && Instant::now() < deadline {
+        pump_server(&mut display, &mut state);
+        thread::sleep(Duration::from_millis(5));
+    }
+    client_handle.join().unwrap();
+}
+
+
+#[test]
+fn ipc_screencast_target_and_preview_validation_roundtrip() {
+    use neon_compositor::ipc::IpcServer;
+    use neon_ipc::{IpcClient, IpcPayload, IpcRequest, IpcResult, ScreencastTarget};
+
+    let (_event_loop, _display, mut state) = create_headless_server();
+    let dir = tempfile::tempdir().unwrap();
+    let ipc_path = dir.path().join("neon-ipc-sc-test.sock");
+    let mut ipc_server = IpcServer::bind(ipc_path.clone()).unwrap();
+
+    let done = Arc::new(AtomicBool::new(false));
+    let done_c = Arc::clone(&done);
+    let preview_ok_path = dir.path().join("thumb.png").to_string_lossy().into_owned();
+
+    let client_thread = thread::spawn(move || {
+        let mut client = IpcClient::connect(&ipc_path).unwrap();
+
+        // Default target is Output { name: None }.
+        assert_eq!(
+            client.request(IpcRequest::GetScreencastTarget).unwrap(),
+            IpcResult::Ok {
+                payload: IpcPayload::ScreencastTarget {
+                    target: ScreencastTarget::Output { name: None },
+                }
+            }
+        );
+
+        // Switch to Window target.
+        let win_target = ScreencastTarget::Window { window_id: 7 };
+        assert_eq!(
+            client
+                .request(IpcRequest::SetScreencastTarget {
+                    target: win_target.clone(),
+                })
+                .unwrap(),
+            IpcResult::Ok {
+                payload: IpcPayload::ScreencastTarget { target: win_target }
+            }
+        );
+
+        // Switch to Workspace target.
+        let ws_target = ScreencastTarget::Workspace { index: 1 };
+        assert_eq!(
+            client
+                .request(IpcRequest::SetScreencastTarget {
+                    target: ws_target.clone(),
+                })
+                .unwrap(),
+            IpcResult::Ok {
+                payload: IpcPayload::ScreencastTarget { target: ws_target }
+            }
+        );
+
+        // Valid preview request is accepted & queued; path traversal is rejected.
+        assert_eq!(
+            client
+                .request(IpcRequest::CaptureScreencastPreview {
+                    target: ScreencastTarget::Workspace { index: 1 },
+                    path: preview_ok_path,
+                    max_width: Some(320),
+                    max_height: Some(200),
+                })
+                .unwrap(),
+            IpcResult::Ok {
+                payload: IpcPayload::Ack
+            }
+        );
+        let bad = client
+            .request(IpcRequest::CaptureScreencastPreview {
+                target: ScreencastTarget::Output { name: None },
+                path: "/tmp/../etc/passwd.png".into(),
+                max_width: None,
+                max_height: None,
+            })
+            .unwrap();
+        assert!(matches!(bad, IpcResult::Err { .. }));
+
+        done_c.store(true, Ordering::SeqCst);
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !done.load(Ordering::SeqCst) && Instant::now() < deadline {
+        ipc_server.poll_requests(&mut state);
+        thread::sleep(Duration::from_millis(5));
+    }
+    client_thread.join().unwrap();
+
+    assert_eq!(
+        state.screencast_target,
+        ScreencastTarget::Workspace { index: 1 }
+    );
+    assert_eq!(state.pending_screencast_previews.len(), 1);
+}
+
+#[test]
+fn super_left_move_super_right_resize_and_maximize_respects_topbar() {
+    use std::sync::Mutex;
+    use neon_compositor::input::process_input_event;
+    use smithay::backend::input::{
+        ButtonState, Device, DeviceCapability, Event as InputEventTrait, InputBackend, InputEvent,
+        KeyState, KeyboardKeyEvent, PointerButtonEvent, PointerMotionEvent, UnusedEvent,
+    };
+
+    fn pump_display(display: &mut Display<NeonState>, state: &mut NeonState) {
+        display.dispatch_clients(state).unwrap();
+        display.flush_clients().unwrap();
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+    struct MockDev;
+    impl Device for MockDev {
+        fn id(&self) -> String {
+            "mock-super-grab".into()
+        }
+        fn name(&self) -> String {
+            "Mock Super Pointer".into()
+        }
+        fn has_capability(&self, _: DeviceCapability) -> bool {
+            true
+        }
+        fn usb_id(&self) -> Option<(u32, u32)> {
+            None
+        }
+        fn syspath(&self) -> Option<std::path::PathBuf> {
+            None
+        }
+    }
+    struct MockB;
+    struct MockKey {
+        code: u32,
+        state: KeyState,
+    }
+    impl InputEventTrait<MockB> for MockKey {
+        fn time(&self) -> u64 {
+            1000
+        }
+        fn device(&self) -> MockDev {
+            MockDev
+        }
+    }
+    impl KeyboardKeyEvent<MockB> for MockKey {
+        fn key_code(&self) -> smithay::backend::input::Keycode {
+            self.code.into()
+        }
+        fn state(&self) -> KeyState {
+            self.state
+        }
+        fn count(&self) -> u32 {
+            1
+        }
+    }
+    struct MockBtn {
+        button: u32,
+        state: ButtonState,
+    }
+    impl InputEventTrait<MockB> for MockBtn {
+        fn time(&self) -> u64 {
+            1100
+        }
+        fn device(&self) -> MockDev {
+            MockDev
+        }
+    }
+    impl PointerButtonEvent<MockB> for MockBtn {
+        fn button_code(&self) -> u32 {
+            self.button
+        }
+        fn state(&self) -> ButtonState {
+            self.state
+        }
+    }
+    struct MockMot {
+        dx: f64,
+        dy: f64,
+    }
+    impl InputEventTrait<MockB> for MockMot {
+        fn time(&self) -> u64 {
+            1200
+        }
+        fn device(&self) -> MockDev {
+            MockDev
+        }
+    }
+    impl PointerMotionEvent<MockB> for MockMot {
+        fn delta_x(&self) -> f64 {
+            self.dx
+        }
+        fn delta_y(&self) -> f64 {
+            self.dy
+        }
+        fn delta_x_unaccel(&self) -> f64 {
+            self.dx
+        }
+        fn delta_y_unaccel(&self) -> f64 {
+            self.dy
+        }
+    }
+    impl InputBackend for MockB {
+        type Device = MockDev;
+        type KeyboardKeyEvent = MockKey;
+        type PointerAxisEvent = UnusedEvent;
+        type PointerButtonEvent = MockBtn;
+        type PointerMotionEvent = MockMot;
+        type PointerMotionAbsoluteEvent = UnusedEvent;
+        type GestureSwipeBeginEvent = UnusedEvent;
+        type GestureSwipeUpdateEvent = UnusedEvent;
+        type GestureSwipeEndEvent = UnusedEvent;
+        type GesturePinchBeginEvent = UnusedEvent;
+        type GesturePinchUpdateEvent = UnusedEvent;
+        type GesturePinchEndEvent = UnusedEvent;
+        type GestureHoldBeginEvent = UnusedEvent;
+        type GestureHoldEndEvent = UnusedEvent;
+        type TouchDownEvent = UnusedEvent;
+        type TouchMotionEvent = UnusedEvent;
+        type TouchUpEvent = UnusedEvent;
+        type TouchCancelEvent = UnusedEvent;
+        type TouchFrameEvent = UnusedEvent;
+        type TabletToolAxisEvent = UnusedEvent;
+        type TabletToolProximityEvent = UnusedEvent;
+        type TabletToolTipEvent = UnusedEvent;
+        type TabletToolButtonEvent = UnusedEvent;
+        type SwitchToggleEvent = UnusedEvent;
+        type SpecialEvent = UnusedEvent;
+    }
+
+    let (_event_loop, mut display, mut state) = create_headless_server();
+    // Simulate a live 31px top bar with smart-hide OFF.
+    state.last_panel_height = 31;
+    state.config.panel.visible = true;
+    state.config.panel.smart_hide = false;
+
+    let (server_sock, client_sock) = UnixStream::pair().unwrap();
+    state.insert_client(server_sock);
+
+    let mapped = Arc::new(AtomicBool::new(false));
+    let mapped_c = Arc::clone(&mapped);
+    let allow_exit = Arc::new(AtomicBool::new(false));
+    let allow_exit_c = Arc::clone(&allow_exit);
+    let last_size = Arc::new(Mutex::new((0i32, 0i32)));
+    let last_size_c = Arc::clone(&last_size);
+
+    let client_handle = thread::spawn(move || {
+        let conn = Connection::from_socket(client_sock).unwrap();
+        let mut queue = conn.new_event_queue::<TestClientState>();
+        let qh = queue.handle();
+        let mut cstate = TestClientState::default();
+
+        let _registry = conn.display().get_registry(&qh, ());
+        queue.roundtrip(&mut cstate).unwrap();
+
+        let compositor = cstate.compositor.clone().unwrap();
+        let shm = cstate.shm.clone().unwrap();
+        let wm_base = cstate.wm_base.clone().unwrap();
+
+        let surface = compositor.create_surface(&qh, ());
+        let xdg_surface = wm_base.get_xdg_surface(&surface, &qh, ());
+        let toplevel = xdg_surface.get_toplevel(&qh, ());
+        toplevel.set_title("Resizable App".into());
+        surface.commit();
+        queue.roundtrip(&mut cstate).unwrap();
+
+        let (_f, pool, buffer) = create_shm_buffer(&shm, &qh, 400, 300);
+        surface.attach(Some(&buffer), 0, 0);
+        surface.commit();
+        queue.roundtrip(&mut cstate).unwrap();
+
+        mapped_c.store(true, Ordering::SeqCst);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !allow_exit_c.load(Ordering::SeqCst) && Instant::now() < deadline {
+            queue.roundtrip(&mut cstate).unwrap();
+            *last_size_c.lock().unwrap() = cstate.last_configure_size;
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        toplevel.destroy();
+        xdg_surface.destroy();
+        buffer.destroy();
+        pool.destroy();
+        surface.destroy();
+        conn.flush().unwrap();
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !mapped.load(Ordering::SeqCst) && Instant::now() < deadline {
+        pump_display(&mut display, &mut state);
+        thread::sleep(Duration::from_millis(5));
+    }
+    pump_display(&mut display, &mut state);
+
+    let wid = state.wm.all_window_ids()[0];
+
+    // 1. Maximize with panel smart-hide OFF must NOT go above the 31px top bar.
+    state.toggle_maximize_window(wid);
+    pump_display(&mut display, &mut state);
+    let max_rec = state.wm.get(wid).unwrap().clone();
+    assert!(max_rec.mode.is_maximized());
+    assert_eq!(max_rec.current_geometry.loc.y, 31);
+    assert_eq!(max_rec.current_geometry.size.h, 800 - 31);
+
+    // 2. Enabling panel smart-hide expands maximized window cleanly to y = 0; disabling restores y = 31.
+    state.config.panel.smart_hide = true;
+    state.relayout_non_floating_windows();
+    assert_eq!(state.wm.get(wid).unwrap().current_geometry.loc.y, 0);
+    state.config.panel.smart_hide = false;
+    state.relayout_non_floating_windows();
+    assert_eq!(state.wm.get(wid).unwrap().current_geometry.loc.y, 31);
+
+    // Unmaximize back to floating at (200, 150) for Super+Left move and Super+Right resize tests.
+    state.toggle_maximize_window(wid);
+    let win = state.find_window_by_id(wid).unwrap();
+    state.space.map_element(win.clone(), (200, 150), true);
+    state
+        .wm
+        .set_floating_location(wid, neon_window_manager::geometry::Point::new(200, 150));
+    pump_display(&mut display, &mut state);
+
+    // Position pointer inside the bottom-right quadrant of the 400x300 window at (500, 380).
+    state.pointer_location = (500.0, 380.0).into();
+
+    // Hold Super_L (XKB keycode 133 = evdev 125 + 8).
+    process_input_event::<MockB>(
+        &mut state,
+        InputEvent::Keyboard {
+            event: MockKey {
+                code: 133,
+                state: KeyState::Pressed,
+            },
+        },
+    );
+
+    // 3. Super + Left-Click + Drag moves the window and clamps top edge >= 31px.
+    process_input_event::<MockB>(
+        &mut state,
+        InputEvent::PointerButton {
+            event: MockBtn {
+                button: 0x110,
+                state: ButtonState::Pressed,
+            },
+        },
+    );
+    process_input_event::<MockB>(
+        &mut state,
+        InputEvent::PointerMotion {
+            event: MockMot {
+                dx: 80.0,
+                dy: -250.0, // tries to push y = 150 - 250 = -100 above top bar
+            },
+        },
+    );
+    process_input_event::<MockB>(
+        &mut state,
+        InputEvent::PointerButton {
+            event: MockBtn {
+                button: 0x110,
+                state: ButtonState::Released,
+            },
+        },
+    );
+    let moved_loc = state.space.element_location(&win).unwrap();
+    assert_eq!(moved_loc.x, 280);
+    assert_eq!(moved_loc.y, 31, "Super+Left drag must stay below top bar when autohide is off");
+
+    // 4. Super + Right-Click + Drag resizes the window cleanly from bottom-right quadrant.
+    state.pointer_location = (moved_loc.x as f64 + 320.0, moved_loc.y as f64 + 240.0).into();
+    process_input_event::<MockB>(
+        &mut state,
+        InputEvent::PointerButton {
+            event: MockBtn {
+                button: 0x111,
+                state: ButtonState::Pressed,
+            },
+        },
+    );
+    process_input_event::<MockB>(
+        &mut state,
+        InputEvent::PointerMotion {
+            event: MockMot {
+                dx: 120.0,
+                dy: 90.0,
+            },
+        },
+    );
+    process_input_event::<MockB>(
+        &mut state,
+        InputEvent::PointerButton {
+            event: MockBtn {
+                button: 0x111,
+                state: ButtonState::Released,
+            },
+        },
+    );
+    for _ in 0..8 {
+        pump_display(&mut display, &mut state);
+        thread::sleep(Duration::from_millis(10));
+    }
+    let configured = *last_size.lock().unwrap();
+    assert_eq!(
+        configured,
+        (520, 390),
+        "Super+Right drag must resize window from 400x300 by (+120,+90)"
+    );
+
+    allow_exit.store(true, Ordering::SeqCst);
+    let end_deadline = Instant::now() + Duration::from_secs(2);
+    while !client_handle.is_finished() && Instant::now() < end_deadline {
+        pump_display(&mut display, &mut state);
+        thread::sleep(Duration::from_millis(5));
+    }
+    client_handle.join().unwrap();
 }

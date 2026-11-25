@@ -3,7 +3,7 @@
 mod compositor;
 mod layer_shell;
 pub mod screencopy;
-mod seat;
+pub mod seat;
 pub mod session_lock;
 mod xdg_shell;
 pub mod xwayland;

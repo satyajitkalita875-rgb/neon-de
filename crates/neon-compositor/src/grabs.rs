@@ -4,21 +4,20 @@ use bitflags::bitflags;
 use smithay::{
     desktop::Window,
     input::pointer::{
-        AxisFrame, ButtonEvent, GestureHoldBeginEvent, GestureHoldEndEvent, GesturePinchBeginEvent,
-        GesturePinchEndEvent, GesturePinchUpdateEvent, GestureSwipeBeginEvent,
-        GestureSwipeEndEvent, GestureSwipeUpdateEvent, GrabStartData as PointerGrabStartData,
-        MotionEvent, PointerGrab, PointerInnerHandle, RelativeMotionEvent,
+        AxisFrame, ButtonEvent, CursorIcon, CursorImageStatus, GestureHoldBeginEvent,
+        GestureHoldEndEvent, GesturePinchBeginEvent, GesturePinchEndEvent,
+        GesturePinchUpdateEvent, GestureSwipeBeginEvent, GestureSwipeEndEvent,
+        GestureSwipeUpdateEvent, GrabStartData as PointerGrabStartData, MotionEvent, PointerGrab,
+        PointerInnerHandle, RelativeMotionEvent,
     },
-    reexports::{
-        wayland_protocols::xdg::shell::server::xdg_toplevel,
-        wayland_server::protocol::wl_surface::WlSurface,
-    },
+    reexports::wayland_protocols::xdg::shell::server::xdg_toplevel,
     utils::{Logical, Point, Rectangle, Size},
 };
 
 use crate::{
     state::NeonState,
-    window::{to_wm_point, window_id},
+    wayland::seat::FocusTarget,
+    window::{to_wm_point, to_wm_size, window_id},
 };
 
 /// Interactive floating window move grab.
@@ -33,25 +32,36 @@ impl PointerGrab<NeonState> for MoveSurfaceGrab {
         &mut self,
         data: &mut NeonState,
         handle: &mut PointerInnerHandle<'_, NeonState>,
-        _focus: Option<(WlSurface, Point<f64, Logical>)>,
+        _focus: Option<(FocusTarget, Point<f64, Logical>)>,
         event: &MotionEvent,
     ) {
         handle.motion(data, None, event);
 
         let delta = event.location - self.start_data.location;
         let new_location = self.initial_window_location.to_f64() + delta;
-        let rounded: Point<i32, Logical> = new_location.to_i32_round();
-        data.space.map_element(self.window.clone(), rounded, true);
+        let mut rounded: Point<i32, Logical> = new_location.to_i32_round();
+        // Prevent dragging a window's top edge above/under the Top Bar when Top Bar auto-hide is off.
         if let Some(id) = window_id(&self.window) {
+            let min_y = data.effective_work_area_for(id).loc.y;
+            if rounded.y < min_y {
+                rounded.y = min_y;
+            }
             data.wm.set_floating_location(id, to_wm_point(rounded));
         }
+        data.space.map_element(self.window.clone(), rounded, true);
+        if let Some(x11) = self.window.x11_surface() {
+            let mut geo = x11.geometry();
+            geo.loc = rounded;
+            let _ = x11.configure(geo);
+        }
+        data.needs_redraw = true;
     }
 
     fn relative_motion(
         &mut self,
         data: &mut NeonState,
         handle: &mut PointerInnerHandle<'_, NeonState>,
-        focus: Option<(WlSurface, Point<f64, Logical>)>,
+        focus: Option<(FocusTarget, Point<f64, Logical>)>,
         event: &RelativeMotionEvent,
     ) {
         handle.relative_motion(data, focus, event);
@@ -65,8 +75,7 @@ impl PointerGrab<NeonState> for MoveSurfaceGrab {
     ) {
         handle.button(data, event);
 
-        const BTN_LEFT: u32 = 0x110;
-        if !handle.current_pressed().contains(&BTN_LEFT) {
+        if !handle.current_pressed().contains(&self.start_data.button) {
             handle.unset_grab(self, data, event.serial, event.time, true);
         }
     }
@@ -160,7 +169,10 @@ impl PointerGrab<NeonState> for MoveSurfaceGrab {
         &self.start_data
     }
 
-    fn unset(&mut self, _data: &mut NeonState) {}
+    fn unset(&mut self, data: &mut NeonState) {
+        data.cursor_status = CursorImageStatus::Named(CursorIcon::Default);
+        data.needs_redraw = true;
+    }
 }
 
 bitflags! {
@@ -225,7 +237,7 @@ impl PointerGrab<NeonState> for ResizeSurfaceGrab {
         &mut self,
         data: &mut NeonState,
         handle: &mut PointerInnerHandle<'_, NeonState>,
-        _focus: Option<(WlSurface, Point<f64, Logical>)>,
+        _focus: Option<(FocusTarget, Point<f64, Logical>)>,
         event: &MotionEvent,
     ) {
         handle.motion(data, None, event);
@@ -248,6 +260,14 @@ impl PointerGrab<NeonState> for ResizeSurfaceGrab {
         } else if self.edges.contains(ResizeEdge::TOP) {
             new_h = (self.initial_rect.size.h as f64 - delta.y) as i32;
             new_y = self.initial_rect.loc.y + (self.initial_rect.size.h - new_h.max(100));
+            if let Some(id) = window_id(&self.window) {
+                let min_y = data.effective_work_area_for(id).loc.y;
+                if new_y < min_y {
+                    let clamp_delta = min_y - new_y;
+                    new_y = min_y;
+                    new_h -= clamp_delta;
+                }
+            }
         }
 
         let clamped_size: Size<i32, Logical> = (new_w.max(160), new_h.max(100)).into();
@@ -268,14 +288,25 @@ impl PointerGrab<NeonState> for ResizeSurfaceGrab {
                 state.size = Some(clamped_size);
             });
             toplevel.send_pending_configure();
+        } else if let Some(x11) = self.window.x11_surface() {
+            let target_rect = Rectangle::new((new_x, new_y).into(), clamped_size);
+            let _ = x11.configure(target_rect);
+            if let Some(id) = window_id(&self.window) {
+                let work_area = data.work_area();
+                data.wm
+                    .update_committed_size(id, to_wm_size(clamped_size), work_area);
+                data.wm
+                    .set_floating_location(id, to_wm_point((new_x, new_y).into()));
+            }
         }
+        data.needs_redraw = true;
     }
 
     fn relative_motion(
         &mut self,
         data: &mut NeonState,
         handle: &mut PointerInnerHandle<'_, NeonState>,
-        focus: Option<(WlSurface, Point<f64, Logical>)>,
+        focus: Option<(FocusTarget, Point<f64, Logical>)>,
         event: &RelativeMotionEvent,
     ) {
         handle.relative_motion(data, focus, event);
@@ -390,5 +421,8 @@ impl PointerGrab<NeonState> for ResizeSurfaceGrab {
         &self.start_data
     }
 
-    fn unset(&mut self, _data: &mut NeonState) {}
+    fn unset(&mut self, data: &mut NeonState) {
+        data.cursor_status = CursorImageStatus::Named(CursorIcon::Default);
+        data.needs_redraw = true;
+    }
 }

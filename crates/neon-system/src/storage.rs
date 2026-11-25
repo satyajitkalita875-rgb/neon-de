@@ -38,20 +38,20 @@ pub struct StorageAndDevicesSnapshot {
     pub scanners: Vec<String>,
 }
 
-/// Queries live mounted storage devices, removable media, CUPS printers, and scanners.
+/// Queries live mounted storage devices, removable media, and CUPS printers without blocking
+/// on slow USB/mDNS SANE scanner probing (`scanimage -L`).
 pub fn query_storage_and_devices() -> StorageAndDevicesSnapshot {
     let udisks_available = which_exists("udisksctl");
     let devices = query_block_devices();
     let (cups_available, printers) = query_printers();
-    let (sane_available, scanners) = query_scanners();
 
     StorageAndDevicesSnapshot {
         udisks_available,
         devices,
         cups_available,
         printers,
-        sane_available,
-        scanners,
+        sane_available: false,
+        scanners: Vec::new(),
     }
 }
 
@@ -284,23 +284,6 @@ fn query_printers() -> (bool, Vec<PrinterInfo>) {
         }
     }
     (true, printers)
-}
-
-fn query_scanners() -> (bool, Vec<String>) {
-    if !which_exists("scanimage") {
-        return (false, Vec::new());
-    }
-    let Ok(out) = Command::new("scanimage").arg("-L").output() else {
-        return (true, Vec::new());
-    };
-    let mut list = Vec::new();
-    for line in String::from_utf8_lossy(&out.stdout).lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with("device ") {
-            list.push(trimmed.to_string());
-        }
-    }
-    (true, list)
 }
 
 fn which_exists(bin: &str) -> bool {

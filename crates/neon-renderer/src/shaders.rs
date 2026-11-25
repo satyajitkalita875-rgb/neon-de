@@ -4,7 +4,7 @@
 //! `GL_ONE, GL_ONE_MINUS_SRC_ALPHA` blend pipeline.
 
 use smithay::backend::renderer::gles::{
-    GlesError, GlesPixelProgram, GlesRenderer, UniformName, UniformType,
+    GlesError, GlesPixelProgram, GlesRenderer, GlesTexProgram, UniformName, UniformType,
 };
 
 /// Analytical SDF soft drop-shadow shader for floating windows.
@@ -292,6 +292,147 @@ void main() {
 }
 "#;
 
+/// Custom GLES texture shader that clips floating client window surfaces cleanly to
+/// anti-aliased rounded corners (supporting `NO_ALPHA`, `EXTERNAL` DMA-BUF, `DEBUG_FLAGS`,
+/// arbitrary buffer transforms, viewporter crops, subsurfaces, and CSD shadow margins).
+pub const ROUNDED_WINDOW_FRAGMENT_SHADER: &str = r#"
+#version 100
+
+//_DEFINES_
+
+#if defined(EXTERNAL)
+#extension GL_OES_EGL_image_external : require
+#endif
+
+#ifdef GL_FRAGMENT_PRECISION_HIGH
+precision highp float;
+#else
+precision mediump float;
+#endif
+
+#if defined(EXTERNAL)
+uniform samplerExternalOES tex;
+#else
+uniform sampler2D tex;
+#endif
+
+uniform float alpha;
+varying vec2 v_coords;
+
+#if defined(DEBUG_FLAGS)
+uniform float tint;
+#endif
+
+uniform vec2 u_uv0;
+uniform vec4 u_inv_mat;
+uniform vec2 u_dst_offset;
+uniform vec2 u_win_size;
+uniform vec2 u_radii;
+
+void main() {
+    vec4 color = texture2D(tex, v_coords);
+
+#if defined(NO_ALPHA)
+    color = vec4(color.rgb, 1.0) * alpha;
+#else
+    color = color * alpha;
+#endif
+
+    vec2 d_uv = v_coords - u_uv0;
+    vec2 win_pos = u_dst_offset + vec2(dot(u_inv_mat.xy, d_uv), dot(u_inv_mat.zw, d_uv));
+
+    vec2 half_size = u_win_size * 0.5;
+    float r = (win_pos.y < half_size.y) ? u_radii.x : u_radii.y;
+    r = min(r, min(half_size.x, half_size.y));
+
+    vec2 rel = abs(win_pos - half_size);
+    float mask = 1.0;
+
+    if (rel.x > half_size.x || rel.y > half_size.y) {
+        float d_box = length(max(rel - half_size, vec2(0.0)));
+        mask = 1.0 - smoothstep(0.0, 1.0, d_box);
+    }
+
+    if (r > 0.5) {
+        vec2 corner_vec = rel - (half_size - vec2(r));
+        if (corner_vec.x > 0.0 && corner_vec.y > 0.0) {
+            float d_corner = length(corner_vec) - r;
+            mask = min(mask, 1.0 - smoothstep(-0.75, 0.75, d_corner));
+        }
+    }
+
+    color *= mask;
+
+#if defined(DEBUG_FLAGS)
+    if (tint == 1.0)
+        color = vec4(0.0, 0.2, 0.0, 0.2) + color * 0.8;
+#endif
+
+    gl_FragColor = color;
+}
+"#;
+
+/// 9-tap hardware-bilinear separable Gaussian blur texture shader used for real-time frosted
+/// backdrops behind Quick Settings and the fullscreen Power Menu.
+pub const BLUR_PASS_FRAGMENT_SHADER: &str = r#"
+#version 100
+
+//_DEFINES_
+
+#if defined(EXTERNAL)
+#extension GL_OES_EGL_image_external : require
+#endif
+
+#ifdef GL_FRAGMENT_PRECISION_HIGH
+precision highp float;
+#else
+precision mediump float;
+#endif
+
+#if defined(EXTERNAL)
+uniform samplerExternalOES tex;
+#else
+uniform sampler2D tex;
+#endif
+
+uniform float alpha;
+varying vec2 v_coords;
+
+#if defined(DEBUG_FLAGS)
+uniform float tint;
+#endif
+
+uniform vec2 u_step;
+uniform vec4 u_uv_bounds;
+
+void main() {
+    vec2 lo = u_uv_bounds.xy;
+    vec2 hi = u_uv_bounds.zw;
+    vec4 sum = texture2D(tex, clamp(v_coords, lo, hi)) * 0.16;
+    sum += texture2D(tex, clamp(v_coords + u_step * 1.4, lo, hi)) * 0.15;
+    sum += texture2D(tex, clamp(v_coords - u_step * 1.4, lo, hi)) * 0.15;
+    sum += texture2D(tex, clamp(v_coords + u_step * 3.2, lo, hi)) * 0.12;
+    sum += texture2D(tex, clamp(v_coords - u_step * 3.2, lo, hi)) * 0.12;
+    sum += texture2D(tex, clamp(v_coords + u_step * 5.1, lo, hi)) * 0.09;
+    sum += texture2D(tex, clamp(v_coords - u_step * 5.1, lo, hi)) * 0.09;
+    sum += texture2D(tex, clamp(v_coords + u_step * 7.0, lo, hi)) * 0.06;
+    sum += texture2D(tex, clamp(v_coords - u_step * 7.0, lo, hi)) * 0.06;
+
+#if defined(NO_ALPHA)
+    vec4 color = vec4(sum.rgb, 1.0) * alpha;
+#else
+    vec4 color = sum * alpha;
+#endif
+
+#if defined(DEBUG_FLAGS)
+    if (tint == 1.0)
+        color = vec4(0.0, 0.2, 0.0, 0.2) + color * 0.8;
+#endif
+
+    gl_FragColor = color;
+}
+"#;
+
 /// Compiled NEON DE custom shader suite cached for the lifetime of a `GlesRenderer`.
 #[derive(Debug, Clone)]
 pub struct NeonShaders {
@@ -300,6 +441,8 @@ pub struct NeonShaders {
     pub backdrop: GlesPixelProgram,
     pub frosted_glass: GlesPixelProgram,
     pub titlebar: GlesPixelProgram,
+    pub rounded_window: GlesTexProgram,
+    pub blur_pass: GlesTexProgram,
 }
 
 impl NeonShaders {
@@ -358,12 +501,33 @@ impl NeonShaders {
             ],
         )?;
 
+        let rounded_window = renderer.compile_custom_texture_shader(
+            ROUNDED_WINDOW_FRAGMENT_SHADER,
+            &[
+                UniformName::new("u_uv0", UniformType::_2f),
+                UniformName::new("u_inv_mat", UniformType::_4f),
+                UniformName::new("u_dst_offset", UniformType::_2f),
+                UniformName::new("u_win_size", UniformType::_2f),
+                UniformName::new("u_radii", UniformType::_2f),
+            ],
+        )?;
+
+        let blur_pass = renderer.compile_custom_texture_shader(
+            BLUR_PASS_FRAGMENT_SHADER,
+            &[
+                UniformName::new("u_step", UniformType::_2f),
+                UniformName::new("u_uv_bounds", UniformType::_4f),
+            ],
+        )?;
+
         Ok(Self {
             shadow,
             border,
             backdrop,
             frosted_glass,
             titlebar,
+            rounded_window,
+            blur_pass,
         })
     }
 }

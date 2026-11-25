@@ -51,11 +51,14 @@ impl Rect {
         }
     }
 
-    /// Centers a window of `child_size` inside `self`, clamped so top-left never escapes `self`.
+    /// Returns the geometric top-left origin that centers a rectangle of `child_size` on `self`.
+    ///
+    /// Does not clamp inside `self` so centering a larger window over a smaller anchor rect
+    /// remains truly centered; callers should clamp the result against the output `work_area`.
     pub fn center_size(self, child_size: Size) -> Point {
         let cx = self.loc.x + (self.size.w - child_size.w) / 2;
         let cy = self.loc.y + (self.size.h - child_size.h) / 2;
-        self.clamp_origin(Point::new(cx, cy), child_size)
+        Point::new(cx, cy)
     }
 
     /// Clamps a window's origin so that it stays reasonably visible inside `self`.
