@@ -437,7 +437,7 @@ pub fn build_page(ctrl: Rc<SettingsController>) -> ScrolledWindow {
             ),
             dropdown_row(
                 "Window Buttons",
-                "Titlebar button placement for GTK applications.",
+                "Place close, minimize, and maximize buttons on the left or right across all apps.",
                 &["Left (macOS)", "Right (Standard)"],
                 btn_layout_idx,
                 {
@@ -450,7 +450,9 @@ pub fn build_page(ctrl: Rc<SettingsController>) -> ScrolledWindow {
                         };
                         ctrl_c.config.borrow_mut().windows.button_layout = layout;
                         apply_window_button_layout(layout);
-                        ctrl_c.persist_and_sync(None, "Updated window button layout");
+                        ctrl_c.notify_button_layout_changed(layout);
+                        let req = build_window_behavior_request(&ctrl_c.config.borrow());
+                        ctrl_c.persist_and_sync(Some(req), "Updated window button layout");
                     }
                 },
             ),

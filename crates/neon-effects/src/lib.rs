@@ -467,7 +467,19 @@ impl EffectsManager {
 
     /// Hyprland `popout` × Material 3 Expressive close animation. Returns its duration.
     pub fn animate_window_close(&mut self, id: WindowId, now: Duration) -> Duration {
-        let dur = self.scaled_duration(185);
+        self.animate_window_close_toward(id, 0.0, 24.0, now)
+    }
+
+    /// Hyprland `popout` × Material 3 Expressive close animation drifting subtly by
+    /// `(delta_x, delta_y)` (for example slightly toward the window's Dock icon).
+    pub fn animate_window_close_toward(
+        &mut self,
+        id: WindowId,
+        delta_x: f64,
+        delta_y: f64,
+        now: Duration,
+    ) -> Duration {
+        let dur = self.scaled_duration(220);
         let entry = self.window_anims.entry(id).or_default();
         if dur.is_zero() {
             return Duration::ZERO;
@@ -475,6 +487,7 @@ impl EffectsManager {
         let cur_op = entry.opacity.as_ref().map(|a| a.sample(now)).unwrap_or(1.0);
         let cur_sx = entry.scale_x.as_ref().map(|a| a.sample(now)).unwrap_or(1.0);
         let cur_sy = entry.scale_y.as_ref().map(|a| a.sample(now)).unwrap_or(1.0);
+        let cur_ox = entry.offset_x.as_ref().map(|a| a.sample(now)).unwrap_or(0.0);
         let cur_oy = entry.offset_y.as_ref().map(|a| a.sample(now)).unwrap_or(0.0);
 
         entry.opacity = Some(Animation::new(
@@ -486,21 +499,28 @@ impl EffectsManager {
         ));
         entry.scale_x = Some(Animation::new(
             cur_sx,
-            0.84,
+            0.78,
             now,
             dur,
             Easing::M3_EXPRESSIVE_FAST_EFFECTS,
         ));
         entry.scale_y = Some(Animation::new(
             cur_sy,
-            0.84,
+            0.78,
+            now,
+            dur,
+            Easing::M3_EXPRESSIVE_FAST_EFFECTS,
+        ));
+        entry.offset_x = Some(Animation::new(
+            cur_ox,
+            cur_ox + delta_x,
             now,
             dur,
             Easing::M3_EXPRESSIVE_FAST_EFFECTS,
         ));
         entry.offset_y = Some(Animation::new(
             cur_oy,
-            cur_oy + 20.0,
+            cur_oy + delta_y,
             now,
             dur,
             Easing::M3_EXPRESSIVE_FAST_EFFECTS,
@@ -564,7 +584,7 @@ impl EffectsManager {
         target_dy: f64,
         now: Duration,
     ) -> Duration {
-        let dur = self.scaled_duration(240);
+        let dur = self.scaled_duration(270);
         let entry = self.window_anims.entry(id).or_default();
         if dur.is_zero() {
             return Duration::ZERO;
@@ -584,8 +604,8 @@ impl EffectsManager {
         ));
         entry.offset_x = Some(Animation::new(cur_ox, target_dx, now, dur, Easing::NEON_STANDARD));
         entry.offset_y = Some(Animation::new(cur_oy, target_dy, now, dur, Easing::NEON_STANDARD));
-        entry.scale_x = Some(Animation::new(cur_sx, 0.22, now, dur, Easing::NEON_STANDARD));
-        entry.scale_y = Some(Animation::new(cur_sy, 0.22, now, dur, Easing::NEON_STANDARD));
+        entry.scale_x = Some(Animation::new(cur_sx, 0.15, now, dur, Easing::NEON_STANDARD));
+        entry.scale_y = Some(Animation::new(cur_sy, 0.15, now, dur, Easing::NEON_STANDARD));
         dur
     }
 
@@ -597,8 +617,8 @@ impl EffectsManager {
         from_dy: f64,
         now: Duration,
     ) {
-        let spatial_dur = self.scaled_duration(380);
-        let fade_dur = self.scaled_duration(200);
+        let spatial_dur = self.scaled_duration(360);
+        let fade_dur = self.scaled_duration(190);
         let entry = self.window_anims.entry(id).or_default();
         if spatial_dur.is_zero() {
             entry.opacity = None;
@@ -630,14 +650,14 @@ impl EffectsManager {
             Easing::M3_EXPRESSIVE_DEFAULT_SPATIAL,
         ));
         entry.scale_x = Some(Animation::new(
-            0.28,
+            0.18,
             1.0,
             now,
             spatial_dur,
             Easing::M3_EXPRESSIVE_DEFAULT_SPATIAL,
         ));
         entry.scale_y = Some(Animation::new(
-            0.28,
+            0.18,
             1.0,
             now,
             spatial_dur,

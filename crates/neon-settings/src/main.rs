@@ -16,7 +16,7 @@ use gtk4::{
     ListBox, ListBoxRow, Orientation, PolicyType, ScrolledWindow, SearchEntry, SelectionMode,
     Separator, Stack, StackTransitionType, WindowHandle, gdk, glib, prelude::*,
 };
-use neon_config::{default_config_path, load_or_default};
+use neon_config::{WindowButtonLayout, default_config_path, load_or_default};
 use neon_ipc::default_socket_path;
 
 use crate::{
@@ -61,6 +61,57 @@ fn build_nav_badge(icon_name: &str, badge_class: &str) -> GtkBox {
     icon.set_margin_end(4);
     badge.append(&icon);
     badge
+}
+
+fn build_window_controls(window: &ApplicationWindow, right_order: bool) -> GtkBox {
+    let row = GtkBox::new(Orientation::Horizontal, 8);
+    row.set_valign(Align::Center);
+
+    let close_btn = Button::new();
+    close_btn.add_css_class("mac-dot");
+    close_btn.add_css_class("mac-dot-close");
+    close_btn.set_tooltip_text(Some("Close"));
+    {
+        let win = window.clone();
+        close_btn.connect_clicked(move |_| win.close());
+    }
+
+    let min_btn = Button::new();
+    min_btn.add_css_class("mac-dot");
+    min_btn.add_css_class("mac-dot-min");
+    min_btn.set_tooltip_text(Some("Minimize"));
+    {
+        let win = window.clone();
+        min_btn.connect_clicked(move |_| win.minimize());
+    }
+
+    let max_btn = Button::new();
+    max_btn.add_css_class("mac-dot");
+    max_btn.add_css_class("mac-dot-max");
+    max_btn.set_tooltip_text(Some("Maximize"));
+    {
+        let win = window.clone();
+        max_btn.connect_clicked(move |_| {
+            if win.is_maximized() {
+                win.unmaximize();
+            } else {
+                win.maximize();
+            }
+        });
+    }
+
+    if right_order {
+        row.add_css_class("settings-right-controls");
+        row.append(&min_btn);
+        row.append(&max_btn);
+        row.append(&close_btn);
+    } else {
+        row.add_css_class("settings-sidebar-top");
+        row.append(&close_btn);
+        row.append(&min_btn);
+        row.append(&max_btn);
+    }
+    row
 }
 
 fn main() {
@@ -146,49 +197,16 @@ fn main() {
         // Explicitly stop hexpand propagation from row labels so the sidebar never steals width.
         sidebar.set_hexpand(false);
 
-        // Draggable sidebar top with crisp macOS traffic lights
+        // Draggable sidebar top with macOS traffic lights (shown when Left layout is active)
         let sidebar_handle = WindowHandle::new();
-        let traffic_row = GtkBox::new(Orientation::Horizontal, 8);
-        traffic_row.add_css_class("settings-sidebar-top");
-        traffic_row.set_valign(Align::Center);
-
-        let close_btn = Button::new();
-        close_btn.add_css_class("mac-dot");
-        close_btn.add_css_class("mac-dot-close");
-        close_btn.set_tooltip_text(Some("Close"));
-        {
-            let win = window.clone();
-            close_btn.connect_clicked(move |_| win.close());
-        }
-
-        let min_btn = Button::new();
-        min_btn.add_css_class("mac-dot");
-        min_btn.add_css_class("mac-dot-min");
-        min_btn.set_tooltip_text(Some("Minimize"));
-        {
-            let win = window.clone();
-            min_btn.connect_clicked(move |_| win.minimize());
-        }
-
-        let max_btn = Button::new();
-        max_btn.add_css_class("mac-dot");
-        max_btn.add_css_class("mac-dot-max");
-        max_btn.set_tooltip_text(Some("Zoom"));
-        {
-            let win = window.clone();
-            max_btn.connect_clicked(move |_| {
-                if win.is_maximized() {
-                    win.unmaximize();
-                } else {
-                    win.maximize();
-                }
-            });
-        }
-
-        traffic_row.append(&close_btn);
-        traffic_row.append(&min_btn);
-        traffic_row.append(&max_btn);
-        sidebar_handle.set_child(Some(&traffic_row));
+        let sidebar_top_box = GtkBox::new(Orientation::Horizontal, 0);
+        sidebar_top_box.set_valign(Align::Center);
+        let left_controls = build_window_controls(&window, false);
+        let sidebar_top_spacer = GtkBox::new(Orientation::Horizontal, 0);
+        sidebar_top_spacer.add_css_class("settings-sidebar-top-spacer");
+        sidebar_top_box.append(&left_controls);
+        sidebar_top_box.append(&sidebar_top_spacer);
+        sidebar_handle.set_child(Some(&sidebar_top_box));
         sidebar.append(&sidebar_handle);
 
         // Compact macOS Search Field directly under traffic lights
@@ -297,11 +315,28 @@ fn main() {
         page_title_label.set_halign(Align::Start);
         page_title_label.set_hexpand(true);
 
+        let right_controls = build_window_controls(&window, true);
+
         content_header.append(&back_btn);
         content_header.append(&fwd_btn);
         content_header.append(&page_title_label);
+        content_header.append(&right_controls);
         content_handle.set_child(Some(&content_header));
         content_pane.append(&content_handle);
+
+        let apply_header_button_layout = {
+            let left_c = left_controls.clone();
+            let spacer_c = sidebar_top_spacer.clone();
+            let right_c = right_controls.clone();
+            Rc::new(move |layout: WindowButtonLayout| {
+                let is_right = layout == WindowButtonLayout::RightStandard;
+                left_c.set_visible(!is_right);
+                spacer_c.set_visible(is_right);
+                right_c.set_visible(is_right);
+            })
+        };
+        apply_header_button_layout(ctrl.config.borrow().windows.button_layout);
+        *ctrl.button_layout_cb.borrow_mut() = Some(apply_header_button_layout);
 
         let stack = Stack::new();
         stack.set_transition_type(StackTransitionType::Crossfade);

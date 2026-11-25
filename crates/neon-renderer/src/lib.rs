@@ -5,6 +5,7 @@
 //! NEON DE ambient backdrop) so idle frames generate zero spurious damage.
 
 pub mod backdrop_blur;
+pub mod close_ghost;
 pub mod cursor;
 pub mod rounded;
 pub mod screenshot;
@@ -50,10 +51,13 @@ use crate::{
     backdrop_blur::{
         BlurTargets, BlurredBackdropElement, CHROME_BLUR_CACHE_TTL, OVERLAY_BLUR_CACHE_TTL,
     },
+    close_ghost::{ClosingGhost, ClosingGhostElement},
     cursor::CursorCache,
     rounded::RoundedSurfaceElement,
     shaders::NeonShaders,
 };
+
+pub use crate::close_ghost::PendingCloseGhost;
 
 /// Fallback clear color (`#0C0F17`) used if shaders are unavailable.
 pub const FALLBACK_CLEAR_COLOR: Color32F = Color32F::new(0.047, 0.059, 0.090, 1.0);
@@ -167,6 +171,7 @@ render_elements! {
     RoundedWayland=RoundedSurfaceElement,
     RescaledRoundedWayland=RescaleRenderElement<RoundedSurfaceElement>,
     BlurredBackdrop=BlurredBackdropElement,
+    ClosingGhost=ClosingGhostElement,
     Memory=MemoryRenderBufferRenderElement<GlesRenderer>,
     Shader=PixelShaderElement,
     Solid=SolidColorRenderElement,
@@ -247,6 +252,7 @@ pub struct NeonRenderer {
     last_blur_tex_commit: CommitCounter,
     chrome_blur_commit: CommitCounter,
     last_chrome_blur_tex_commit: CommitCounter,
+    closing_ghosts: Vec<ClosingGhost>,
     pub(crate) screencopy_offscreen: Option<(Size<i32, BufferCoord>, GlesTexture)>,
 }
 
@@ -292,6 +298,7 @@ impl NeonRenderer {
             last_blur_tex_commit: CommitCounter::default(),
             chrome_blur_commit: CommitCounter::default(),
             last_chrome_blur_tex_commit: CommitCounter::default(),
+            closing_ghosts: Vec::new(),
             screencopy_offscreen: None,
         }
     }
@@ -325,13 +332,43 @@ impl NeonRenderer {
         self.overlay_anims.insert(namespace.to_string(), anim);
     }
 
-    /// Returns `true` while any shell overlay open/close GPU animation is still in progress
-    /// so the compositor schedules continuous VBlank-locked frames until settled.
+    /// Captures offscreen GPU textures for newly closed windows so client-initiated closes
+    /// (clicking an app's own `×` button or `Ctrl+Q`) play a smooth pop-out fade animation.
+    pub fn ingest_close_ghosts(
+        &mut self,
+        renderer: &mut GlesRenderer,
+        output: &Output,
+        pending: &[PendingCloseGhost],
+    ) {
+        if pending.is_empty() {
+            return;
+        }
+        let fallback_desktop = self
+            .chrome_blur_targets
+            .full_texture()
+            .or_else(|| self.blur_targets.full_texture());
+        for ghost in pending {
+            if let Some(captured) =
+                ClosingGhost::capture(renderer, output, ghost, fallback_desktop.clone())
+            {
+                self.closing_ghosts.push(captured);
+            }
+        }
+        // Cap concurrent ghosts to keep VRAM bounded during rapid batch closes.
+        if self.closing_ghosts.len() > 8 {
+            let drain = self.closing_ghosts.len() - 8;
+            self.closing_ghosts.drain(..drain);
+        }
+    }
+
+    /// Returns `true` while any shell overlay open/close GPU animation or closing-window ghost
+    /// is still in progress so the compositor schedules continuous VBlank-locked frames until settled.
     pub fn has_active_overlay_animation(&self) -> bool {
-        self.overlay_anims.iter().any(|(ns, &anim)| {
-            let (_, _, _, _, active) = Self::eval_overlay_anim(ns, Some(anim));
-            active
-        })
+        self.closing_ghosts.iter().any(|g| !g.is_finished())
+            || self.overlay_anims.iter().any(|(ns, &anim)| {
+                let (_, _, _, _, active) = Self::eval_overlay_anim(ns, Some(anim));
+                active
+            })
     }
 
     /// Evaluates `(offset_x_logical, offset_y_logical, scale, alpha, is_animating)` for a shell overlay.
@@ -767,6 +804,15 @@ impl NeonRenderer {
                 WaylandSurfaceRenderElement<GlesRenderer>,
             >(or_win, renderer, phys_loc, scale, 1.0);
             elements.extend(popup_elements.into_iter().map(NeonRenderElement::from));
+        }
+
+        // Emit active GPU closing-window ghosts above regular windows (and below Top Bar & Dock).
+        self.closing_ghosts.retain(|g| !g.is_finished());
+        let ghost_rounded_prog = self.shaders.as_ref().map(|s| s.rounded_window.clone());
+        for ghost in self.closing_ghosts.iter_mut().rev() {
+            if let Some(elem) = ghost.build_element(ghost_rounded_prog.clone()) {
+                elements.push(NeonRenderElement::from(elem));
+            }
         }
 
         let output_logical_size = output
@@ -1572,6 +1618,10 @@ impl NeonRenderer {
                 Uniform::new(
                     "u_hover_controls",
                     if style.hover_controls { 1.0_f32 } else { 0.0_f32 },
+                ),
+                Uniform::new(
+                    "u_buttons_right",
+                    if style.buttons_right { 1.0_f32 } else { 0.0_f32 },
                 ),
                 Uniform::new("u_opacity", opacity),
             ]

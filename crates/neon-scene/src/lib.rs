@@ -44,6 +44,8 @@ pub struct TitlebarStyle {
     pub light_theme: bool,
     /// `true` when the pointer hovers over the traffic-light button cluster (reveals ×, −, + glyphs).
     pub hover_controls: bool,
+    /// `false` = Left (macOS: Close, Minimize, Maximize); `true` = Right (Standard: Minimize, Maximize, Close).
+    pub buttons_right: bool,
 }
 
 /// Visual drop-shadow parameters attached to a floating window node.

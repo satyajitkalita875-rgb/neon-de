@@ -50,6 +50,15 @@ pub struct BlurTargets {
 }
 
 impl BlurTargets {
+    /// Returns the latest full-resolution upright offscreen desktop snapshot (if available).
+    pub fn full_texture(&self) -> Option<(GlesTexture, Size<i32, Physical>)> {
+        let (sz, tex) = self.full.as_ref()?;
+        let phys = self
+            .cached_out_size
+            .unwrap_or_else(|| Size::from((sz.w, sz.h)));
+        Some((tex.clone(), phys))
+    }
+
     /// Clears the cached snapshot so the next render captures a fresh desktop frame.
     pub fn invalidate(&mut self) {
         self.cached_at = None;

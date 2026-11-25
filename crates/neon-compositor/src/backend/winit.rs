@@ -396,6 +396,11 @@ fn render_frame(
         let pending_shot = state.pending_screenshot.take();
         match backend.bind() {
             Ok((renderer, mut framebuffer)) => {
+                if !state.pending_close_ghosts.is_empty() {
+                    let ghosts = std::mem::take(&mut state.pending_close_ghosts);
+                    neon_renderer.ingest_close_ghosts(renderer, output, &ghosts);
+                    state.needs_redraw = true;
+                }
                 if let Some((shot_path, region)) = pending_shot {
                     match capture_output_to_png(
                         renderer,

@@ -1799,6 +1799,7 @@ impl ContextMenuOverlay {
             {
                 let ids: Vec<u64> = app_windows.iter().map(|w| w.id).collect();
                 let ipc = self.ipc.clone();
+                let from_pinned = explicit_window_id.is_none();
                 items.push(ContextMenuItem::action(
                     if all_minimized {
                         "window-restore-symbolic"
@@ -1808,6 +1809,13 @@ impl ContextMenuOverlay {
                     if all_minimized { "Show" } else { "Hide" },
                     move || {
                         for &wid in &ids {
+                            if from_pinned {
+                                ipc.send(IpcRequest::SetWindowDockAnchor {
+                                    window_id: wid,
+                                    x,
+                                    y,
+                                });
+                            }
                             if all_minimized {
                                 ipc.send(IpcRequest::FocusWindow { window_id: wid });
                             } else {
@@ -1822,12 +1830,20 @@ impl ContextMenuOverlay {
             {
                 let ids: Vec<u64> = app_windows.iter().map(|w| w.id).collect();
                 let ipc = self.ipc.clone();
+                let from_pinned = explicit_window_id.is_none();
                 items.push(ContextMenuItem::destructive(
                     "application-exit-symbolic",
                     "Quit",
                     Some("Super+Q"),
                     move || {
                         for &wid in &ids {
+                            if from_pinned {
+                                ipc.send(IpcRequest::SetWindowDockAnchor {
+                                    window_id: wid,
+                                    x,
+                                    y,
+                                });
+                            }
                             ipc.send(IpcRequest::CloseWindow { window_id: wid });
                         }
                     },

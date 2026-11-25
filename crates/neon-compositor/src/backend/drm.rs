@@ -632,6 +632,15 @@ fn render_all_drm_outputs(rt: &mut DrmRuntime, state: &mut NeonState) {
             }
         }
     }
+    if !state.pending_close_ghosts.is_empty() {
+        let ghosts = std::mem::take(&mut state.pending_close_ghosts);
+        for active in rt.outputs.values_mut() {
+            active
+                .neon_renderer
+                .ingest_close_ghosts(&mut rt.renderer, &active.output, &ghosts);
+        }
+        state.needs_redraw = true;
+    }
     // Fulfill queued native screenshot capture cleanly via offscreen GLES readback.
     if let Some((shot_path, region)) = state.pending_screenshot.take()
         && let Some(&primary_crtc) = crtcs.first()

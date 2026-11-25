@@ -106,6 +106,83 @@ pub fn sync_system_color_scheme(is_light: bool) {
     }
 }
 
+/// Synchronizes window titlebar button placement (`Left` macOS vs `Right` Standard) across
+/// `gsettings org.gnome.desktop.wm.preferences button-layout` (which `xdg-desktop-portal-gtk`
+/// broadcasts to Electron/Chrome/GTK/Firefox apps) and GTK3/GTK4 `settings.ini`.
+pub fn sync_window_button_layout(buttons_right: bool) {
+    if std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_none() {
+        return;
+    }
+    let val = if buttons_right {
+        ":minimize,maximize,close"
+    } else {
+        "close,minimize,maximize:"
+    };
+    let _ = Command::new("gsettings")
+        .args(["set", "org.gnome.desktop.wm.preferences", "button-layout", val])
+        .status();
+
+    if let Some(config_home) = xdg_config_home() {
+        for sub in ["gtk-3.0/settings.ini", "gtk-4.0/settings.ini"] {
+            let path = config_home.join(sub);
+            let _ = update_gtk_decoration_layout_ini(&path, val);
+        }
+    }
+}
+
+/// Updates `gtk-decoration-layout` inside a GTK 3 / GTK 4 `settings.ini` file cleanly.
+pub fn update_gtk_decoration_layout_ini_text(existing: &str, layout: &str) -> String {
+    let mut out: Vec<String> = Vec::new();
+    let mut in_settings = false;
+    let mut saw_settings_header = false;
+    let mut wrote_layout = false;
+
+    for raw_line in existing.lines() {
+        let trimmed = raw_line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            if in_settings && !wrote_layout {
+                out.push(format!("gtk-decoration-layout={layout}"));
+                wrote_layout = true;
+            }
+            in_settings = trimmed == "[Settings]";
+            if in_settings {
+                saw_settings_header = true;
+            }
+            out.push(raw_line.to_string());
+            continue;
+        }
+        if in_settings
+            && let Some((k, _)) = trimmed.split_once('=')
+            && k.trim() == "gtk-decoration-layout"
+        {
+            out.push(format!("gtk-decoration-layout={layout}"));
+            wrote_layout = true;
+            continue;
+        }
+        out.push(raw_line.to_string());
+    }
+
+    if !saw_settings_header {
+        out.push("[Settings]".to_string());
+    }
+    if !wrote_layout {
+        out.push(format!("gtk-decoration-layout={layout}"));
+    }
+
+    let mut result = out.join("\n");
+    result.push('\n');
+    result
+}
+
+fn update_gtk_decoration_layout_ini(path: &Path, layout: &str) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let existing = fs::read_to_string(path).unwrap_or_default();
+    let updated = update_gtk_decoration_layout_ini_text(&existing, layout);
+    fs::write(path, updated)
+}
+
 fn xdg_config_home() -> Option<PathBuf> {
     if let Some(cfg) = std::env::var_os("XDG_CONFIG_HOME")
         && !cfg.is_empty()
@@ -357,5 +434,16 @@ mod tests {
         assert!(dark.contains("gtk-theme-name=adw-gtk3-dark\n"));
         assert!(dark.contains("gtk-application-prefer-dark-theme=1\n"));
         assert!(dark.contains("gtk-icon-theme-name=WhiteSur-dark\n"));
+    }
+
+    #[test]
+    fn gtk_decoration_layout_ini_updates_cleanly_and_preserves_other_keys() {
+        let input = "[Settings]\ngtk-font-name=Inter 11\ngtk-decoration-layout=close,minimize,maximize:\n";
+        let right = update_gtk_decoration_layout_ini_text(input, ":minimize,maximize,close");
+        assert!(right.contains("gtk-font-name=Inter 11\n"));
+        assert!(right.contains("gtk-decoration-layout=:minimize,maximize,close\n"));
+
+        let fresh = update_gtk_decoration_layout_ini_text("", "close,minimize,maximize:");
+        assert_eq!(fresh, "[Settings]\ngtk-decoration-layout=close,minimize,maximize:\n");
     }
 }

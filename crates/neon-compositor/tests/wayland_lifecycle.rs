@@ -1171,6 +1171,7 @@ fn ipc_server_state_overview_workspace_and_effects_roundtrip() {
             .request(IpcRequest::UpdateWindowBehavior {
                 focus_follows_mouse: Some(true),
                 snap_gap: Some(12),
+                button_layout: Some("right_standard".into()),
             })
             .unwrap();
         let IpcResult::Ok {
@@ -1181,6 +1182,7 @@ fn ipc_server_state_overview_workspace_and_effects_roundtrip() {
         };
         assert!(behavior.focus_follows_mouse);
         assert_eq!(behavior.snap_gap, 12);
+        assert_eq!(behavior.button_layout, "right_standard");
 
         client_done_clone.store(true, Ordering::SeqCst);
     });
@@ -2225,5 +2227,349 @@ fn super_left_move_super_right_resize_and_maximize_respects_topbar() {
         pump_display(&mut display, &mut state);
         thread::sleep(Duration::from_millis(5));
     }
+    client_handle.join().unwrap();
+}
+
+#[test]
+fn window_buttons_double_click_maximize_and_dock_minimize_close_animations() {
+    use neon_compositor::{input::process_input_event, state::TitlebarHit};
+    use neon_config::WindowButtonLayout;
+    use smithay::{
+        backend::input::{
+            ButtonState, Device, DeviceCapability, Event as InputEventTrait, InputBackend,
+            InputEvent, KeyState, KeyboardKeyEvent, PointerButtonEvent, PointerMotionEvent,
+            UnusedEvent,
+        },
+        utils::SERIAL_COUNTER,
+    };
+
+    #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+    struct Dev;
+    impl Device for Dev {
+        fn id(&self) -> String {
+            "mock".into()
+        }
+        fn name(&self) -> String {
+            "mock".into()
+        }
+        fn has_capability(&self, cap: DeviceCapability) -> bool {
+            matches!(cap, DeviceCapability::Pointer | DeviceCapability::Keyboard)
+        }
+        fn usb_id(&self) -> Option<(u32, u32)> {
+            None
+        }
+        fn syspath(&self) -> Option<std::path::PathBuf> {
+            None
+        }
+    }
+    struct B;
+    struct KeyEv {
+        code: u32,
+        state: KeyState,
+    }
+    impl InputEventTrait<B> for KeyEv {
+        fn time(&self) -> u64 {
+            1000
+        }
+        fn device(&self) -> Dev {
+            Dev
+        }
+    }
+    impl KeyboardKeyEvent<B> for KeyEv {
+        fn key_code(&self) -> smithay::input::keyboard::Keycode {
+            smithay::input::keyboard::Keycode::new(self.code)
+        }
+        fn state(&self) -> KeyState {
+            self.state
+        }
+        fn count(&self) -> u32 {
+            1
+        }
+    }
+    struct BtnEv {
+        button: u32,
+        state: ButtonState,
+    }
+    impl InputEventTrait<B> for BtnEv {
+        fn time(&self) -> u64 {
+            1100
+        }
+        fn device(&self) -> Dev {
+            Dev
+        }
+    }
+    impl PointerButtonEvent<B> for BtnEv {
+        fn button_code(&self) -> u32 {
+            self.button
+        }
+        fn state(&self) -> ButtonState {
+            self.state
+        }
+    }
+    struct MotEv {
+        dx: f64,
+        dy: f64,
+    }
+    impl InputEventTrait<B> for MotEv {
+        fn time(&self) -> u64 {
+            1200
+        }
+        fn device(&self) -> Dev {
+            Dev
+        }
+    }
+    impl PointerMotionEvent<B> for MotEv {
+        fn delta_x(&self) -> f64 {
+            self.dx
+        }
+        fn delta_y(&self) -> f64 {
+            self.dy
+        }
+        fn delta_x_unaccel(&self) -> f64 {
+            self.dx
+        }
+        fn delta_y_unaccel(&self) -> f64 {
+            self.dy
+        }
+    }
+    impl InputBackend for B {
+        type Device = Dev;
+        type KeyboardKeyEvent = KeyEv;
+        type PointerAxisEvent = UnusedEvent;
+        type PointerButtonEvent = BtnEv;
+        type PointerMotionEvent = MotEv;
+        type PointerMotionAbsoluteEvent = UnusedEvent;
+        type GestureSwipeBeginEvent = UnusedEvent;
+        type GestureSwipeUpdateEvent = UnusedEvent;
+        type GestureSwipeEndEvent = UnusedEvent;
+        type GesturePinchBeginEvent = UnusedEvent;
+        type GesturePinchUpdateEvent = UnusedEvent;
+        type GesturePinchEndEvent = UnusedEvent;
+        type GestureHoldBeginEvent = UnusedEvent;
+        type GestureHoldEndEvent = UnusedEvent;
+        type TouchDownEvent = UnusedEvent;
+        type TouchMotionEvent = UnusedEvent;
+        type TouchUpEvent = UnusedEvent;
+        type TouchCancelEvent = UnusedEvent;
+        type TouchFrameEvent = UnusedEvent;
+        type TabletToolAxisEvent = UnusedEvent;
+        type TabletToolProximityEvent = UnusedEvent;
+        type TabletToolTipEvent = UnusedEvent;
+        type TabletToolButtonEvent = UnusedEvent;
+        type SwitchToggleEvent = UnusedEvent;
+        type SpecialEvent = UnusedEvent;
+    }
+
+    let (_event_loop, mut display, mut state) = create_headless_server();
+    // Simulate interactive backend so minimize/close animations & closing ghosts engage.
+    state.backend_name = "winit".into();
+    state.last_panel_height = 31;
+    let pump_display = |display: &mut smithay::reexports::wayland_server::Display<NeonState>,
+                        state: &mut NeonState| {
+        let _ = display.dispatch_clients(state);
+        let _ = display.flush_clients();
+    };
+
+    let (server_sock, client_sock) = UnixStream::pair().unwrap();
+    state.insert_client(server_sock);
+
+    let mapped = Arc::new(AtomicBool::new(false));
+    let mapped_c = Arc::clone(&mapped);
+    let commit_resized = Arc::new(AtomicBool::new(false));
+    let commit_resized_c = Arc::clone(&commit_resized);
+    let allow_exit = Arc::new(AtomicBool::new(false));
+    let allow_exit_c = Arc::clone(&allow_exit);
+
+    let client_handle = thread::spawn(move || {
+        let conn = Connection::from_socket(client_sock).unwrap();
+        let mut queue = conn.new_event_queue::<TestClientState>();
+        let qh = queue.handle();
+        let mut cstate = TestClientState::default();
+
+        let _registry = conn.display().get_registry(&qh, ());
+        queue.roundtrip(&mut cstate).unwrap();
+
+        let compositor = cstate.compositor.clone().unwrap();
+        let shm = cstate.shm.clone().unwrap();
+        let wm_base = cstate.wm_base.clone().unwrap();
+
+        let surface = compositor.create_surface(&qh, ());
+        let xdg_surface = wm_base.get_xdg_surface(&surface, &qh, ());
+        let toplevel = xdg_surface.get_toplevel(&qh, ());
+        toplevel.set_title("Animated App".into());
+        surface.commit();
+        queue.roundtrip(&mut cstate).unwrap();
+
+        let (_f1, pool1, buf1) = create_shm_buffer(&shm, &qh, 400, 300);
+        surface.attach(Some(&buf1), 0, 0);
+        surface.commit();
+        queue.roundtrip(&mut cstate).unwrap();
+
+        mapped_c.store(true, Ordering::SeqCst);
+        let mut resized_holder = None;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !allow_exit_c.load(Ordering::SeqCst) && Instant::now() < deadline {
+            queue.roundtrip(&mut cstate).unwrap();
+            if commit_resized_c.swap(false, Ordering::SeqCst) {
+                let (w, h) = cstate.last_configure_size;
+                let (rw, rh) = (w.max(600), h.max(400));
+                let (f2, pool2, buf2) = create_shm_buffer(&shm, &qh, rw, rh);
+                surface.attach(Some(&buf2), 0, 0);
+                surface.commit();
+                queue.roundtrip(&mut cstate).unwrap();
+                resized_holder = Some((f2, pool2, buf2));
+            }
+            thread::sleep(Duration::from_millis(8));
+        }
+        drop(resized_holder);
+
+        toplevel.destroy();
+        xdg_surface.destroy();
+        buf1.destroy();
+        pool1.destroy();
+        surface.destroy();
+        conn.flush().unwrap();
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !mapped.load(Ordering::SeqCst) && Instant::now() < deadline {
+        pump_display(&mut display, &mut state);
+        thread::sleep(Duration::from_millis(5));
+    }
+    pump_display(&mut display, &mut state);
+
+    let wid = state.wm.all_window_ids()[0];
+    let win = state.find_window_by_id(wid).unwrap();
+    state.enable_ssd_for_window(wid);
+    state.space.map_element(win.clone(), (200, 150), true);
+    state
+        .wm
+        .set_floating_location(wid, neon_window_manager::geometry::Point::new(200, 150));
+
+    // 1. Left vs Right SSD titlebar button layout + hit-testing.
+    state.config.windows.button_layout = WindowButtonLayout::LeftTrafficLights;
+    state.sync_scene_graph();
+    let tb_y = 150.0 - neon_scene::MACOS_TITLEBAR_HEIGHT as f64 * 0.5;
+    assert_eq!(
+        state.ssd_titlebar_hit_test((216.0, tb_y).into()).map(|x| x.2),
+        Some(TitlebarHit::Close)
+    );
+    assert_eq!(
+        state.ssd_titlebar_hit_test((236.0, tb_y).into()).map(|x| x.2),
+        Some(TitlebarHit::Minimize)
+    );
+    assert_eq!(
+        state.ssd_titlebar_hit_test((256.0, tb_y).into()).map(|x| x.2),
+        Some(TitlebarHit::Maximize)
+    );
+    let left_node = state
+        .scene
+        .collect_front_to_back()
+        .into_iter()
+        .find(|n| matches!(n.content, neon_scene::NodeContent::Window { window_id, .. } if window_id == wid))
+        .unwrap();
+    assert!(!left_node.titlebar.unwrap().buttons_right);
+
+    state.config.windows.button_layout = WindowButtonLayout::RightStandard;
+    state.sync_scene_graph();
+    assert_eq!(
+        state.ssd_titlebar_hit_test((584.0, tb_y).into()).map(|x| x.2),
+        Some(TitlebarHit::Close)
+    );
+    assert_eq!(
+        state.ssd_titlebar_hit_test((564.0, tb_y).into()).map(|x| x.2),
+        Some(TitlebarHit::Maximize)
+    );
+    assert_eq!(
+        state.ssd_titlebar_hit_test((544.0, tb_y).into()).map(|x| x.2),
+        Some(TitlebarHit::Minimize)
+    );
+    let right_node = state
+        .scene
+        .collect_front_to_back()
+        .into_iter()
+        .find(|n| matches!(n.content, neon_scene::NodeContent::Window { window_id, .. } if window_id == wid))
+        .unwrap();
+    assert!(right_node.titlebar.unwrap().buttons_right);
+
+    // 2. Double-clicking SSD titlebar drag strip maximizes AND triggers the exact same
+    //    Material 3 Expressive geometry morph animation once the resized buffer commits!
+    state.pointer_location = (400.0, tb_y).into();
+    for _ in 0..2 {
+        process_input_event::<B>(
+            &mut state,
+            InputEvent::PointerButton {
+                event: BtnEv {
+                    button: 0x110,
+                    state: ButtonState::Pressed,
+                },
+            },
+        );
+        process_input_event::<B>(
+            &mut state,
+            InputEvent::PointerButton {
+                event: BtnEv {
+                    button: 0x110,
+                    state: ButtonState::Released,
+                },
+            },
+        );
+    }
+    assert!(
+        state.wm.get(wid).unwrap().mode.is_maximized(),
+        "Double-clicking SSD titlebar must maximize the window"
+    );
+    assert!(
+        state.pending_geometry_anims.contains_key(&wid),
+        "Double-click maximize must register a pending geometry morph"
+    );
+    commit_resized.store(true, Ordering::SeqCst);
+    for _ in 0..15 {
+        pump_display(&mut display, &mut state);
+        if state.find_window_by_id(wid).unwrap().geometry().size.w > 400 {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    let animating_after_dbl = state.sync_scene_graph();
+    let now_after_dbl = state.now_duration();
+    assert!(
+        animating_after_dbl && state.effects.has_active_animations(now_after_dbl),
+        "Double-click maximize must launch active geometry morph animation"
+    );
+
+    // 3. Minimize targets exact Dock icon anchor and elevates Z-index above other windows.
+    state.window_dock_anchors.insert(wid, (900, 770).into());
+    state.minimize_window(wid, SERIAL_COUNTER.next_serial());
+    assert!(state.minimizing_windows.contains_key(&wid));
+    assert!(state.sync_scene_graph());
+    let min_node = state
+        .scene
+        .collect_front_to_back()
+        .into_iter()
+        .find(|n| matches!(n.content, neon_scene::NodeContent::Window { window_id, .. } if window_id == wid))
+        .unwrap();
+    assert!(
+        min_node.z_index >= 10_000,
+        "Minimizing window must stay elevated above remaining windows during dock swoop"
+    );
+
+    // Restore from Dock cancels minimizing state and launches rise animation.
+    assert!(state.restore_minimized_window(wid, SERIAL_COUNTER.next_serial()));
+    assert!(!state.minimizing_windows.contains_key(&wid));
+    assert!(state.sync_scene_graph());
+
+    // 4. Client-initiated close (destroying xdg_toplevel directly) queues a GPU PendingCloseGhost.
+    allow_exit.store(true, Ordering::SeqCst);
+    let end_deadline = Instant::now() + Duration::from_secs(2);
+    while !client_handle.is_finished() && Instant::now() < end_deadline {
+        pump_display(&mut display, &mut state);
+        thread::sleep(Duration::from_millis(5));
+    }
+    pump_display(&mut display, &mut state);
+    assert!(
+        !state.pending_close_ghosts.is_empty(),
+        "Client-initiated window close must queue a GPU closing ghost animation"
+    );
     client_handle.join().unwrap();
 }

@@ -10,6 +10,7 @@ pub struct ShellThemeController {
     provider: CssProvider,
     last_applied: Option<AppearanceInfo>,
     last_synced_light: Option<bool>,
+    last_synced_buttons_right: Option<bool>,
 }
 
 impl ShellThemeController {
@@ -30,6 +31,7 @@ impl ShellThemeController {
             provider,
             last_applied: Some(default_appearance),
             last_synced_light: None,
+            last_synced_buttons_right: None,
         }
     }
 
@@ -51,6 +53,28 @@ impl ShellThemeController {
                 neon_system::portals::sync_system_color_scheme(is_light);
             });
         }
+    }
+
+    pub fn sync_button_layout_if_changed(&mut self, button_layout: &str) {
+        let buttons_right = matches!(
+            button_layout.to_lowercase().as_str(),
+            "right" | "right_standard"
+        );
+        if self.last_synced_buttons_right == Some(buttons_right) {
+            return;
+        }
+        self.last_synced_buttons_right = Some(buttons_right);
+        if let Some(settings) = gtk4::Settings::default() {
+            let val = if buttons_right {
+                ":minimize,maximize,close"
+            } else {
+                "close,minimize,maximize:"
+            };
+            settings.set_gtk_decoration_layout(Some(val));
+        }
+        std::thread::spawn(move || {
+            neon_system::portals::sync_window_button_layout(buttons_right);
+        });
     }
 }
 

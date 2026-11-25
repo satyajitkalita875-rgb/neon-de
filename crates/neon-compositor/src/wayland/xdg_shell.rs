@@ -74,15 +74,22 @@ impl XdgShellHandler for NeonState {
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
         if let Some((id, window)) = self.find_window_by_surface(surface.wl_surface()) {
             let was_focused = self.wm.focused_id() == Some(id);
+            self.queue_close_ghost_if_visible(id, &window);
             self.space.unmap_elem(&window);
             self.managed_windows.remove(&id);
             self.ssd_windows.remove(&id);
+            self.last_rendered_rects.remove(&id);
+            self.pending_geometry_anims.remove(&id);
+            self.window_dock_anchors.remove(&id);
+            self.minimizing_windows.remove(&id);
+            self.closing_windows.remove(&id);
             if self.hovered_titlebar_window == Some(id) {
                 self.hovered_titlebar_window = None;
             }
             self.wm.remove_window(id);
             self.effects.remove_window(id);
             self.scene.remove_window(id);
+            self.needs_redraw = true;
             info!(?id, "Destroyed xdg_toplevel window");
             if was_focused {
                 self.focus_topmost_window(SERIAL_COUNTER.next_serial());
@@ -218,11 +225,13 @@ impl XdgShellHandler for NeonState {
             return;
         };
 
-        // Dragging a maximized or snapped window automatically restores floating mode.
-        let work_area = self.work_area();
-        if let Some(update) = self.wm.set_floating(id, work_area) {
-            self.apply_layout_update(&update);
-        }
+        // Defer restoring maximized/snapped windows until the user actually drags (> 6 px)
+        // so double-clicking a CSD titlebar never falsely unmaximizes on click 1.
+        let is_non_floating = self
+            .wm
+            .get(id)
+            .map(|r| !r.mode.is_floating())
+            .unwrap_or(false);
 
         let Some(initial_window_location) = self.space.element_location(&window) else {
             return;
@@ -232,6 +241,7 @@ impl XdgShellHandler for NeonState {
             start_data,
             window,
             initial_window_location,
+            pending_unmaximize: is_non_floating,
         };
         if let Some(pointer) = seat.get_pointer() {
             pointer.set_grab(self, grab, serial, Focus::Clear);
@@ -283,7 +293,9 @@ impl XdgShellHandler for NeonState {
         if let Some((id, _)) = self.find_window_by_surface(surface.wl_surface()) {
             let work_area = self.effective_work_area_for(id);
             if let Some(update) = self.wm.set_maximized(id, true, work_area) {
+                self.begin_geometry_transition(id, update.configure_size);
                 self.apply_layout_update(&update);
+                self.needs_redraw = true;
                 return;
             }
         }
@@ -294,7 +306,9 @@ impl XdgShellHandler for NeonState {
         if let Some((id, _)) = self.find_window_by_surface(surface.wl_surface()) {
             let work_area = self.effective_work_area_for(id);
             if let Some(update) = self.wm.set_maximized(id, false, work_area) {
+                self.begin_geometry_transition(id, update.configure_size);
                 self.apply_layout_update(&update);
+                self.needs_redraw = true;
                 return;
             }
         }
@@ -305,6 +319,7 @@ impl XdgShellHandler for NeonState {
         if let Some((id, _)) = self.find_window_by_surface(surface.wl_surface()) {
             let full = self.output_full_rect();
             if let Some(update) = self.wm.set_fullscreen(id, true, full) {
+                self.begin_geometry_transition(id, update.configure_size);
                 self.apply_layout_update(&update);
                 self.needs_redraw = true;
                 return;
@@ -317,6 +332,7 @@ impl XdgShellHandler for NeonState {
         if let Some((id, _)) = self.find_window_by_surface(surface.wl_surface()) {
             let work_area = self.effective_work_area_for(id);
             if let Some(update) = self.wm.set_fullscreen(id, false, work_area) {
+                self.begin_geometry_transition(id, update.configure_size);
                 self.apply_layout_update(&update);
                 self.needs_redraw = true;
                 return;

@@ -519,10 +519,13 @@ impl XwmHandler for NeonState {
         if let Some((id, window)) = self.find_managed_x11(target_xid) {
             let was_focused = self.wm.focused_id() == Some(id);
             let parent_id = self.wm.get(id).and_then(|r| r.parent);
+            self.queue_close_ghost_if_visible(id, &window);
             self.space.unmap_elem(&window);
             self.managed_windows.remove(&id);
             self.ssd_windows.remove(&id);
             self.last_rendered_rects.remove(&id);
+            self.pending_geometry_anims.remove(&id);
+            self.window_dock_anchors.remove(&id);
             self.minimizing_windows.remove(&id);
             self.closing_windows.remove(&id);
             if self.hovered_titlebar_window == Some(id) {
@@ -772,6 +775,7 @@ impl XwmHandler for NeonState {
         if let Some((id, _)) = self.find_managed_x11(xid) {
             let eff_wa = self.effective_work_area_for(id);
             if let Some(update) = self.wm.set_maximized(id, true, eff_wa) {
+                self.begin_geometry_transition(id, update.configure_size);
                 let _ = surface.set_maximized(true);
                 if let (Some(loc), Some(sz)) = (update.target_location, update.configure_size) {
                     let _ = surface.configure(Rectangle::new(from_wm_point(loc), from_wm_size(sz)));
@@ -787,6 +791,7 @@ impl XwmHandler for NeonState {
         if let Some((id, _)) = self.find_managed_x11(xid) {
             let eff_wa = self.effective_work_area_for(id);
             if let Some(update) = self.wm.set_maximized(id, false, eff_wa) {
+                self.begin_geometry_transition(id, update.configure_size);
                 let _ = surface.set_maximized(false);
                 if let (Some(loc), Some(sz)) = (update.target_location, update.configure_size) {
                     let _ = surface.configure(Rectangle::new(from_wm_point(loc), from_wm_size(sz)));
@@ -803,6 +808,7 @@ impl XwmHandler for NeonState {
             self.ssd_windows.remove(&id);
             let full = self.output_full_rect();
             if let Some(update) = self.wm.set_fullscreen(id, true, full) {
+                self.begin_geometry_transition(id, update.configure_size);
                 let _ = surface.set_fullscreen(true);
                 if let (Some(loc), Some(sz)) = (update.target_location, update.configure_size) {
                     let _ = surface.configure(Rectangle::new(from_wm_point(loc), from_wm_size(sz)));
@@ -823,6 +829,7 @@ impl XwmHandler for NeonState {
             }
             let eff_wa = self.effective_work_area_for(id);
             if let Some(update) = self.wm.set_fullscreen(id, false, eff_wa) {
+                self.begin_geometry_transition(id, update.configure_size);
                 let _ = surface.set_fullscreen(false);
                 if let (Some(loc), Some(sz)) = (update.target_location, update.configure_size) {
                     let _ = surface.configure(Rectangle::new(from_wm_point(loc), from_wm_size(sz)));

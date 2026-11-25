@@ -167,6 +167,9 @@ impl Element for RoundedSurfaceElement {
     }
 
     fn opaque_regions(&self, scale: Scale<f64>) -> OpaqueRegions<i32, Physical> {
+        if self.inner.alpha() < 0.999 {
+            return OpaqueRegions::default();
+        }
         // Trim top and bottom rounded-corner strips (and any client-side margin outside `win_rect`)
         // from reported opaque regions so `OutputDamageTracker` always composites the desktop
         // background and window shadow behind the anti-aliased rounded corners.

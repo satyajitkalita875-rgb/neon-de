@@ -379,11 +379,17 @@ pub struct DiagnosticsInfo {
     pub safe_mode: bool,
 }
 
+fn default_button_layout() -> String {
+    "left".into()
+}
+
 /// Snapshot of live window manager behavior settings.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WindowBehaviorInfo {
     pub focus_follows_mouse: bool,
     pub snap_gap: i32,
+    #[serde(default = "default_button_layout")]
+    pub button_layout: String,
 }
 
 /// Complete desktop state snapshot consumed by `neon-shell` and `neon-settings`.
@@ -467,6 +473,11 @@ pub enum IpcRequest {
     MoveWindowToOutput {
         window_id: u64,
         output_name: String,
+    },
+    SetWindowDockAnchor {
+        window_id: u64,
+        x: i32,
+        y: i32,
     },
     ToggleOverview,
     SetOverview {
@@ -568,6 +579,8 @@ pub enum IpcRequest {
     UpdateWindowBehavior {
         focus_follows_mouse: Option<bool>,
         snap_gap: Option<i32>,
+        #[serde(default)]
+        button_layout: Option<String>,
     },
     Subscribe {
         topics: Vec<EventTopic>,

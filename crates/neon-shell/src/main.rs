@@ -351,6 +351,14 @@ fn main() {
                         }
                         if let Some(ref cfg) = legacy_cfg {
                             ipc_bridge::overlay_legacy_appearance(&mut snapshot.appearance, cfg);
+                            snapshot.window_behavior.button_layout = match cfg.windows.button_layout {
+                                neon_config::WindowButtonLayout::RightStandard => {
+                                    "right_standard".into()
+                                }
+                                neon_config::WindowButtonLayout::LeftTrafficLights => {
+                                    "left_traffic_lights".into()
+                                }
+                            };
                         }
                     } else if only_if_cfg_changed {
                         return;
@@ -361,6 +369,8 @@ fn main() {
                         snapshot.appearance.cursor_size,
                     );
                     theme_ctrl.apply_if_changed(&snapshot.appearance);
+                    theme_ctrl
+                        .sync_button_layout_if_changed(&snapshot.window_behavior.button_layout);
                     wallpaper_layer.update(&snapshot.appearance);
                     quick_settings.update_appearance(&snapshot.appearance);
                     context_menu.update_snapshot(&snapshot);

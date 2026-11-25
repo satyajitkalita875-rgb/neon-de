@@ -25,6 +25,10 @@ pub struct MoveSurfaceGrab {
     pub start_data: PointerGrabStartData<NeonState>,
     pub window: Window,
     pub initial_window_location: Point<i32, Logical>,
+    /// When dragging from a maximized/snapped titlebar, defer transitioning back to floating
+    /// until pointer motion exceeds a small drag threshold so double-clicking to unmaximize
+    /// plays the full smooth Material 3 restore animation cleanly.
+    pub pending_unmaximize: bool,
 }
 
 impl PointerGrab<NeonState> for MoveSurfaceGrab {
@@ -37,7 +41,59 @@ impl PointerGrab<NeonState> for MoveSurfaceGrab {
     ) {
         handle.motion(data, None, event);
 
-        let delta = event.location - self.start_data.location;
+        let mut delta = event.location - self.start_data.location;
+        if self.pending_unmaximize {
+            if delta.x.hypot(delta.y) < 6.0 {
+                return;
+            }
+            self.pending_unmaximize = false;
+            if let Some(id) = window_id(&self.window) {
+                let old_loc = self.initial_window_location;
+                let old_size = self.window.geometry().size;
+                let work_area = data.effective_work_area_for(id);
+                if let Some(update) = data.wm.set_floating(id, work_area) {
+                    if let Some(x11) = self.window.x11_surface() {
+                        let _ = x11.set_maximized(false);
+                        let _ = x11.set_fullscreen(false);
+                        if let (Some(loc), Some(sz)) =
+                            (update.target_location, update.configure_size)
+                        {
+                            let _ = x11.configure(Rectangle::new(
+                                crate::window::from_wm_point(loc),
+                                crate::window::from_wm_size(sz),
+                            ));
+                        }
+                    }
+                    data.apply_layout_update(&update);
+                    if old_size.w > 0 {
+                        let new_w = update
+                            .configure_size
+                            .map(|s| s.w)
+                            .unwrap_or(old_size.w)
+                            .max(200);
+                        let ratio_x = ((event.location.x - old_loc.x as f64) / old_size.w as f64)
+                            .clamp(0.12, 0.88);
+                        let new_x = (event.location.x - new_w as f64 * ratio_x).round() as i32;
+                        let new_y =
+                            (event.location.y - 16.0).round().max(work_area.loc.y as f64) as i32;
+                        let adjusted: Point<i32, Logical> = (new_x, new_y).into();
+                        data.space.map_element(self.window.clone(), adjusted, true);
+                        data.wm.set_floating_location(id, to_wm_point(adjusted));
+                        if let Some(x11) = self.window.x11_surface() {
+                            let mut g = x11.geometry();
+                            g.loc = adjusted;
+                            let _ = x11.configure(g);
+                        }
+                        self.initial_window_location = adjusted;
+                    } else if let Some(loc) = data.space.element_location(&self.window) {
+                        self.initial_window_location = loc;
+                    }
+                    self.start_data.location = event.location;
+                    delta = (0.0, 0.0).into();
+                }
+            }
+        }
+
         let new_location = self.initial_window_location.to_f64() + delta;
         let mut rounded: Point<i32, Logical> = new_location.to_i32_round();
         // Prevent dragging a window's top edge above/under the Top Bar when Top Bar auto-hide is off.

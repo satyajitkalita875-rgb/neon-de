@@ -553,6 +553,7 @@ impl Dock {
 
         let apps_guard = self.all_apps.borrow();
         let icon_px = self.last_icon_size.get() as i32;
+        let mut anchor_buttons: Vec<(u64, Button)> = Vec::with_capacity(snapshot.windows.len());
         for win in &snapshot.windows {
             let display_name = win
                 .title
@@ -576,27 +577,76 @@ impl Dock {
             }
 
             let win_id = win.id;
-            let ipc = self.ipc.clone();
-            btn.connect_clicked(move |_| {
-                ipc.send(IpcRequest::SetOverview { open: false });
-                ipc.send(IpcRequest::FocusWindow { window_id: win_id });
-            });
+            let was_focused = win.focused;
+            let was_minimized = win.minimized;
+            {
+                let ipc = self.ipc.clone();
+                let cm = self.context_menu.clone();
+                let cont = self.container.clone();
+                let btn_c = btn.clone();
+                let st_rc = Rc::clone(&self.hide_state);
+                btn.connect_clicked(move |_| {
+                    let pos = st_rc.borrow().position.clone();
+                    let (ax, ay) = dock_button_center_screen_coords(&cm, &cont, &btn_c, &pos);
+                    ipc.send(IpcRequest::SetWindowDockAnchor {
+                        window_id: win_id,
+                        x: ax,
+                        y: ay,
+                    });
+                    if was_focused && !was_minimized {
+                        ipc.send(IpcRequest::MinimizeWindow { window_id: win_id });
+                    } else {
+                        ipc.send(IpcRequest::SetOverview { open: false });
+                        ipc.send(IpcRequest::FocusWindow { window_id: win_id });
+                    }
+                });
+            }
             let rc_gesture = GestureClick::new();
             rc_gesture.set_button(3);
             {
                 let cm = self.context_menu.clone();
+                let ipc = self.ipc.clone();
                 let cont = self.container.clone();
                 let btn_c = btn.clone();
                 let st_rc = Rc::clone(&self.hide_state);
                 rc_gesture.connect_pressed(move |gesture, _, x, y| {
                     gesture.set_state(gtk4::EventSequenceState::Claimed);
                     let pos = st_rc.borrow().position.clone();
+                    let (ax, ay) = dock_button_center_screen_coords(&cm, &cont, &btn_c, &pos);
+                    ipc.send(IpcRequest::SetWindowDockAnchor {
+                        window_id: win_id,
+                        x: ax,
+                        y: ay,
+                    });
                     let (sx, sy) = dock_widget_screen_coords(&cm, &cont, &btn_c, &pos, x, y);
                     cm.open_dock_app_menu(sx, sy, None, Some(win_id));
                 });
             }
             btn.add_controller(rc_gesture);
             self.running_box.append(&btn);
+            anchor_buttons.push((win_id, btn));
+        }
+
+        // Report each running window's exact Dock icon screen center once GTK finishes layout
+        // so titlebar Minimize/Close and Super+H/Super+Q swoop accurately to/from that icon.
+        if !anchor_buttons.is_empty() {
+            let cm = self.context_menu.clone();
+            let cont = self.container.clone();
+            let st_rc = Rc::clone(&self.hide_state);
+            let ipc = self.ipc.clone();
+            glib::timeout_add_local_once(Duration::from_millis(60), move || {
+                let pos = st_rc.borrow().position.clone();
+                for (wid, btn) in anchor_buttons {
+                    if btn.parent().is_some() {
+                        let (ax, ay) = dock_button_center_screen_coords(&cm, &cont, &btn, &pos);
+                        ipc.send(IpcRequest::SetWindowDockAnchor {
+                            window_id: wid,
+                            x: ax,
+                            y: ay,
+                        });
+                    }
+                }
+            });
         }
     }
 }
@@ -750,6 +800,40 @@ fn dock_widget_screen_coords(
         .map(|b| (b.x() as f64, b.y() as f64))
         .unwrap_or((0.0, 0.0));
     dock_point_screen_coords(cm, dock_container, pos, rel_x + local_x, rel_y + local_y)
+}
+
+fn dock_button_center_screen_coords(
+    cm: &ContextMenuOverlay,
+    dock_container: &GtkBox,
+    widget: &impl IsA<gtk4::Widget>,
+    pos: &str,
+) -> (i32, i32) {
+    let (out_w, out_h) = cm.output_size();
+    let dock_w = dock_container.width().max(80);
+    let dock_h = dock_container.height().max(48);
+    let (cx, cy) = widget
+        .compute_bounds(dock_container)
+        .map(|b| {
+            (
+                b.x() as f64 + b.width() as f64 * 0.5,
+                b.y() as f64 + b.height() as f64 * 0.5,
+            )
+        })
+        .unwrap_or((dock_w as f64 * 0.5, dock_h as f64 * 0.5));
+    match pos {
+        "left" => {
+            let dock_top = (out_h - dock_h) / 2;
+            ((dock_w / 2).max(20), dock_top + cy.round() as i32)
+        }
+        "right" => {
+            let dock_top = (out_h - dock_h) / 2;
+            (out_w - (dock_w / 2).max(20), dock_top + cy.round() as i32)
+        }
+        _ => {
+            let dock_left = (out_w - dock_w) / 2;
+            (dock_left + cx.round() as i32, out_h - (dock_h / 2).max(20))
+        }
+    }
 }
 
 fn make_icon_dock_button(

@@ -7,7 +7,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use neon_config::{DockPosition, FocusMode, ThemeMode};
+use neon_config::{DockPosition, FocusMode, ThemeMode, WindowButtonLayout};
 use neon_ipc::{
     AppearanceInfo, DesktopSnapshot, DiagnosticsInfo, EffectsInfo, EventTopic, IpcEvent,
     IpcPayload, IpcRequest, IpcRequestEnvelope, IpcResult, IpcServerMessage, MAX_FRAME_BYTES,
@@ -657,6 +657,14 @@ fn handle_ipc_request(
                 payload: IpcPayload::Ack,
             }
         }
+        IpcRequest::SetWindowDockAnchor { window_id, x, y } => {
+            state
+                .window_dock_anchors
+                .insert(WindowId(window_id), (x, y).into());
+            IpcResult::Ok {
+                payload: IpcPayload::Ack,
+            }
+        }
         IpcRequest::TakeScreenshot { path, region } => {
             let dest = state.request_screenshot(path.map(std::path::PathBuf::from), region);
             IpcResult::Ok {
@@ -969,6 +977,7 @@ fn handle_ipc_request(
         IpcRequest::UpdateWindowBehavior {
             focus_follows_mouse,
             snap_gap,
+            button_layout,
         } => {
             if let Some(ffm) = focus_follows_mouse {
                 state.config.windows.focus_mode = if ffm {
@@ -988,6 +997,21 @@ fn handle_ipc_request(
                 state.wm.set_snap_gap(clamped);
                 state.relayout_non_floating_windows();
             }
+            if let Some(layout) = button_layout {
+                state.config.windows.button_layout = match layout.to_lowercase().as_str() {
+                    "right" | "right_standard" => WindowButtonLayout::RightStandard,
+                    _ => WindowButtonLayout::LeftTrafficLights,
+                };
+                state.needs_redraw = true;
+            }
+            state.config.validate_and_clamp();
+            if state.backend_name != "headless" {
+                let cfg_path = neon_config::default_config_path();
+                if let Err(err) = neon_config::save_atomic(&cfg_path, &state.config) {
+                    warn!(?err, "Failed to persist live window behavior update");
+                }
+            }
+            state.needs_redraw = true;
             IpcResult::Ok {
                 payload: IpcPayload::WindowBehavior {
                     behavior: build_window_behavior(state),
@@ -1147,8 +1171,13 @@ fn build_appearance(state: &NeonState) -> AppearanceInfo {
 }
 
 fn build_window_behavior(state: &NeonState) -> WindowBehaviorInfo {
+    let button_layout = match state.config.windows.button_layout {
+        WindowButtonLayout::RightStandard => "right_standard",
+        WindowButtonLayout::LeftTrafficLights => "left_traffic_lights",
+    };
     WindowBehaviorInfo {
         focus_follows_mouse: state.config.windows.focus_mode == FocusMode::FocusFollowsMouse,
         snap_gap: state.config.windows.snap_gap,
+        button_layout: button_layout.into(),
     }
 }

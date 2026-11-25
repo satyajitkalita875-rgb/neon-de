@@ -10,7 +10,7 @@ use std::{
     time::Duration,
 };
 
-use neon_config::{FocusMode, NeonConfig, ThemeMode};
+use neon_config::{DockPosition, FocusMode, NeonConfig, ThemeMode, WindowButtonLayout};
 use neon_effects::{EffectsConfig, EffectsManager};
 use neon_output::{DisplayMode, OutputConfigPatch, OutputId, OutputManager, OutputTransform};
 use neon_scene::{BorderStyle, MACOS_TITLEBAR_HEIGHT, SceneGraph, ShadowStyle, TitlebarStyle};
@@ -131,6 +131,17 @@ pub struct PendingPreviewCapture {
     pub max_height: u32,
 }
 
+/// Captures a window's pre-transition geometry right before maximize/unmaximize/snap/fullscreen
+/// so the compositor holds the visual frame smoothly until the client commits its resized buffer
+/// and then drives the exact same Material 3 Expressive morph whether triggered by button or
+/// double-click.
+#[derive(Debug, Clone, Copy)]
+pub struct PendingGeometryAnim {
+    pub old_rect: WmRect,
+    pub expected_size: Option<crate::window::WmSize>,
+    pub queued_at: Duration,
+}
+
 /// Callback invoked when the user presses `Ctrl+Alt+F1..F12` on a bare-metal TTY session.
 pub type VtSwitchHook = Box<dyn FnMut(i32)>;
 
@@ -182,6 +193,14 @@ pub struct NeonState {
     pub ssd_windows: HashSet<WindowId>,
     /// Last rendered logical rect per visible window (drives smooth Hyprland/M3 geometry morphs).
     pub last_rendered_rects: HashMap<WindowId, WmRect>,
+    /// Pre-transition geometry snapshots awaiting client buffer resize before starting morph.
+    pub pending_geometry_anims: HashMap<WindowId, PendingGeometryAnim>,
+    /// Last click timestamp & location on an SSD titlebar drag strip for double-click maximize.
+    pub last_titlebar_click: Option<(WindowId, std::time::Instant, Point<f64, Logical>)>,
+    /// Exact Dock icon screen center per running window (reported by `neon-shell` for minimize/close).
+    pub window_dock_anchors: HashMap<WindowId, Point<i32, Logical>>,
+    /// Client-initiated window closes queued for GPU offscreen texture capture + fade animation.
+    pub pending_close_ghosts: Vec<neon_renderer::PendingCloseGhost>,
     /// Windows currently playing their dock-swoop minimize animation (`id -> unmap_at`).
     pub minimizing_windows: HashMap<WindowId, Duration>,
     /// Windows currently playing their popout close animation (`id -> (deadline, close_sent)`).
@@ -316,6 +335,10 @@ impl NeonState {
             override_redirect_windows: Vec::new(),
             ssd_windows: HashSet::new(),
             last_rendered_rects: HashMap::new(),
+            pending_geometry_anims: HashMap::new(),
+            last_titlebar_click: None,
+            window_dock_anchors: HashMap::new(),
+            pending_close_ghosts: Vec::new(),
             minimizing_windows: HashMap::new(),
             closing_windows: HashMap::new(),
             outgoing_workspace_windows: Vec::new(),
@@ -472,13 +495,15 @@ impl NeonState {
 
         let mut animating = self.effects.tick(now)
             || !self.minimizing_windows.is_empty()
-            || !self.closing_windows.is_empty();
+            || !self.closing_windows.is_empty()
+            || !self.pending_geometry_anims.is_empty();
 
         let output_size = self.output_logical_size();
         self.scene.set_backdrop(to_wm_size(output_size));
 
         let fx_cfg = self.effects.config;
         let focused_id = self.wm.focused_id();
+        let buttons_right = self.config.windows.button_layout == WindowButtonLayout::RightStandard;
         let pointer_grabbed = self
             .seat
             .get_pointer()
@@ -496,22 +521,48 @@ impl NeonState {
             };
             let win_size = window.geometry().size;
             let bounds = WmRect::new(to_wm_point(loc), to_wm_size(win_size));
+            let mut render_bounds = bounds;
 
             // Detect maximize / unmaximize / snap / fullscreen / resize transitions on
             // already-visible windows and drive a smooth Material 3 Expressive spatial morph.
-            if win_size.w > 0
-                && win_size.h > 0
-                && !self.minimizing_windows.contains_key(&id)
-                && !self.closing_windows.contains_key(&id)
-            {
-                if !pointer_grabbed
-                    && let Some(&prev_bounds) = self.last_rendered_rects.get(&id)
-                    && prev_bounds != bounds
-                {
-                    self.effects.animate_window_geometry(id, prev_bounds, bounds, now);
-                    animating = true;
+            let is_exiting = self.minimizing_windows.contains_key(&id)
+                || self.closing_windows.contains_key(&id);
+            if win_size.w > 0 && win_size.h > 0 && !is_exiting {
+                if let Some(pending) = self.pending_geometry_anims.get(&id).copied() {
+                    let size_changed = bounds.size != pending.old_rect.size;
+                    let expects_resize =
+                        pending.expected_size.is_some_and(|s| s != pending.old_rect.size);
+                    let ready = if expects_resize {
+                        size_changed || now >= pending.queued_at + Duration::from_millis(180)
+                    } else {
+                        bounds != pending.old_rect
+                            || now >= pending.queued_at + Duration::from_millis(50)
+                    };
+                    if ready {
+                        self.pending_geometry_anims.remove(&id);
+                        if pending.old_rect != bounds {
+                            self.effects
+                                .animate_window_geometry(id, pending.old_rect, bounds, now);
+                            animating = true;
+                        }
+                        self.last_rendered_rects.insert(id, bounds);
+                    } else {
+                        // Hold visual frame at `old_rect` for the ~1 frame before the client
+                        // commits its resized buffer so double-click & button maximize never
+                        // flicker to the new origin at the old size before morphing.
+                        render_bounds = pending.old_rect;
+                        animating = true;
+                    }
+                } else {
+                    if !pointer_grabbed
+                        && let Some(&prev_bounds) = self.last_rendered_rects.get(&id)
+                        && prev_bounds != bounds
+                    {
+                        self.effects.animate_window_geometry(id, prev_bounds, bounds, now);
+                        animating = true;
+                    }
+                    self.last_rendered_rects.insert(id, bounds);
                 }
-                self.last_rendered_rects.insert(id, bounds);
             }
 
             let is_frameless_special = is_window_frameless_special(window);
@@ -560,10 +611,18 @@ impl NeonState {
                     None
                 };
 
+            // Keep minimizing/closing windows elevated above other windows while in flight
+            // so `focus_topmost_window` raising the next window never hides the dock swoop.
+            let scene_z = if is_exiting {
+                z_idx as i32 + 10_000
+            } else {
+                z_idx as i32
+            };
+
             self.scene.upsert_window(
                 id,
-                bounds,
-                z_idx as i32,
+                render_bounds,
+                scene_z,
                 true,
                 opacity,
                 (visual.offset_x, visual.offset_y),
@@ -582,6 +641,7 @@ impl NeonState {
                         focused: is_focused,
                         light_theme: self.config.appearance.theme == ThemeMode::NeonLight,
                         hover_controls: self.hovered_titlebar_window == Some(id),
+                        buttons_right,
                     })
                 } else {
                     None
@@ -676,6 +736,7 @@ impl NeonState {
                         focused: out.was_focused,
                         light_theme,
                         hover_controls: false,
+                        buttons_right,
                     })
                 } else {
                     None
@@ -698,6 +759,8 @@ impl NeonState {
         }
 
         self.last_rendered_rects
+            .retain(|id, _| active_space_ids.contains(id));
+        self.pending_geometry_anims
             .retain(|id, _| active_space_ids.contains(id));
         self.scene.retain_windows(|id| visible_ids.contains(&id));
         animating
@@ -1412,18 +1475,118 @@ impl NeonState {
         }
     }
 
+    /// Captures a window's pre-transition logical rect right before maximize/unmaximize/snap/
+    /// fullscreen/center so button clicks and titlebar double-clicks play the exact same smooth
+    /// Material 3 Expressive spatial morph once the client commits its resized buffer.
+    pub fn begin_geometry_transition(
+        &mut self,
+        id: WindowId,
+        expected_size: Option<crate::window::WmSize>,
+    ) {
+        let now = self.now_duration();
+        let old_rect = self
+            .pending_geometry_anims
+            .get(&id)
+            .map(|p| p.old_rect)
+            .or_else(|| self.last_rendered_rects.get(&id).copied())
+            .or_else(|| {
+                self.find_window_by_id(id).and_then(|w| {
+                    let loc = self.space.element_location(&w)?;
+                    let sz = w.geometry().size;
+                    (sz.w > 0 && sz.h > 0).then(|| WmRect::new(to_wm_point(loc), to_wm_size(sz)))
+                })
+            })
+            .or_else(|| self.wm.get(id).map(|r| r.current_geometry));
+
+        if let Some(old_rect) = old_rect
+            && old_rect.size.w > 0
+            && old_rect.size.h > 0
+        {
+            self.pending_geometry_anims.insert(
+                id,
+                PendingGeometryAnim {
+                    old_rect,
+                    expected_size,
+                    queued_at: now,
+                },
+            );
+            self.needs_redraw = true;
+        }
+    }
+
+    /// Queues a one-shot GPU closing ghost for a client-initiated window close (`×` button,
+    /// `Ctrl+Q`, etc.) whenever the window was visible on the active workspace and not already
+    /// playing a compositor-driven close or minimize animation.
+    pub fn queue_close_ghost_if_visible(&mut self, id: WindowId, window: &Window) {
+        if self.backend_name == "headless"
+            || self.closing_windows.contains_key(&id)
+            || self.minimizing_windows.contains_key(&id)
+            || is_window_frameless_special(window)
+        {
+            return;
+        }
+        let dur = self.effects.scaled_duration(220);
+        if dur.is_zero() {
+            return;
+        }
+        let rect = self
+            .space
+            .element_location(window)
+            .and_then(|loc| {
+                let sz = window.geometry().size;
+                (sz.w > 24 && sz.h > 24).then(|| Rectangle::new(loc, sz))
+            })
+            .or_else(|| {
+                self.last_rendered_rects
+                    .get(&id)
+                    .filter(|r| r.size.w > 24 && r.size.h > 24)
+                    .map(|r| Rectangle::new(from_wm_point(r.loc), from_wm_size(r.size)))
+            });
+        let Some(rect) = rect else {
+            return;
+        };
+        let fullscreen = self
+            .wm
+            .get(id)
+            .map(|r| r.mode.is_fullscreen())
+            .unwrap_or(false);
+        let target_offset = self.close_swoop_delta_for(id);
+        self.pending_close_ghosts.push(neon_renderer::PendingCloseGhost {
+            window: window.clone(),
+            rect,
+            corner_radius: if fullscreen {
+                0.0
+            } else {
+                self.effects.config.corner_radius
+            },
+            target_offset,
+            duration: dur,
+        });
+        self.needs_redraw = true;
+    }
+
     /// Requests graceful closure of a window with a smooth Hyprland/M3 popout close animation.
     pub fn close_window_by_id(&mut self, id: WindowId) -> bool {
-        if self.find_window_by_id(id).is_none() {
+        let Some(window) = self.find_window_by_id(id) else {
             return false;
-        }
+        };
         if self.closing_windows.contains_key(&id) {
             return true;
         }
+        self.pending_geometry_anims.remove(&id);
+        // If the window is not currently mapped on the active workspace (e.g. minimized or on
+        // another workspace), close it immediately without waiting for a hidden animation.
+        let is_visible = self.space.element_location(&window).is_some()
+            && !self.minimizing_windows.contains_key(&id);
+        if !is_visible || self.backend_name == "headless" {
+            self.needs_redraw = true;
+            return self.send_native_close(id);
+        }
+        let (dx, dy) = self.close_swoop_delta_for(id);
         let now = self.now_duration();
-        let dur = self.effects.animate_window_close(id, now);
+        let dur = self.effects.animate_window_close_toward(id, dx, dy, now);
         self.needs_redraw = true;
-        if dur.is_zero() || self.backend_name == "headless" {
+        if dur.is_zero() {
             self.send_native_close(id)
         } else {
             self.closing_windows.insert(id, (now + dur, false));
@@ -1507,11 +1670,18 @@ impl NeonState {
                 let cy = MACOS_TITLEBAR_HEIGHT as f64 * 0.5;
                 let dist_sq = |cx: f64| (lx - cx).powi(2) + (ly - cy).powi(2);
                 let hit_r_sq = 8.5_f64.powi(2);
-                let hit = if dist_sq(16.0) <= hit_r_sq {
+                let buttons_right =
+                    self.config.windows.button_layout == WindowButtonLayout::RightStandard;
+                let (close_x, min_x, max_x) = if buttons_right {
+                    (w as f64 - 16.0, w as f64 - 56.0, w as f64 - 36.0)
+                } else {
+                    (16.0, 36.0, 56.0)
+                };
+                let hit = if dist_sq(close_x) <= hit_r_sq {
                     TitlebarHit::Close
-                } else if dist_sq(36.0) <= hit_r_sq {
+                } else if dist_sq(min_x) <= hit_r_sq {
                     TitlebarHit::Minimize
-                } else if dist_sq(56.0) <= hit_r_sq {
+                } else if dist_sq(max_x) <= hit_r_sq {
                     TitlebarHit::Maximize
                 } else {
                     TitlebarHit::Drag
@@ -1526,6 +1696,7 @@ impl NeonState {
     pub fn toggle_maximize_window(&mut self, id: WindowId) {
         let work_area = self.effective_work_area_for(id);
         if let Some(update) = self.wm.toggle_maximized(id, work_area) {
+            self.begin_geometry_transition(id, update.configure_size);
             info!(?id, mode = ?update.mode, "Toggled maximize on window");
             if let Some(window) = self.find_window_by_id(id)
                 && let Some(x11) = window.x11_surface()
@@ -1580,6 +1751,7 @@ impl NeonState {
             self.effective_work_area_for(id)
         };
         if let Some(update) = self.wm.set_fullscreen(id, entering_fs, target_rect) {
+            self.begin_geometry_transition(id, update.configure_size);
             info!(?id, mode = ?update.mode, "Toggled fullscreen on focused window");
             if let Some(window) = self.find_window_by_id(id)
                 && let Some(x11) = window.x11_surface()
@@ -1597,6 +1769,7 @@ impl NeonState {
     pub fn snap_window_by_id(&mut self, id: WindowId, region: SnapRegion) {
         let work_area = self.effective_work_area_for(id);
         if let Some(update) = self.wm.toggle_snap(id, region, work_area) {
+            self.begin_geometry_transition(id, update.configure_size);
             info!(?id, mode = ?update.mode, "Updated window snap state");
             if let Some(window) = self.find_window_by_id(id)
                 && let Some(x11) = window.x11_surface()
@@ -1629,6 +1802,7 @@ impl NeonState {
         let Some(update) = self.wm.center_window(id, work_area) else {
             return false;
         };
+        self.begin_geometry_transition(id, update.configure_size);
         if let Some(window) = self.find_window_by_id(id)
             && let Some(x11) = window.x11_surface()
         {
@@ -1648,6 +1822,7 @@ impl NeonState {
         let Some(update) = self.wm.set_floating(id, work_area) else {
             return false;
         };
+        self.begin_geometry_transition(id, update.configure_size);
         if let Some(window) = self.find_window_by_id(id)
             && let Some(x11) = window.x11_surface()
         {
@@ -1713,18 +1888,27 @@ impl NeonState {
         if is_floating {
             self.minimize_window(id, serial);
         } else {
-            let work_area = self.work_area();
+            let work_area = self.effective_work_area_for(id);
             if let Some(update) = self.wm.set_floating(id, work_area) {
+                self.begin_geometry_transition(id, update.configure_size);
                 info!(?id, "Restored window to floating mode");
                 self.apply_layout_update(&update);
+                self.needs_redraw = true;
             }
         }
     }
 
     fn dock_swoop_delta_for(&self, id: WindowId) -> (f64, f64) {
         let out_sz = self.output_logical_size();
-        let dock_x = out_sz.w as f64 * 0.5;
-        let dock_y = (out_sz.h - 32).max(100) as f64;
+        let (dock_x, dock_y) = if let Some(anchor) = self.window_dock_anchors.get(&id) {
+            (anchor.x as f64, anchor.y as f64)
+        } else {
+            match self.config.dock.position {
+                DockPosition::Left => (28.0, out_sz.h as f64 * 0.5),
+                DockPosition::Right => ((out_sz.w - 28).max(100) as f64, out_sz.h as f64 * 0.5),
+                DockPosition::Bottom => (out_sz.w as f64 * 0.5, (out_sz.h - 28).max(100) as f64),
+            }
+        };
         if let Some(rect) = self
             .last_rendered_rects
             .get(&id)
@@ -1735,8 +1919,24 @@ impl NeonState {
             let cy = rect.loc.y as f64 + rect.size.h as f64 * 0.5;
             (dock_x - cx, dock_y - cy)
         } else {
-            (0.0, 260.0)
+            match self.config.dock.position {
+                DockPosition::Left => (-260.0, 0.0),
+                DockPosition::Right => (260.0, 0.0),
+                DockPosition::Bottom => (0.0, 260.0),
+            }
         }
+    }
+
+    /// Subtle directional pull toward the window's Dock icon for closing animations so closing
+    /// feels anchored to the Dock without mimicking a full minimize swoop.
+    fn close_swoop_delta_for(&self, id: WindowId) -> (f64, f64) {
+        let (dx, dy) = self.dock_swoop_delta_for(id);
+        let pull_x = (dx * 0.16).clamp(-56.0, 56.0);
+        let pull_y = match self.config.dock.position {
+            DockPosition::Bottom => (dy * 0.16).clamp(16.0, 52.0),
+            DockPosition::Left | DockPosition::Right => (dy * 0.16).clamp(-36.0, 36.0),
+        };
+        (pull_x, pull_y)
     }
 
     pub fn minimize_window(&mut self, id: WindowId, serial: Serial) {
@@ -1744,12 +1944,13 @@ impl NeonState {
         let work_area = self.work_area();
         if let Some(update) = self.wm.minimize(id, work_area) {
             info!(?id, "Minimized window");
+            self.pending_geometry_anims.remove(&id);
             let now = self.now_duration();
             let dur = self.effects.animate_window_minimize(id, dx, dy, now);
             if dur.is_zero() || self.backend_name == "headless" {
                 self.apply_layout_update(&update);
             } else {
-                // Keep window visible in Space while it swoops smoothly down into the Dock.
+                // Keep window visible in Space while it swoops smoothly into its Dock icon.
                 self.minimizing_windows.insert(id, now + dur);
                 self.needs_redraw = true;
             }
@@ -1784,6 +1985,7 @@ impl NeonState {
             return false;
         };
         self.minimizing_windows.remove(&id);
+        self.pending_geometry_anims.remove(&id);
         self.last_rendered_rects.remove(&id);
         self.apply_layout_update(&update);
         let (dx, dy) = self.dock_swoop_delta_for(id);
@@ -1807,6 +2009,7 @@ impl NeonState {
             }
             info!(id = ?update.id, mode = ?update.mode, "Restored minimized window");
             self.minimizing_windows.remove(&update.id);
+            self.pending_geometry_anims.remove(&update.id);
             self.last_rendered_rects.remove(&update.id);
             self.apply_layout_update(&update);
             let (dx, dy) = self.dock_swoop_delta_for(update.id);
@@ -2223,10 +2426,13 @@ impl NeonState {
         let mut lost_focus = false;
         for id in dead_ids {
             if let Some(window) = self.managed_windows.remove(&id) {
+                self.queue_close_ghost_if_visible(id, &window);
                 self.space.unmap_elem(&window);
             }
             self.ssd_windows.remove(&id);
             self.last_rendered_rects.remove(&id);
+            self.pending_geometry_anims.remove(&id);
+            self.window_dock_anchors.remove(&id);
             self.minimizing_windows.remove(&id);
             self.closing_windows.remove(&id);
             if self.hovered_titlebar_window == Some(id) {

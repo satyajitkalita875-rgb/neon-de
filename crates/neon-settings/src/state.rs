@@ -19,6 +19,7 @@ use crate::ui::style::SettingsTheme;
 
 type NavCallback = Rc<dyn Fn(&str, Option<&str>)>;
 type RebuildCallback = Rc<dyn Fn(&str)>;
+type ButtonLayoutCallback = Rc<dyn Fn(WindowButtonLayout)>;
 
 enum WorkerMsg {
     PersistAndSync {
@@ -48,6 +49,7 @@ pub struct SettingsController {
     pub window: ApplicationWindow,
     pub navigate_cb: RefCell<Option<NavCallback>>,
     pub rebuild_page_cb: RefCell<Option<RebuildCallback>>,
+    pub button_layout_cb: RefCell<Option<ButtonLayoutCallback>>,
     toast_generation: Rc<Cell<u64>>,
     worker_tx: mpsc::Sender<WorkerMsg>,
 }
@@ -108,6 +110,7 @@ impl SettingsController {
             window,
             navigate_cb: RefCell::new(None),
             rebuild_page_cb: RefCell::new(None),
+            button_layout_cb: RefCell::new(None),
             toast_generation: Rc::new(Cell::new(0)),
             worker_tx: tx,
         }
@@ -211,8 +214,19 @@ impl SettingsController {
         }
         self.persist_silent();
         self.push_full_config_live();
+        let layout = self.config.borrow().windows.button_layout;
+        apply_window_button_layout(layout);
+        self.notify_button_layout_changed(layout);
         self.rebuild_page(category_id);
         self.set_status_ok("Restored default settings");
+    }
+
+    /// Updates `neon-settings`'s own header window buttons live when button side changes.
+    pub fn notify_button_layout_changed(&self, layout: WindowButtonLayout) {
+        let cb = self.button_layout_cb.borrow().clone();
+        if let Some(cb) = cb {
+            cb(layout);
+        }
     }
 
     /// Navigates programmatically to any category (optionally focusing a setting id).
@@ -314,9 +328,14 @@ pub fn build_appearance_request(cfg: &NeonConfig) -> IpcRequest {
 }
 
 pub fn build_window_behavior_request(cfg: &NeonConfig) -> IpcRequest {
+    let layout = match cfg.windows.button_layout {
+        WindowButtonLayout::RightStandard => "right_standard",
+        WindowButtonLayout::LeftTrafficLights => "left_traffic_lights",
+    };
     IpcRequest::UpdateWindowBehavior {
         focus_follows_mouse: Some(cfg.windows.focus_mode == FocusMode::FocusFollowsMouse),
         snap_gap: Some(cfg.windows.snap_gap),
+        button_layout: Some(layout.into()),
     }
 }
 
@@ -394,23 +413,19 @@ pub fn apply_toolkit_appearance(
     });
 }
 
-/// Synchronizes window titlebar button layout (macOS left traffic lights vs right controls).
+/// Synchronizes window titlebar button layout (macOS left traffic lights vs right controls)
+/// across GTK4, gsettings (`org.gnome.desktop.wm.preferences button-layout`), and GTK3/4 `settings.ini`.
 pub fn apply_window_button_layout(layout: WindowButtonLayout) {
-    let val = match layout {
-        WindowButtonLayout::LeftTrafficLights => "close,minimize,maximize:",
-        WindowButtonLayout::RightStandard => ":minimize,maximize,close",
+    let buttons_right = layout == WindowButtonLayout::RightStandard;
+    let val = if buttons_right {
+        ":minimize,maximize,close"
+    } else {
+        "close,minimize,maximize:"
     };
     if let Some(s) = gtk4::Settings::default() {
         s.set_gtk_decoration_layout(Some(val));
     }
     std::thread::spawn(move || {
-        let _ = Command::new("gsettings")
-            .args([
-                "set",
-                "org.gnome.desktop.wm.preferences",
-                "button-layout",
-                val,
-            ])
-            .status();
+        neon_system::portals::sync_window_button_layout(buttons_right);
     });
 }

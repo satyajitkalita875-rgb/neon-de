@@ -179,6 +179,7 @@ uniform float u_corner_radius;
 uniform float u_focused;
 uniform float u_light_theme;
 uniform float u_hover_controls;
+uniform float u_buttons_right;
 uniform float u_opacity;
 
 float rounded_top_sdf(vec2 pos, vec2 sz, float r) {
@@ -222,12 +223,12 @@ void main() {
         bg = mix(bg, sep, 0.10);
     }
 
-    // macOS traffic-light buttons at top-left: Close (16, 14), Minimize (36, 14), Maximize (56, 14)
+    // Traffic-light controls placed on left (macOS: Close, Min, Max) or right (Standard: Min, Max, Close).
     float cy = size.y * 0.5;
     float btn_r = 6.0;
-    vec2 c_close = vec2(16.0, cy);
-    vec2 c_min   = vec2(36.0, cy);
-    vec2 c_max   = vec2(56.0, cy);
+    vec2 c_close = vec2(mix(16.0, size.x - 16.0, u_buttons_right), cy);
+    vec2 c_min   = vec2(mix(36.0, size.x - 56.0, u_buttons_right), cy);
+    vec2 c_max   = vec2(mix(56.0, size.x - 36.0, u_buttons_right), cy);
 
     float show_color = max(u_focused, u_hover_controls);
     vec3 inactive_dot = mix(vec3(0.36, 0.37, 0.41), vec3(0.76, 0.77, 0.79), u_light_theme);
@@ -497,6 +498,7 @@ impl NeonShaders {
                 UniformName::new("u_focused", UniformType::_1f),
                 UniformName::new("u_light_theme", UniformType::_1f),
                 UniformName::new("u_hover_controls", UniformType::_1f),
+                UniformName::new("u_buttons_right", UniformType::_1f),
                 UniformName::new("u_opacity", UniformType::_1f),
             ],
         )?;

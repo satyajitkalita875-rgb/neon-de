@@ -544,10 +544,28 @@ fn handle_pointer_button<B: InputBackend>(state: &mut NeonState, event: B::Point
                     return;
                 }
                 TitlebarHit::Drag => {
-                    let work_area = state.effective_work_area_for(id);
-                    if let Some(update) = state.wm.set_floating(id, work_area) {
-                        state.apply_layout_update(&update);
+                    let now_inst = std::time::Instant::now();
+                    let dbl_ms = u64::from(state.config.input.double_click_ms.clamp(200, 600));
+                    let is_double_click = state.last_titlebar_click.is_some_and(
+                        |(prev_id, prev_at, prev_pos)| {
+                            prev_id == id
+                                && now_inst.saturating_duration_since(prev_at)
+                                    <= std::time::Duration::from_millis(dbl_ms)
+                                && (pos.x - prev_pos.x).hypot(pos.y - prev_pos.y) <= 8.0
+                        },
+                    );
+                    if is_double_click {
+                        state.last_titlebar_click = None;
+                        state.toggle_maximize_window(id);
+                        return;
                     }
+                    state.last_titlebar_click = Some((id, now_inst, pos));
+
+                    let is_non_floating = state
+                        .wm
+                        .get(id)
+                        .map(|r| !r.mode.is_floating())
+                        .unwrap_or(false);
                     if let Some(window_loc) = state.space.element_location(&window) {
                         let start_data = PointerGrabStartData {
                             focus: state.surface_under(pos),
@@ -558,6 +576,7 @@ fn handle_pointer_button<B: InputBackend>(state: &mut NeonState, event: B::Point
                             start_data,
                             window,
                             initial_window_location: window_loc,
+                            pending_unmaximize: is_non_floating,
                         };
                         pointer.set_grab(state, grab, serial, Focus::Clear);
                     }
@@ -656,6 +675,7 @@ fn handle_pointer_button<B: InputBackend>(state: &mut NeonState, event: B::Point
                     start_data,
                     window,
                     initial_window_location: window_loc,
+                    pending_unmaximize: false,
                 };
                 pointer.set_grab(state, grab, serial, Focus::Clear);
                 return;

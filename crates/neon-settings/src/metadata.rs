@@ -111,8 +111,8 @@ pub const SETTINGS_REGISTRY: &[SettingMetadata] = &[
         category_id: "dock",
         category_title: "Desktop & Dock",
         name: "Window Focus, Snap Gap & Titlebar Buttons",
-        description: "Configure focus follows mouse, snap gap, inactive opacity, and button side.",
-        keywords: "window focus mouse snap gap titlebar traffic lights buttons macos",
+        description: "Configure focus follows mouse, snap gap, and left/right close, minimize, and maximize buttons.",
+        keywords: "window focus mouse snap gap titlebar traffic lights buttons close minimize maximize left right macos",
     },
     // Displays
     SettingMetadata {

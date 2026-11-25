@@ -144,6 +144,15 @@ window.neon-settings-window {{
     padding: 12px 6px 10px 6px;
 }}
 
+.settings-sidebar-top-spacer {{
+    min-height: 12px;
+}}
+
+.settings-right-controls {{
+    margin-left: 10px;
+    padding: 0 2px;
+}}
+
 /* Crisp macOS traffic lights */
 button.mac-dot {{
     background-image: none;
