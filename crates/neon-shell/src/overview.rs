@@ -40,6 +40,82 @@ const APPS_PER_PAGE: usize = LAUNCHPAD_COLS * LAUNCHPAD_ROWS;
 type BoolCallback = Rc<RefCell<Option<Box<dyn Fn(bool)>>>>;
 type VoidCallback = Rc<RefCell<Option<Box<dyn Fn()>>>>;
 
+struct ScrollPagingState {
+    in_gesture: bool,
+    gesture_consumed: bool,
+    accum: f64,
+    last_turn_at: Instant,
+}
+
+impl ScrollPagingState {
+    fn new() -> Self {
+        Self {
+            in_gesture: false,
+            gesture_consumed: false,
+            accum: 0.0,
+            last_turn_at: Instant::now()
+                .checked_sub(Duration::from_secs(1))
+                .unwrap_or_else(Instant::now),
+        }
+    }
+
+    fn reset_gesture(&mut self) {
+        self.in_gesture = false;
+        self.gesture_consumed = false;
+        self.accum = 0.0;
+    }
+
+    /// Evaluates a scroll delta and returns `Some(+1)` / `Some(-1)` when a single clean
+    /// page turn should fire, suppressing touchpad momentum bounces and mid-transition re-triggers.
+    fn consume_delta(&mut self, dx: f64, dy: f64, now: Instant, transitioning: bool) -> Option<isize> {
+        let primary = if dy.abs() >= dx.abs() { dy } else { dx };
+        if primary.abs() < 0.01 || transitioning {
+            return None;
+        }
+        let cooldown = Duration::from_millis(280);
+        if self.in_gesture {
+            if self.gesture_consumed {
+                return None;
+            }
+            // Reset accumulator cleanly if user reversed direction mid-gesture.
+            if self.accum != 0.0 && self.accum.signum() != primary.signum() {
+                self.accum = 0.0;
+            }
+            self.accum += primary;
+            if self.accum.abs() >= 0.90 && now.duration_since(self.last_turn_at) >= cooldown {
+                let dir = if self.accum > 0.0 { 1 } else { -1 };
+                self.gesture_consumed = true;
+                self.accum = 0.0;
+                self.last_turn_at = now;
+                return Some(dir);
+            }
+            return None;
+        }
+
+        if now.duration_since(self.last_turn_at) < cooldown {
+            return None;
+        }
+        // Discrete mouse wheel notches arrive with |primary| >= 0.8; smaller continuous deltas accumulate.
+        if primary.abs() < 0.35 {
+            if self.accum != 0.0 && self.accum.signum() != primary.signum() {
+                self.accum = 0.0;
+            }
+            self.accum += primary;
+            if self.accum.abs() < 0.85 {
+                return None;
+            }
+            let dir = if self.accum > 0.0 { 1 } else { -1 };
+            self.accum = 0.0;
+            self.last_turn_at = now;
+            Some(dir)
+        } else {
+            self.accum = 0.0;
+            self.last_turn_at = now;
+            Some(if primary > 0.0 { 1 } else { -1 })
+        }
+    }
+}
+
 /// Pure 60 FPS fullscreen blurred App Drawer (Launchpad).
 pub struct Overview {
     pub window: ApplicationWindow,
@@ -49,6 +125,9 @@ pub struct Overview {
     current_wp_sig: RefCell<Option<(PathBuf, bool, u32)>>,
     desired_open: Rc<Cell<bool>>,
     anim_gen: Rc<Cell<u64>>,
+    motion_enabled: Cell<bool>,
+    speed_scale: Cell<f64>,
+    suppress_reopen_until: Cell<Option<Instant>>,
     on_layer_elevate: BoolCallback,
     on_bg_hidden: BoolCallback,
     on_apps_refreshed: VoidCallback,
@@ -60,7 +139,7 @@ pub struct Overview {
     current_page: Rc<Cell<usize>>,
     page_count: Rc<Cell<usize>>,
     dot_buttons: Rc<RefCell<Vec<Button>>>,
-    last_scroll_at: Rc<RefCell<Instant>>,
+    scroll_state: Rc<RefCell<ScrollPagingState>>,
     context_menu: ContextMenuOverlay,
     ipc: IpcCommandSender,
 }
@@ -116,7 +195,7 @@ impl Overview {
             }
         }
 
-        let content_box = GtkBox::new(Orientation::Vertical, 18);
+        let content_box = GtkBox::new(Orientation::Vertical, 10);
         content_box.add_css_class("neon-launchpad-scrim");
         content_box.add_css_class("neon-launchpad-content");
         content_box.set_hexpand(true);
@@ -127,7 +206,7 @@ impl Overview {
         search_entry.add_css_class("neon-launchpad-search");
         search_entry.set_placeholder_text(Some("Search"));
         search_entry.set_halign(Align::Center);
-        search_entry.set_margin_top(8);
+        search_entry.set_margin_top(4);
         content_box.append(&search_entry);
 
         // Top-aligned 7×5 paged app grid wrapper: every page (Page 1, Page 2, ...) starts at Row 0!
@@ -136,13 +215,16 @@ impl Overview {
         pages_holder.set_vexpand(true);
         pages_holder.set_halign(Align::Center);
         pages_holder.set_valign(Align::Fill);
-        pages_holder.set_margin_top(16);
+        pages_holder.set_margin_top(6);
 
         let page_stack = Stack::new();
         page_stack.set_hexpand(true);
         page_stack.set_vexpand(true);
         page_stack.set_halign(Align::Center);
         page_stack.set_valign(Align::Start);
+        page_stack.set_hhomogeneous(true);
+        page_stack.set_vhomogeneous(true);
+        page_stack.set_interpolate_size(false);
         page_stack.set_transition_type(StackTransitionType::SlideLeftRight);
         page_stack.set_transition_duration(240);
         pages_holder.append(&page_stack);
@@ -177,6 +259,9 @@ impl Overview {
             current_wp_sig: RefCell::new(initial_sig),
             desired_open: Rc::new(Cell::new(false)),
             anim_gen: Rc::new(Cell::new(0)),
+            motion_enabled: Cell::new(true),
+            speed_scale: Cell::new(1.0),
+            suppress_reopen_until: Cell::new(None),
             on_layer_elevate: Rc::new(RefCell::new(None)),
             on_bg_hidden: Rc::new(RefCell::new(None)),
             on_apps_refreshed: Rc::new(RefCell::new(None)),
@@ -188,38 +273,47 @@ impl Overview {
             current_page: Rc::new(Cell::new(0)),
             page_count: Rc::new(Cell::new(1)),
             dot_buttons: Rc::new(RefCell::new(Vec::new())),
-            last_scroll_at: Rc::new(RefCell::new(
-                Instant::now()
-                    .checked_sub(Duration::from_secs(1))
-                    .unwrap_or_else(Instant::now),
-            )),
+            scroll_state: Rc::new(RefCell::new(ScrollPagingState::new())),
             context_menu,
             ipc,
         });
 
-        // 60 FPS smooth mouse wheel & trackpad horizontal/vertical page turning
+        // 60 FPS gesture-aware mouse wheel & touchpad page turning in Capture phase so child
+        // tiles or search widgets can never block or double-trigger scroll transitions.
         let scroll_ctrl = EventControllerScroll::new(EventControllerScrollFlags::BOTH_AXES);
+        scroll_ctrl.set_propagation_phase(gtk4::PropagationPhase::Capture);
+        {
+            let st = Rc::clone(&overview.scroll_state);
+            scroll_ctrl.connect_scroll_begin(move |_| {
+                let mut s = st.borrow_mut();
+                s.in_gesture = true;
+                s.gesture_consumed = false;
+                s.accum = 0.0;
+            });
+        }
+        {
+            let st = Rc::clone(&overview.scroll_state);
+            scroll_ctrl.connect_scroll_end(move |_| {
+                st.borrow_mut().reset_gesture();
+            });
+        }
         {
             let ov = Rc::clone(&overview);
             scroll_ctrl.connect_scroll(move |_, dx, dy| {
-                let primary = if dy.abs() >= dx.abs() { dy } else { dx };
-                if primary.abs() < 0.08 {
-                    return glib::Propagation::Proceed;
-                }
-                let now = Instant::now();
-                if now.duration_since(*ov.last_scroll_at.borrow()) < Duration::from_millis(220) {
-                    return glib::Propagation::Stop;
-                }
-                *ov.last_scroll_at.borrow_mut() = now;
-                if primary > 0.0 {
-                    ov.step_page(1);
-                } else {
-                    ov.step_page(-1);
+                let transitioning = ov.page_stack.is_transition_running();
+                let step = ov.scroll_state.borrow_mut().consume_delta(
+                    dx,
+                    dy,
+                    Instant::now(),
+                    transitioning,
+                );
+                if let Some(delta) = step {
+                    ov.step_page(delta);
                 }
                 glib::Propagation::Stop
             });
         }
-        overview.content_box.add_controller(scroll_ctrl);
+        overview.window.add_controller(scroll_ctrl);
 
         // Clicking empty blurred space closes the App Drawer smoothly
         let bg_click = GestureClick::new();
@@ -368,6 +462,38 @@ impl Overview {
         self.ipc.send(IpcRequest::SetOverview { open: false });
     }
 
+    /// Immediately closes the App Drawer with zero delayed timers (used when handing off directly
+    /// to Mission Control, Quick Settings, Power Menu, or Screenshot UI) and suppresses stale
+    /// `overview_open == true` IPC snapshots briefly until the compositor acknowledges close.
+    pub fn set_open_immediate(self: &Rc<Self>, open: bool) {
+        if open {
+            self.set_open(true);
+            return;
+        }
+        let was_active = self.desired_open.get() || self.window.is_visible();
+        let epoch = self.anim_gen.get().wrapping_add(1);
+        self.anim_gen.set(epoch);
+        self.desired_open.set(false);
+        self.suppress_reopen_until
+            .set(Some(Instant::now() + Duration::from_millis(450)));
+
+        self.backdrop_overlay.remove_css_class("lp-open");
+        self.backdrop_overlay.add_css_class("lp-closed");
+        if gtk4_layer_shell::is_supported() {
+            self.window.set_keyboard_mode(KeyboardMode::None);
+        }
+        self.window.set_visible(false);
+        if was_active {
+            if let Some(cb) = self.on_bg_hidden.borrow().as_ref() {
+                cb(false);
+            }
+            if let Some(cb) = self.on_layer_elevate.borrow().as_ref() {
+                cb(false);
+            }
+            self.ipc.send(IpcRequest::SetOverview { open: false });
+        }
+    }
+
     pub fn set_open(self: &Rc<Self>, open: bool) {
         if self.desired_open.get() == open && self.window.is_visible() == open {
             return;
@@ -377,6 +503,8 @@ impl Overview {
         self.desired_open.set(open);
 
         if open {
+            self.suppress_reopen_until.set(None);
+            self.scroll_state.borrow_mut().reset_gesture();
             // Immediately detect any newly installed Flatpak/Snap/system/PWA apps before presenting
             let _ = self.refresh_apps();
 
@@ -397,7 +525,7 @@ impl Overview {
 
             // 2. Present in closed zoomed-out state, wait 2 frame ticks so Wayland commits the
             //    initial frame cleanly, then simultaneously fade in the fullscreen blur AND fade
-            //    out the Top Bar & Dock backgrounds on the exact same frame (280ms seamless swap).
+            //    out the Top Bar & Dock backgrounds on the exact same frame.
             self.backdrop_overlay.remove_css_class("lp-open");
             self.backdrop_overlay.add_css_class("lp-closed");
             self.window.set_visible(true);
@@ -444,18 +572,34 @@ impl Overview {
                 }
             });
         } else {
+            self.suppress_reopen_until
+                .set(Some(Instant::now() + Duration::from_millis(350)));
             // Simultaneously fade out the fullscreen blur AND fade in the Top Bar & Dock
-            // backgrounds on the exact same frame with the exact same 280ms duration.
+            // backgrounds on the exact same frame.
             self.backdrop_overlay.remove_css_class("lp-open");
             self.backdrop_overlay.add_css_class("lp-closed");
             if let Some(cb) = self.on_bg_hidden.borrow().as_ref() {
                 cb(false);
             }
 
+            if !self.motion_enabled.get() {
+                if gtk4_layer_shell::is_supported() {
+                    self.window.set_keyboard_mode(KeyboardMode::None);
+                }
+                self.window.set_visible(false);
+                if let Some(cb) = self.on_layer_elevate.borrow().as_ref() {
+                    cb(false);
+                }
+                return;
+            }
+
+            let speed = self.speed_scale.get().clamp(0.5, 2.5);
+            let close_ms = ((290.0 / speed).round() as u64).clamp(110, 620);
+
             let win = self.window.clone();
             let gen_cell = Rc::clone(&self.anim_gen);
             let layer_hook = Rc::clone(&self.on_layer_elevate);
-            glib::timeout_add_local_once(Duration::from_millis(290), move || {
+            glib::timeout_add_local_once(Duration::from_millis(close_ms), move || {
                 if gen_cell.get() == epoch {
                     if gtk4_layer_shell::is_supported() {
                         win.set_keyboard_mode(KeyboardMode::None);
@@ -470,7 +614,25 @@ impl Overview {
     }
 
     pub fn update(self: &Rc<Self>, snapshot: &DesktopSnapshot) {
+        self.motion_enabled.set(
+            snapshot.effects.enabled
+                && !snapshot.effects.reduced_motion
+                && snapshot.effects.overview_animation,
+        );
+        self.speed_scale
+            .set(snapshot.effects.speed_scale.clamp(0.5, 2.5));
         self.update_appearance(&snapshot.appearance);
+        if !snapshot.overview_open {
+            self.suppress_reopen_until.set(None);
+        }
+        if snapshot.overview_open
+            && self
+                .suppress_reopen_until
+                .get()
+                .is_some_and(|until| Instant::now() < until)
+        {
+            return;
+        }
         if self.desired_open.get() != snapshot.overview_open {
             self.set_open(snapshot.overview_open);
         }
@@ -535,11 +697,17 @@ impl Overview {
 
             let apps_grid = Grid::new();
             apps_grid.set_column_spacing(34);
-            apps_grid.set_row_spacing(18);
+            apps_grid.set_row_spacing(6);
             apps_grid.set_column_homogeneous(true);
             apps_grid.set_row_homogeneous(false);
             apps_grid.set_halign(Align::Start);
             apps_grid.set_valign(Align::Start);
+            // Breathing room inside GtkStack's clip bounds so edge tiles (row 0, row 4, col 0,
+            // col 6) never get their 1.10x hover highlight sliced off by GtkStack overflow clipping.
+            apps_grid.set_margin_top(14);
+            apps_grid.set_margin_bottom(14);
+            apps_grid.set_margin_start(16);
+            apps_grid.set_margin_end(16);
 
             // Insert invisible placeholder spacers on empty columns of Row 0 for sparse pages
             // so a 2-app Page 2 keeps identical 7-column horizontal alignment with Page 1!
@@ -551,15 +719,15 @@ impl Overview {
 
                 let tile = Button::new();
                 tile.add_css_class("neon-launchpad-tile");
-                if let Some(comment) = &app.comment {
-                    tile.set_tooltip_text(Some(comment));
-                }
+                // Keep tiles clean of native GTK xdg_popup tooltips so dark tooltip bars never
+                // cover app icons or intercept Wayland pointer/scroll events mid-swipe.
+                tile.set_has_tooltip(false);
 
-                let vbox = GtkBox::new(Orientation::Vertical, 7);
+                let vbox = GtkBox::new(Orientation::Vertical, 5);
                 vbox.set_halign(Align::Center);
                 vbox.set_valign(Align::Center);
 
-                let icon = load_app_icon(app.icon.as_deref(), &app.name, 72);
+                let icon = load_app_icon(app.icon.as_deref(), &app.name, 56);
                 icon.set_halign(Align::Center);
                 icon.set_valign(Align::Center);
                 vbox.append(&icon);
@@ -575,7 +743,14 @@ impl Overview {
 
                 let app_clone = (*app).clone();
                 let ov = Rc::clone(self);
+                let win_launch = self.window.clone();
+                let tile_launch = tile.clone();
                 tile.connect_clicked(move |_| {
+                    if let Some(bounds) = tile_launch.compute_bounds(&win_launch) {
+                        let cx = (bounds.x() + bounds.width() * 0.5).round() as i32;
+                        let cy = (bounds.y() + bounds.height() * 0.5).round() as i32;
+                        ov.ipc.send(IpcRequest::SetLaunchOrigin { x: cx, y: cy });
+                    }
                     app_clone.launch();
                     ov.request_close();
                 });
@@ -642,21 +817,69 @@ impl Overview {
             *self.dot_buttons.borrow_mut() = dots_vec;
 
             for (p, dot) in self.dot_buttons.borrow().iter().enumerate() {
-                let page_cell = Rc::clone(&self.current_page);
-                let stack_ref = self.page_stack.clone();
-                let all_dots = Rc::clone(&self.dot_buttons);
+                let ov_dot = Rc::clone(self);
                 dot.connect_clicked(move |_| {
-                    page_cell.set(p);
-                    stack_ref.set_visible_child_name(&format!("page-{p}"));
-                    for (idx, d) in all_dots.borrow().iter().enumerate() {
-                        if idx == p {
-                            d.add_css_class("active");
-                        } else {
-                            d.remove_css_class("active");
-                        }
-                    }
+                    ov_dot.go_to_page(p);
                 });
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn touchpad_scroll_gesture_turns_exactly_one_page_and_ignores_rebound() {
+        let mut st = ScrollPagingState::new();
+        let t0 = Instant::now();
+        st.in_gesture = true;
+
+        // Micro-jitter below threshold should not turn a page.
+        assert_eq!(st.consume_delta(0.0, 0.3, t0, false), None);
+        // Reaching accumulated threshold turns page +1 once.
+        assert_eq!(
+            st.consume_delta(0.0, 0.7, t0 + Duration::from_millis(16), false),
+            Some(1)
+        );
+        // Further momentum events and finger-lift micro-rebound in the same gesture are ignored.
+        assert_eq!(
+            st.consume_delta(0.0, 1.5, t0 + Duration::from_millis(320), false),
+            None
+        );
+        assert_eq!(
+            st.consume_delta(0.0, -1.2, t0 + Duration::from_millis(360), false),
+            None
+        );
+
+        // After scroll_end and cooldown, a new gesture turns back cleanly.
+        st.reset_gesture();
+        st.in_gesture = true;
+        assert_eq!(
+            st.consume_delta(0.0, -1.1, t0 + Duration::from_millis(400), false),
+            Some(-1)
+        );
+    }
+
+    #[test]
+    fn mouse_wheel_scroll_respects_transition_and_cooldown() {
+        let mut st = ScrollPagingState::new();
+        let t0 = Instant::now();
+        assert_eq!(st.consume_delta(0.0, 1.0, t0, false), Some(1));
+        // Blocked while transitioning or within cooldown.
+        assert_eq!(
+            st.consume_delta(0.0, 1.0, t0 + Duration::from_millis(100), true),
+            None
+        );
+        assert_eq!(
+            st.consume_delta(0.0, -1.0, t0 + Duration::from_millis(200), false),
+            None
+        );
+        // Allowed once transition finishes and cooldown elapses.
+        assert_eq!(
+            st.consume_delta(0.0, -1.0, t0 + Duration::from_millis(310), false),
+            Some(-1)
+        );
     }
 }

@@ -279,6 +279,14 @@ fn build_arrangement_canvas(outputs: Vec<OutputInfo>) -> DrawingArea {
     area.set_hexpand(true);
 
     area.set_draw_func(move |_, cr, width, height| {
+        cr.set_antialias(gtk4::cairo::Antialias::Best);
+        if let Ok(mut fo) = gtk4::cairo::FontOptions::new() {
+            fo.set_antialias(gtk4::cairo::Antialias::Subpixel);
+            fo.set_subpixel_order(gtk4::cairo::SubpixelOrder::Rgb);
+            fo.set_hint_style(gtk4::cairo::HintStyle::Slight);
+            fo.set_hint_metrics(gtk4::cairo::HintMetrics::Off);
+            cr.set_font_options(&fo);
+        }
         let w = f64::from(width);
         let h = f64::from(height);
 

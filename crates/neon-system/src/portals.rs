@@ -104,6 +104,101 @@ pub fn sync_system_color_scheme(is_light: bool) {
             );
         }
     }
+    sync_system_font_antialiasing();
+}
+
+/// Ensures crisp system-wide font anti-aliasing across GTK3, GTK4, libadwaita, and portal-aware apps
+/// via `gsettings org.gnome.desktop.interface` and `~/.config/gtk-{3,4}.0/settings.ini`.
+pub fn sync_system_font_antialiasing() {
+    if std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_none() {
+        return;
+    }
+    for (key, val) in [
+        ("font-antialiasing", "rgba"),
+        ("font-hinting", "slight"),
+        ("font-rgba-order", "rgb"),
+        ("font-rendering", "manual"),
+    ] {
+        let _ = Command::new("gsettings")
+            .args(["set", "org.gnome.desktop.interface", key, val])
+            .status();
+    }
+    if let Some(config_home) = xdg_config_home() {
+        for (sub, is_gtk4) in [("gtk-3.0/settings.ini", false), ("gtk-4.0/settings.ini", true)] {
+            let path = config_home.join(sub);
+            let _ = update_gtk_font_aa_ini(&path, is_gtk4);
+        }
+    }
+}
+
+/// Writes smooth font anti-aliasing keys into a GTK 3 / GTK 4 `settings.ini` file cleanly.
+pub fn update_gtk_font_aa_ini_text(existing: &str, is_gtk4: bool) -> String {
+    let mut pairs: Vec<(&str, &str)> = vec![
+        ("gtk-xft-antialias", "1"),
+        ("gtk-xft-hinting", "1"),
+        ("gtk-xft-hintstyle", "hintslight"),
+        ("gtk-xft-rgba", "rgb"),
+    ];
+    if is_gtk4 {
+        pairs.push(("gtk-hint-font-metrics", "1"));
+        pairs.push(("gtk-font-rendering", "manual"));
+    }
+
+    let mut written = vec![false; pairs.len()];
+    let mut out: Vec<String> = Vec::new();
+    let mut in_settings = false;
+    let mut saw_settings_header = false;
+
+    for raw_line in existing.lines() {
+        let trimmed = raw_line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            if in_settings {
+                for (idx, (k, v)) in pairs.iter().enumerate() {
+                    if !written[idx] {
+                        out.push(format!("{k}={v}"));
+                        written[idx] = true;
+                    }
+                }
+            }
+            in_settings = trimmed == "[Settings]";
+            if in_settings {
+                saw_settings_header = true;
+            }
+            out.push(raw_line.to_string());
+            continue;
+        }
+        if in_settings
+            && let Some((k, _)) = trimmed.split_once('=')
+            && let Some(idx) = pairs.iter().position(|(pk, _)| *pk == k.trim())
+        {
+            out.push(format!("{}={}", pairs[idx].0, pairs[idx].1));
+            written[idx] = true;
+            continue;
+        }
+        out.push(raw_line.to_string());
+    }
+
+    if !saw_settings_header {
+        out.push("[Settings]".to_string());
+    }
+    for (idx, (k, v)) in pairs.iter().enumerate() {
+        if !written[idx] {
+            out.push(format!("{k}={v}"));
+        }
+    }
+
+    let mut result = out.join("\n");
+    result.push('\n');
+    result
+}
+
+fn update_gtk_font_aa_ini(path: &Path, is_gtk4: bool) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let existing = fs::read_to_string(path).unwrap_or_default();
+    let updated = update_gtk_font_aa_ini_text(&existing, is_gtk4);
+    fs::write(path, updated)
 }
 
 /// Synchronizes window titlebar button placement (`Left` macOS vs `Right` Standard) across
@@ -445,5 +540,22 @@ mod tests {
 
         let fresh = update_gtk_decoration_layout_ini_text("", "close,minimize,maximize:");
         assert_eq!(fresh, "[Settings]\ngtk-decoration-layout=close,minimize,maximize:\n");
+    }
+
+    #[test]
+    fn gtk_font_aa_ini_enables_smooth_subpixel_rendering_for_gtk3_and_gtk4() {
+        let input = "[Settings]\ngtk-theme-name=Adwaita-dark\ngtk-xft-rgba=none\n";
+        let gtk4 = update_gtk_font_aa_ini_text(input, true);
+        assert!(gtk4.contains("gtk-theme-name=Adwaita-dark\n"));
+        assert!(gtk4.contains("gtk-xft-antialias=1\n"));
+        assert!(gtk4.contains("gtk-xft-hinting=1\n"));
+        assert!(gtk4.contains("gtk-xft-hintstyle=hintslight\n"));
+        assert!(gtk4.contains("gtk-xft-rgba=rgb\n"));
+        assert!(gtk4.contains("gtk-hint-font-metrics=1\n"));
+        assert!(gtk4.contains("gtk-font-rendering=manual\n"));
+
+        let gtk3 = update_gtk_font_aa_ini_text(input, false);
+        assert!(gtk3.contains("gtk-xft-rgba=rgb\n"));
+        assert!(!gtk3.contains("gtk-font-rendering="));
     }
 }

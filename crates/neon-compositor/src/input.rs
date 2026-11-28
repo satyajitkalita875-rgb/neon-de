@@ -24,10 +24,11 @@ use smithay::{
 use tracing::info;
 
 use crate::{
-    grabs::{MoveSurfaceGrab, ResizeEdge, ResizeSurfaceGrab},
+    grabs::{MoveSurfaceGrab, ResizeEdge, ResizeSurfaceGrab, TileSplitResizeGrab},
     state::{NeonState, TitlebarHit},
     window::{FocusPolicy, SnapRegion, window_id},
 };
+use neon_window_manager::tiling::SplitAxis;
 
 const BTN_LEFT: u32 = 0x110;
 const BTN_RIGHT: u32 = 0x111;
@@ -39,15 +40,24 @@ enum CompositorAction {
     ToggleOverview,
     LockSession,
     OpenScreenshotUi,
+    ToggleClipboard,
+    ToggleDynamicIsland,
     TakeScreenshot,
     CloseFocused,
     CycleFocus,
     ToggleMaximize,
-    UnmaximizeOrMinimize,
     ToggleFullscreen,
     MinimizeFocused,
     RestoreLastMinimized,
-    Snap(SnapRegion),
+    ArrowDir(i32, i32),
+    ToggleAutoTiling,
+    CycleTilingLayout,
+    ToggleWindowFloat,
+    ToggleSplitOrientation,
+    PromoteToMaster,
+    SwapTile(i32, i32),
+    ResizeTile(f32, f32),
+    ResetTileRatios,
     SwitchWorkspaceNext,
     SwitchWorkspacePrev,
     SwitchWorkspaceIndex(usize),
@@ -188,7 +198,25 @@ fn handle_keyboard<B: InputBackend>(state: &mut NeonState, event: B::KeyboardKey
             }
 
             if modifiers.logo {
-                if modifiers.shift {
+                if modifiers.ctrl && !modifiers.shift && !modifiers.alt {
+                    if sym == Keysym::from(keysyms::KEY_Left) {
+                        return FilterResult::Intercept(CompositorAction::ResizeTile(-0.05, 0.0));
+                    }
+                    if sym == Keysym::from(keysyms::KEY_Right) {
+                        return FilterResult::Intercept(CompositorAction::ResizeTile(0.05, 0.0));
+                    }
+                    if sym == Keysym::from(keysyms::KEY_Up) {
+                        return FilterResult::Intercept(CompositorAction::ResizeTile(0.0, -0.05));
+                    }
+                    if sym == Keysym::from(keysyms::KEY_Down) {
+                        return FilterResult::Intercept(CompositorAction::ResizeTile(0.0, 0.05));
+                    }
+                    if sym == Keysym::from(keysyms::KEY_0)
+                        || sym == Keysym::from(keysyms::KEY_equal)
+                    {
+                        return FilterResult::Intercept(CompositorAction::ResetTileRatios);
+                    }
+                } else if modifiers.shift {
                     if sym == Keysym::from(keysyms::KEY_Page_Down) {
                         return FilterResult::Intercept(
                             CompositorAction::MoveFocusedToNextWorkspace,
@@ -201,6 +229,27 @@ fn handle_keyboard<B: InputBackend>(state: &mut NeonState, event: B::KeyboardKey
                     }
                     if sym == Keysym::from(keysyms::KEY_H) || sym == Keysym::from(keysyms::KEY_h) {
                         return FilterResult::Intercept(CompositorAction::RestoreLastMinimized);
+                    }
+                    if sym == Keysym::from(keysyms::KEY_T) || sym == Keysym::from(keysyms::KEY_t) {
+                        return FilterResult::Intercept(CompositorAction::CycleTilingLayout);
+                    }
+                    if sym == Keysym::from(keysyms::KEY_F) || sym == Keysym::from(keysyms::KEY_f) {
+                        return FilterResult::Intercept(CompositorAction::ToggleWindowFloat);
+                    }
+                    if sym == Keysym::from(keysyms::KEY_Return) {
+                        return FilterResult::Intercept(CompositorAction::PromoteToMaster);
+                    }
+                    if sym == Keysym::from(keysyms::KEY_Left) {
+                        return FilterResult::Intercept(CompositorAction::SwapTile(-1, 0));
+                    }
+                    if sym == Keysym::from(keysyms::KEY_Right) {
+                        return FilterResult::Intercept(CompositorAction::SwapTile(1, 0));
+                    }
+                    if sym == Keysym::from(keysyms::KEY_Up) {
+                        return FilterResult::Intercept(CompositorAction::SwapTile(0, -1));
+                    }
+                    if sym == Keysym::from(keysyms::KEY_Down) {
+                        return FilterResult::Intercept(CompositorAction::SwapTile(0, 1));
                     }
                 } else {
                     if sym == Keysym::from(keysyms::KEY_Return) {
@@ -225,20 +274,31 @@ fn handle_keyboard<B: InputBackend>(state: &mut NeonState, event: B::KeyboardKey
                         return FilterResult::Intercept(CompositorAction::SwitchWorkspacePrev);
                     }
                     if sym == Keysym::from(keysyms::KEY_Left) {
-                        return FilterResult::Intercept(CompositorAction::Snap(
-                            SnapRegion::LeftHalf,
-                        ));
+                        return FilterResult::Intercept(CompositorAction::ArrowDir(-1, 0));
                     }
                     if sym == Keysym::from(keysyms::KEY_Right) {
-                        return FilterResult::Intercept(CompositorAction::Snap(
-                            SnapRegion::RightHalf,
-                        ));
+                        return FilterResult::Intercept(CompositorAction::ArrowDir(1, 0));
                     }
                     if sym == Keysym::from(keysyms::KEY_Up) {
-                        return FilterResult::Intercept(CompositorAction::ToggleMaximize);
+                        return FilterResult::Intercept(CompositorAction::ArrowDir(0, -1));
                     }
                     if sym == Keysym::from(keysyms::KEY_Down) {
-                        return FilterResult::Intercept(CompositorAction::UnmaximizeOrMinimize);
+                        return FilterResult::Intercept(CompositorAction::ArrowDir(0, 1));
+                    }
+                    if sym == Keysym::from(keysyms::KEY_m) || sym == Keysym::from(keysyms::KEY_M) {
+                        return FilterResult::Intercept(CompositorAction::ToggleMaximize);
+                    }
+                    if sym == Keysym::from(keysyms::KEY_t) || sym == Keysym::from(keysyms::KEY_T) {
+                        return FilterResult::Intercept(CompositorAction::ToggleAutoTiling);
+                    }
+                    if sym == Keysym::from(keysyms::KEY_v) || sym == Keysym::from(keysyms::KEY_V) {
+                        return FilterResult::Intercept(CompositorAction::ToggleClipboard);
+                    }
+                    if sym == Keysym::from(keysyms::KEY_n) || sym == Keysym::from(keysyms::KEY_N) {
+                        return FilterResult::Intercept(CompositorAction::ToggleDynamicIsland);
+                    }
+                    if sym == Keysym::from(keysyms::KEY_j) || sym == Keysym::from(keysyms::KEY_J) {
+                        return FilterResult::Intercept(CompositorAction::ToggleSplitOrientation);
                     }
                     if sym == Keysym::from(keysyms::KEY_f)
                         || sym == Keysym::from(keysyms::KEY_F)
@@ -301,17 +361,53 @@ fn handle_keyboard<B: InputBackend>(state: &mut NeonState, event: B::KeyboardKey
             CompositorAction::OpenScreenshotUi => {
                 state.pending_screenshot_ui = true;
             }
+            CompositorAction::ToggleClipboard => {
+                state.pending_clipboard_toggle = true;
+                state.needs_redraw = true;
+            }
+            CompositorAction::ToggleDynamicIsland => {
+                state.pending_island_toggle = true;
+                state.needs_redraw = true;
+            }
             CompositorAction::TakeScreenshot => {
                 state.request_screenshot(None, None);
             }
             CompositorAction::CloseFocused => state.close_focused_window(),
             CompositorAction::CycleFocus => state.cycle_focus(serial),
             CompositorAction::ToggleMaximize => state.toggle_maximize_focused(),
-            CompositorAction::UnmaximizeOrMinimize => state.unmaximize_or_minimize_focused(serial),
             CompositorAction::ToggleFullscreen => state.toggle_fullscreen_focused(),
             CompositorAction::MinimizeFocused => state.minimize_focused(serial),
             CompositorAction::RestoreLastMinimized => state.restore_last_minimized(serial),
-            CompositorAction::Snap(region) => state.snap_focused(region),
+            CompositorAction::ArrowDir(dx, dy) => {
+                if state.wm.is_auto_tiling() {
+                    let focused_maximized = state
+                        .wm
+                        .focused_id()
+                        .and_then(|id| state.wm.get(id))
+                        .is_some_and(|w| w.mode.is_maximized());
+                    if dy > 0 && focused_maximized {
+                        state.toggle_maximize_focused();
+                    } else {
+                        state.focus_tiled_in_direction(dx, dy, serial);
+                    }
+                } else {
+                    match (dx, dy) {
+                        (-1, 0) => state.snap_focused(SnapRegion::LeftHalf),
+                        (1, 0) => state.snap_focused(SnapRegion::RightHalf),
+                        (0, -1) => state.toggle_maximize_focused(),
+                        (0, 1) => state.unmaximize_or_minimize_focused(serial),
+                        _ => {}
+                    }
+                }
+            }
+            CompositorAction::ToggleAutoTiling => state.toggle_auto_tiling(),
+            CompositorAction::CycleTilingLayout => state.cycle_tiling_layout(),
+            CompositorAction::ToggleWindowFloat => state.toggle_window_float(None),
+            CompositorAction::ToggleSplitOrientation => state.toggle_focused_split_orientation(),
+            CompositorAction::PromoteToMaster => state.promote_focused_to_master(),
+            CompositorAction::SwapTile(dx, dy) => state.swap_focused_tile_in_direction(dx, dy),
+            CompositorAction::ResizeTile(dx, dy) => state.resize_focused_tile(dx, dy),
+            CompositorAction::ResetTileRatios => state.reset_active_workspace_tile_ratios(),
             CompositorAction::SwitchWorkspaceNext => {
                 state.switch_workspace_next(serial);
             }
@@ -383,6 +479,49 @@ fn apply_pointer_motion_at(
         None
     };
     state.hovered_titlebar_window = hovered_tb;
+
+    // Show crisp resize cursor when hovering an interactive gap/divider between tiled windows.
+    let pointer_grabbed = state
+        .seat
+        .get_pointer()
+        .map(|p| p.is_grabbed())
+        .unwrap_or(false);
+    if !pointer_grabbed
+        && !state.is_locked()
+        && state.wm.is_auto_tiling()
+        && hovered_tb.is_none()
+        && state.upper_layer_surface_under(pos).is_none()
+    {
+        let covered_by_non_tiled = state
+            .window_under(pos)
+            .and_then(|(w, _)| window_id(&w))
+            .and_then(|id| state.wm.get(id))
+            .is_some_and(|w| !w.mode.is_tiled());
+        let active_ws = state.wm.active_workspace_id();
+        let wa = state.work_area();
+        if !covered_by_non_tiled
+            && let Some(div) = state
+                .wm
+                .divider_at_point(active_ws, pos.x.round() as i32, pos.y.round() as i32, wa)
+        {
+            let icon = match div.axis {
+                SplitAxis::VerticalDivider => smithay::input::pointer::CursorIcon::EwResize,
+                SplitAxis::HorizontalDivider => smithay::input::pointer::CursorIcon::NsResize,
+            };
+            state.cursor_status = smithay::input::pointer::CursorImageStatus::Named(icon);
+            state.hovering_tile_divider = true;
+        } else if state.hovering_tile_divider {
+            state.hovering_tile_divider = false;
+            state.cursor_status = smithay::input::pointer::CursorImageStatus::Named(
+                smithay::input::pointer::CursorIcon::Default,
+            );
+        }
+    } else if state.hovering_tile_divider && !pointer_grabbed {
+        state.hovering_tile_divider = false;
+        state.cursor_status = smithay::input::pointer::CursorImageStatus::Named(
+            smithay::input::pointer::CursorIcon::Default,
+        );
+    }
 
     let serial = SERIAL_COUNTER.next_serial();
     let under = if state.is_locked() {
@@ -561,10 +700,15 @@ fn handle_pointer_button<B: InputBackend>(state: &mut NeonState, event: B::Point
                     }
                     state.last_titlebar_click = Some((id, now_inst, pos));
 
+                    let is_tiled = state
+                        .wm
+                        .get(id)
+                        .map(|r| r.mode.is_tiled())
+                        .unwrap_or(false);
                     let is_non_floating = state
                         .wm
                         .get(id)
-                        .map(|r| !r.mode.is_floating())
+                        .map(|r| !r.mode.is_floating() && !r.mode.is_tiled())
                         .unwrap_or(false);
                     if let Some(window_loc) = state.space.element_location(&window) {
                         let start_data = PointerGrabStartData {
@@ -577,12 +721,46 @@ fn handle_pointer_button<B: InputBackend>(state: &mut NeonState, event: B::Point
                             window,
                             initial_window_location: window_loc,
                             pending_unmaximize: is_non_floating,
+                            pending_tile_drag: is_tiled,
+                            committed: false,
                         };
                         pointer.set_grab(state, grab, serial, Focus::Clear);
                     }
                     return;
                 }
             }
+        } else if button == BTN_LEFT
+            && !super_held
+            && !alt_held
+            && state.wm.is_auto_tiling()
+            && !state
+                .window_under(pos)
+                .and_then(|(w, _)| window_id(&w))
+                .and_then(|id| state.wm.get(id))
+                .is_some_and(|w| !w.mode.is_tiled())
+            && let Some(div) = state.wm.divider_at_point(
+                state.wm.active_workspace_id(),
+                pos.x.round() as i32,
+                pos.y.round() as i32,
+                state.work_area(),
+            )
+        {
+            // Direct mouse drag on the gap/divider between two tiled panes resizes the split live!
+            let icon = match div.axis {
+                SplitAxis::VerticalDivider => smithay::input::pointer::CursorIcon::EwResize,
+                SplitAxis::HorizontalDivider => smithay::input::pointer::CursorIcon::NsResize,
+            };
+            state.cursor_status = smithay::input::pointer::CursorImageStatus::Named(icon);
+            state.needs_redraw = true;
+            let start_data = PointerGrabStartData {
+                focus: state.surface_under(pos),
+                button,
+                location: pos,
+            };
+            let ws_id = state.wm.active_workspace_id();
+            let grab = TileSplitResizeGrab::start(start_data, ws_id, div);
+            pointer.set_grab(state, grab, serial, Focus::Clear);
+            return;
         } else if let Some((window, mut window_loc)) = state.window_under(pos) {
             // Click-to-focus & raise; if this window currently owns a visible transient/modal
             // child dialog (e.g. DaVinci Resolve's "Create New Project"), keep that child
@@ -608,63 +786,78 @@ fn handle_pointer_button<B: InputBackend>(state: &mut NeonState, event: B::Point
                 return;
             }
 
-            // Super+Left-Click or Alt+Left-Click interactive window Move (auto-unmaximizes/unsnaps cleanly).
+            // Super+Left-Click or Alt+Left-Click interactive window Move (auto-unmaximizes/unsnaps cleanly;
+            // keeps tiled windows tiled so Hyprland drag-to-swap works smoothly).
             if (super_held || alt_held) && button == BTN_LEFT {
                 let old_loc = window_loc;
                 let old_size = window.geometry().size;
                 if let Some(id) = window_id(&window) {
+                    let is_tiled = state
+                        .wm
+                        .get(id)
+                        .map(|r| r.mode.is_tiled())
+                        .unwrap_or(false);
                     let was_non_floating = state
                         .wm
                         .get(id)
-                        .map(|r| !r.mode.is_floating())
+                        .map(|r| !r.mode.is_floating() && !r.mode.is_tiled())
                         .unwrap_or(false);
-                    let work_area = state.effective_work_area_for(id);
-                    if let Some(update) = state.wm.set_floating(id, work_area) {
-                        if let Some(x11) = window.x11_surface() {
-                            let _ = x11.set_maximized(false);
-                            let _ = x11.set_fullscreen(false);
-                            if let (Some(loc), Some(sz)) =
-                                (update.target_location, update.configure_size)
-                            {
-                                let _ = x11.configure(Rectangle::new(
-                                    crate::window::from_wm_point(loc),
-                                    crate::window::from_wm_size(sz),
-                                ));
-                            }
-                        }
-                        state.apply_layout_update(&update);
-                        // Keep pointer proportionally positioned over the restored window when
-                        // dragging out of maximized/snapped mode.
-                        if was_non_floating && old_size.w > 0 {
-                            let new_w = update
-                                .configure_size
-                                .map(|s| s.w)
-                                .unwrap_or(old_size.w)
-                                .max(200);
-                            let ratio_x = ((pos.x - old_loc.x as f64) / old_size.w as f64)
-                                .clamp(0.12, 0.88);
-                            let new_x = (pos.x - new_w as f64 * ratio_x).round() as i32;
-                            let new_y = (pos.y - 24.0).round().max(work_area.loc.y as f64) as i32;
-                            let adjusted: smithay::utils::Point<i32, smithay::utils::Logical> =
-                                (new_x, new_y).into();
-                            state.space.map_element(window.clone(), adjusted, true);
-                            state
-                                .wm
-                                .set_floating_location(id, crate::window::to_wm_point(adjusted));
+                    if !is_tiled {
+                        let work_area = state.effective_work_area_for(id);
+                        if let Some(update) = state.wm.set_floating(id, work_area) {
                             if let Some(x11) = window.x11_surface() {
-                                let mut g = x11.geometry();
-                                g.loc = adjusted;
-                                let _ = x11.configure(g);
+                                let _ = x11.set_maximized(false);
+                                let _ = x11.set_fullscreen(false);
+                                if let (Some(loc), Some(sz)) =
+                                    (update.target_location, update.configure_size)
+                                {
+                                    let _ = x11.configure(Rectangle::new(
+                                        crate::window::from_wm_point(loc),
+                                        crate::window::from_wm_size(sz),
+                                    ));
+                                }
                             }
-                            window_loc = adjusted;
-                        } else if let Some(loc) = state.space.element_location(&window) {
-                            window_loc = loc;
+                            state.apply_layout_update(&update);
+                            // Keep pointer proportionally positioned over the restored window when
+                            // dragging out of maximized/snapped mode.
+                            if was_non_floating && old_size.w > 0 {
+                                let new_w = update
+                                    .configure_size
+                                    .map(|s| s.w)
+                                    .unwrap_or(old_size.w)
+                                    .max(200);
+                                let ratio_x = ((pos.x - old_loc.x as f64) / old_size.w as f64)
+                                    .clamp(0.12, 0.88);
+                                let new_x = (pos.x - new_w as f64 * ratio_x).round() as i32;
+                                let new_y =
+                                    (pos.y - 24.0).round().max(work_area.loc.y as f64) as i32;
+                                let adjusted: smithay::utils::Point<i32, smithay::utils::Logical> =
+                                    (new_x, new_y).into();
+                                state.space.map_element(window.clone(), adjusted, true);
+                                state
+                                    .wm
+                                    .set_floating_location(id, crate::window::to_wm_point(adjusted));
+                                if let Some(x11) = window.x11_surface() {
+                                    let mut g = x11.geometry();
+                                    g.loc = adjusted;
+                                    let _ = x11.configure(g);
+                                }
+                                window_loc = adjusted;
+                            } else if let Some(loc) = state.space.element_location(&window) {
+                                window_loc = loc;
+                            }
                         }
                     }
                 }
-                state.cursor_status = smithay::input::pointer::CursorImageStatus::Named(
-                    smithay::input::pointer::CursorIcon::Grabbing,
-                );
+                let is_tiled = window_id(&window)
+                    .and_then(|id| state.wm.get(id))
+                    .map(|r| r.mode.is_tiled())
+                    .unwrap_or(false);
+                if !is_tiled {
+                    state.cursor_status = smithay::input::pointer::CursorImageStatus::Named(
+                        smithay::input::pointer::CursorIcon::Grabbing,
+                    );
+                }
                 state.needs_redraw = true;
                 let start_data = PointerGrabStartData {
                     focus: state.surface_under(pos),
@@ -676,14 +869,72 @@ fn handle_pointer_button<B: InputBackend>(state: &mut NeonState, event: B::Point
                     window,
                     initial_window_location: window_loc,
                     pending_unmaximize: false,
+                    pending_tile_drag: is_tiled,
+                    committed: false,
                 };
                 pointer.set_grab(state, grab, serial, Focus::Clear);
                 return;
             }
 
-            // Super+Right-Click or Alt+Right-Click interactive quadrant-smart window Resize.
+            // Super+Right-Click or Alt+Right-Click interactive quadrant-smart window Resize
+            // (live split-divider resize when the window is tiled!).
             if (super_held || alt_held) && button == BTN_RIGHT {
                 if let Some(id) = window_id(&window) {
+                    let is_tiled = state.wm.is_auto_tiling()
+                        && state.wm.get(id).is_some_and(|w| w.mode.is_tiled());
+                    if is_tiled {
+                        let initial_size = window.geometry().size;
+                        let rel_x = pos.x - window_loc.x as f64;
+                        let rel_y = pos.y - window_loc.y as f64;
+                        let horiz_pos = rel_x >= initial_size.w as f64 * 0.5;
+                        let vert_pos = rel_y >= initial_size.h as f64 * 0.5;
+                        let dx_norm = ((rel_x / initial_size.w.max(1) as f64) - 0.5).abs();
+                        let dy_norm = ((rel_y / initial_size.h.max(1) as f64) - 0.5).abs();
+                        let prefer_vert_div = dx_norm >= dy_norm;
+                        let wa = state.work_area();
+                        let ws_id = state
+                            .wm
+                            .get(id)
+                            .map(|w| w.workspace_id)
+                            .unwrap_or_else(|| state.wm.active_workspace_id());
+                        let chosen = state
+                            .wm
+                            .divider_for_window_edge(
+                                id,
+                                prefer_vert_div,
+                                if prefer_vert_div { horiz_pos } else { vert_pos },
+                                wa,
+                            )
+                            .or_else(|| {
+                                state.wm.divider_for_window_edge(
+                                    id,
+                                    !prefer_vert_div,
+                                    if !prefer_vert_div { horiz_pos } else { vert_pos },
+                                    wa,
+                                )
+                            });
+                        if let Some(div) = chosen {
+                            let icon = match div.axis {
+                                SplitAxis::VerticalDivider => {
+                                    smithay::input::pointer::CursorIcon::EwResize
+                                }
+                                SplitAxis::HorizontalDivider => {
+                                    smithay::input::pointer::CursorIcon::NsResize
+                                }
+                            };
+                            state.cursor_status =
+                                smithay::input::pointer::CursorImageStatus::Named(icon);
+                            state.needs_redraw = true;
+                            let start_data = PointerGrabStartData {
+                                focus: state.surface_under(pos),
+                                button,
+                                location: pos,
+                            };
+                            let grab = TileSplitResizeGrab::start(start_data, ws_id, div);
+                            pointer.set_grab(state, grab, serial, Focus::Clear);
+                        }
+                        return;
+                    }
                     let work_area = state.effective_work_area_for(id);
                     if let Some(update) = state.wm.set_floating(id, work_area) {
                         if let Some(x11) = window.x11_surface() {

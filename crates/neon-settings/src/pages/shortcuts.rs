@@ -35,6 +35,16 @@ const ACTIVE_SHORTCUTS: &[ShortcutEntry] = &[
     },
     ShortcutEntry {
         group: "Desktop & Launcher",
+        action: "Open / Close Dynamic Island",
+        keys: "Super + N",
+    },
+    ShortcutEntry {
+        group: "Desktop & Launcher",
+        action: "Open Clipboard History (Dynamic Island)",
+        keys: "Super + V",
+    },
+    ShortcutEntry {
+        group: "Desktop & Launcher",
         action: "Interactive Screenshot",
         keys: "Print  /  Super + Shift + S  /  Super + Shift + 4",
     },
@@ -73,6 +83,11 @@ const ACTIVE_SHORTCUTS: &[ShortcutEntry] = &[
         group: "Windows",
         action: "Snap Window Left / Right",
         keys: "Super + Left  /  Super + Right",
+    },
+    ShortcutEntry {
+        group: "Windows",
+        action: "Toggle Floating Window",
+        keys: "Super + Shift + F",
     },
     // Workspaces
     ShortcutEntry {

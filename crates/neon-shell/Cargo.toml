@@ -18,6 +18,8 @@ gtk4-layer-shell.workspace = true
 neon-config.workspace = true
 neon-ipc.workspace = true
 neon-system.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 

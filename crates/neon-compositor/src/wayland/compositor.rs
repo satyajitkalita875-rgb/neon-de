@@ -4,7 +4,7 @@ use smithay::{
     backend::{allocator::dmabuf::Dmabuf, renderer::utils::on_commit_buffer_handler},
     desktop::{WindowSurfaceType, find_popup_root_surface, layer_map_for_output},
     reexports::wayland_server::{
-        Client,
+        Client, Resource,
         protocol::{wl_buffer::WlBuffer, wl_surface::WlSurface},
     },
     utils::SERIAL_COUNTER,
@@ -131,11 +131,35 @@ impl CompositorHandler for NeonState {
                 });
 
                 if !initial_configure_sent {
+                    // Auto-float fixed-size or small utility dialogs (e.g. calculators, password
+                    // prompts, compact popups) so Auto-Tiling never stretches them awkwardly.
+                    let is_fixed_or_tiny = with_states(surface, |states| {
+                        let mut cached = states
+                            .cached_state
+                            .get::<smithay::wayland::shell::xdg::SurfaceCachedState>();
+                        let cur = cached.current();
+                        let fixed = cur.min_size.w > 0
+                            && cur.min_size.h > 0
+                            && cur.min_size == cur.max_size;
+                        let tiny_max = cur.max_size.w > 0
+                            && cur.max_size.w < 500
+                            && cur.max_size.h > 0
+                            && cur.max_size.h < 400;
+                        fixed || tiny_max
+                    });
+                    if is_fixed_or_tiny {
+                        self.wm.set_float_override(id, true);
+                    }
                     // Evaluate any matching window rules before sending the initial configure so
                     // maximized/snapped/sized rules take effect on the very first frame.
                     let work_area = self.work_area();
                     if let Some((_eval, update)) = self.wm.apply_rules_if_needed(id, work_area) {
                         self.apply_layout_update(&update);
+                    }
+                    if self.wm.is_auto_tiling()
+                        && let Some(ws_id) = self.wm.get(id).map(|w| w.workspace_id)
+                    {
+                        self.relayout_auto_tiling_for_workspace(ws_id);
                     }
                     trace!(?id, "Sending initial xdg_toplevel configure");
                     toplevel.send_configure();
@@ -168,8 +192,7 @@ impl CompositorHandler for NeonState {
                         .map(|w| w.is_visible_on(self.wm.active_workspace_id()))
                         .unwrap_or(false)
                 {
-                    let now = self.now_duration();
-                    self.effects.animate_window_open(id, now);
+                    self.animate_window_open_android(id, &window);
                     let serial = SERIAL_COUNTER.next_serial();
                     self.focus_window(Some(&window), serial);
                 }
@@ -179,7 +202,7 @@ impl CompositorHandler for NeonState {
         // Handle zwlr_layer_shell_v1 surface commits, initial configure, and exclusive keyboard focus.
         if let Some(output) = self.primary_output.clone() {
             let prev_work_area = self.work_area();
-            let (arranged_changed, exclusive_surface) = {
+            let (arranged_changed, exclusive_surface, released_surface_id) = {
                 let mut map = layer_map_for_output(&output);
                 if let Some(layer) = map
                     .layer_for_surface(surface, WindowSurfaceType::TOPLEVEL)
@@ -229,9 +252,11 @@ impl CompositorHandler for NeonState {
                     });
                     let exclusive = (interactivity == KeyboardInteractivity::Exclusive)
                         .then(|| layer.wl_surface().clone());
-                    (changed, exclusive)
+                    let released = (interactivity == KeyboardInteractivity::None)
+                        .then(|| layer.wl_surface().id());
+                    (changed, exclusive, released)
                 } else {
-                    (false, None)
+                    (false, None, None)
                 }
             };
 
@@ -242,6 +267,15 @@ impl CompositorHandler for NeonState {
                 && let Some(keyboard) = self.seat.get_keyboard()
             {
                 keyboard.set_focus(self, Some(layer_wl.into()), SERIAL_COUNTER.next_serial());
+            } else if let Some(released_id) = released_surface_id
+                && self
+                    .seat
+                    .get_keyboard()
+                    .and_then(|k| k.current_focus())
+                    .and_then(|s| s.wl_surface_id())
+                    .is_some_and(|id| id == released_id)
+            {
+                self.focus_topmost_window(SERIAL_COUNTER.next_serial());
             }
         }
 

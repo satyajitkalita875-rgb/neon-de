@@ -1093,6 +1093,13 @@ fn ipc_server_state_overview_workspace_and_effects_roundtrip() {
                 inactive_opacity: Some(0.9),
                 corner_radius: Some(16.0),
                 speed_scale: None,
+                open_animation: None,
+                close_animation: None,
+                minimize_animation: None,
+                maximize_animation: None,
+                workspace_animation: None,
+                overview_animation: None,
+                dock_animation: None,
             })
             .unwrap();
         let IpcResult::Ok {
@@ -1171,7 +1178,12 @@ fn ipc_server_state_overview_workspace_and_effects_roundtrip() {
             .request(IpcRequest::UpdateWindowBehavior {
                 focus_follows_mouse: Some(true),
                 snap_gap: Some(12),
+                tiling_gap: Some(6),
                 button_layout: Some("right_standard".into()),
+                auto_tiling: Some(true),
+                tiling_layout: Some("master_stack".into()),
+                auto_snap: Some(true),
+                snap_layouts_bar: Some(true),
             })
             .unwrap();
         let IpcResult::Ok {
@@ -1182,7 +1194,12 @@ fn ipc_server_state_overview_workspace_and_effects_roundtrip() {
         };
         assert!(behavior.focus_follows_mouse);
         assert_eq!(behavior.snap_gap, 12);
+        assert_eq!(behavior.tiling_gap, 6);
         assert_eq!(behavior.button_layout, "right_standard");
+        assert!(behavior.auto_tiling);
+        assert_eq!(behavior.tiling_layout, "master_stack");
+        assert!(behavior.auto_snap);
+        assert!(behavior.snap_layouts_bar);
 
         client_done_clone.store(true, Ordering::SeqCst);
     });
@@ -2572,4 +2589,159 @@ fn window_buttons_double_click_maximize_and_dock_minimize_close_animations() {
         "Client-initiated window close must queue a GPU closing ghost animation"
     );
     client_handle.join().unwrap();
+}
+
+#[test]
+fn auto_tiling_gaps_maximize_reflow_resize_and_dead_cleanup() {
+    let (_event_loop, mut display, mut state) = create_headless_server();
+    // Default tight tiling gap must be 6px (not the legacy 17px/12px gap).
+    assert_eq!(state.wm.tiling_gap(), 6);
+    state.set_auto_tiling(true, false);
+
+    let spawn_client = |display: &mut Display<NeonState>,
+                        state: &mut NeonState,
+                        title: &'static str,
+                        exit_flag: Arc<AtomicBool>| {
+        let (server_sock, client_sock) = UnixStream::pair().unwrap();
+        state.insert_client(server_sock);
+        let mapped = Arc::new(AtomicBool::new(false));
+        let mapped_c = Arc::clone(&mapped);
+        let handle = thread::spawn(move || {
+            let conn = Connection::from_socket(client_sock).unwrap();
+            let mut eq = conn.new_event_queue();
+            let qh = eq.handle();
+            let _reg = conn.display().get_registry(&qh, ());
+            let mut cs = TestClientState::default();
+            while cs.compositor.is_none() || cs.shm.is_none() || cs.wm_base.is_none() {
+                eq.blocking_dispatch(&mut cs).unwrap();
+            }
+            let surf = cs.compositor.as_ref().unwrap().create_surface(&qh, ());
+            let xdg_surf = cs
+                .wm_base
+                .as_ref()
+                .unwrap()
+                .get_xdg_surface(&surf, &qh, ());
+            let toplevel = xdg_surf.get_toplevel(&qh, ());
+            toplevel.set_title(title.into());
+            surf.commit();
+            while !cs.configured {
+                eq.blocking_dispatch(&mut cs).unwrap();
+            }
+            let (w, h) = (
+                cs.last_configure_size.0.max(200),
+                cs.last_configure_size.1.max(150),
+            );
+            let (_f, _p, buf) = create_shm_buffer(cs.shm.as_ref().unwrap(), &qh, w, h);
+            surf.attach(Some(&buf), 0, 0);
+            surf.commit();
+            conn.flush().unwrap();
+            mapped_c.store(true, Ordering::SeqCst);
+            while !exit_flag.load(Ordering::SeqCst) {
+                let _ = eq.dispatch_pending(&mut cs);
+                let _ = conn.flush();
+                thread::sleep(Duration::from_millis(5));
+            }
+            drop(toplevel);
+            drop(xdg_surf);
+            drop(surf);
+            let _ = conn.flush();
+        });
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !mapped.load(Ordering::SeqCst) && Instant::now() < deadline {
+            pump_server(display, state);
+            thread::sleep(Duration::from_millis(5));
+        }
+        for _ in 0..8 {
+            pump_server(display, state);
+            thread::sleep(Duration::from_millis(5));
+        }
+        handle
+    };
+
+    let exit1 = Arc::new(AtomicBool::new(false));
+    let exit2 = Arc::new(AtomicBool::new(false));
+    let exit3 = Arc::new(AtomicBool::new(false));
+    let h1 = spawn_client(&mut display, &mut state, "Tile-1", Arc::clone(&exit1));
+    let h2 = spawn_client(&mut display, &mut state, "Tile-2", Arc::clone(&exit2));
+    let h3 = spawn_client(&mut display, &mut state, "Tile-3", Arc::clone(&exit3));
+
+    let mut ids = state.wm.all_window_ids();
+    ids.sort_by_key(|id| id.0);
+    assert_eq!(ids.len(), 3);
+    let (id1, id2, id3) = (ids[0], ids[1], ids[2]);
+
+    // 1. All 3 windows must be tiled with exact 6px outer & inner gaps (1280x800 work area).
+    let r1 = state.wm.get(id1).unwrap().current_geometry;
+    let r2 = state.wm.get(id2).unwrap().current_geometry;
+    let r3 = state.wm.get(id3).unwrap().current_geometry;
+    assert_eq!(r1.loc.x, 6);
+    assert_eq!(r1.loc.y, 6);
+    assert_eq!(r1.loc.x + r1.size.w + 6, r2.loc.x);
+    assert_eq!(r2.loc.x, r3.loc.x);
+    assert_eq!(r2.loc.y + r2.size.h + 6, r3.loc.y);
+
+    // 2. Maximizing id1 keeps id1 maximized AND reflows id2 + id3 across full width (no blank hole!).
+    state.toggle_maximize_window(id1);
+    assert!(state.wm.get(id1).unwrap().mode.is_maximized());
+    assert_eq!(state.wm.get(id2).unwrap().current_geometry.loc.x, 6);
+    assert_eq!(
+        state.wm.get(id2).unwrap().current_geometry.loc.x
+            + state.wm.get(id2).unwrap().current_geometry.size.w
+            + 6,
+        state.wm.get(id3).unwrap().current_geometry.loc.x
+    );
+
+    // 3. Unmaximizing id1 returns it directly to Tiled in its original left slot!
+    state.toggle_maximize_window(id1);
+    assert!(state.wm.get(id1).unwrap().mode.is_tiled());
+    assert_eq!(state.wm.get(id1).unwrap().current_geometry.loc.x, 6);
+    assert_eq!(
+        state.wm.get(id1).unwrap().current_geometry.loc.x
+            + state.wm.get(id1).unwrap().current_geometry.size.w
+            + 6,
+        state.wm.get(id2).unwrap().current_geometry.loc.x
+    );
+
+    // 4. Keyboard split resize widens id1 cleanly.
+    let w1_win = state.find_window_by_id(id1).unwrap();
+    state.focus_window(Some(&w1_win), SERIAL_COUNTER.next_serial());
+    let prev_w1 = state.wm.get(id1).unwrap().current_geometry.size.w;
+    state.resize_focused_tile(0.10, 0.0);
+    assert!(state.wm.get(id1).unwrap().current_geometry.size.w > prev_w1 + 80);
+
+    // 5. Floating id3 keeps id3 stacked above tiled id1 even after focusing id1!
+    state.toggle_window_float(Some(id3));
+    assert!(state.wm.get(id3).unwrap().mode.is_floating());
+    state.focus_window(Some(&w1_win), SERIAL_COUNTER.next_serial());
+    let top_elem_id = state
+        .space
+        .elements()
+        .last()
+        .and_then(|w| state.window_id_for_window(w));
+    assert_eq!(
+        top_elem_id,
+        Some(id3),
+        "Floating windows must stay stacked above tiled windows when focusing a tile"
+    );
+
+    // 6. Destroying id2 cleanly reflows id1 to fill the entire tiled area (no stale hole!).
+    exit2.store(true, Ordering::SeqCst);
+    let dl = Instant::now() + Duration::from_secs(2);
+    while state.wm.get(id2).is_some() && Instant::now() < dl {
+        pump_server(&mut display, &mut state);
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert!(state.wm.get(id2).is_none());
+    assert_eq!(state.wm.get(id1).unwrap().current_geometry.size.w, 1280 - 12);
+
+    exit1.store(true, Ordering::SeqCst);
+    exit3.store(true, Ordering::SeqCst);
+    let dl2 = Instant::now() + Duration::from_secs(2);
+    while (!h1.is_finished() || !h2.is_finished() || !h3.is_finished()) && Instant::now() < dl2 {
+        pump_server(&mut display, &mut state);
+        thread::sleep(Duration::from_millis(5));
+    }
+    h1.join().unwrap();
+    h2.join().unwrap();
+    h3.join().unwrap();
 }

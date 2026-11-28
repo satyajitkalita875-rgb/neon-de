@@ -7,7 +7,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use neon_config::{DockPosition, FocusMode, ThemeMode, WindowButtonLayout};
+use neon_config::{DockPosition, FocusMode, PanelMode, ThemeMode, WindowButtonLayout};
 use neon_ipc::{
     AppearanceInfo, DesktopSnapshot, DiagnosticsInfo, EffectsInfo, EventTopic, IpcEvent,
     IpcPayload, IpcRequest, IpcRequestEnvelope, IpcResult, IpcServerMessage, MAX_FRAME_BYTES,
@@ -213,6 +213,30 @@ impl IpcServer {
         } else {
             None
         };
+        let clipboard_frame = if state.pending_clipboard_toggle {
+            state.pending_clipboard_toggle = false;
+            Some(encode_frame(&IpcServerMessage::Event {
+                version: PROTOCOL_VERSION,
+                event: IpcEvent::ClipboardToggleRequested,
+            }))
+        } else {
+            None
+        };
+        let island_frame = if state.pending_island_toggle {
+            state.pending_island_toggle = false;
+            Some(encode_frame(&IpcServerMessage::Event {
+                version: PROTOCOL_VERSION,
+                event: IpcEvent::DynamicIslandToggleRequested,
+            }))
+        } else {
+            None
+        };
+        let drag_frame = state.pending_drag_state.take().map(|active| {
+            encode_frame(&IpcServerMessage::Event {
+                version: PROTOCOL_VERSION,
+                event: IpcEvent::DragStateChanged { active },
+            })
+        });
         let context_menu_frame =
             state
                 .pending_context_menu
@@ -226,6 +250,9 @@ impl IpcServer {
 
         let snapshot = build_snapshot(state);
         if screenshot_ui_frame.is_none()
+            && clipboard_frame.is_none()
+            && island_frame.is_none()
+            && drag_frame.is_none()
             && context_menu_frame.is_none()
             && self.last_broadcast_snapshot.as_ref() == Some(&snapshot)
         {
@@ -276,6 +303,30 @@ impl IpcServer {
             if !failed
                 && !client.subscriptions.is_empty()
                 && let Some(Ok(bytes)) = &screenshot_ui_frame
+                && client.stream.write_all(bytes).is_err()
+            {
+                failed = true;
+            }
+
+            if !failed
+                && !client.subscriptions.is_empty()
+                && let Some(Ok(bytes)) = &clipboard_frame
+                && client.stream.write_all(bytes).is_err()
+            {
+                failed = true;
+            }
+
+            if !failed
+                && !client.subscriptions.is_empty()
+                && let Some(Ok(bytes)) = &island_frame
+                && client.stream.write_all(bytes).is_err()
+            {
+                failed = true;
+            }
+
+            if !failed
+                && !client.subscriptions.is_empty()
+                && let Some(Ok(bytes)) = &drag_frame
                 && client.stream.write_all(bytes).is_err()
             {
                 failed = true;
@@ -420,25 +471,18 @@ fn handle_ipc_request(
                     message: format!("Workspace index {workspace_index} out of bounds"),
                 };
             }
-            // Move window directly to requested workspace index
-            let cur_idx = state
+            // Move window directly to requested workspace index (no intermediate dynamic pruning).
+            let old_ws = state.wm.get(id).map(|w| w.workspace_id);
+            if let Some(new_ws) = state
                 .wm
-                .get(id)
-                .and_then(|w| state.wm.workspaces().index_of(w.workspace_id));
-            if let Some(mut idx) = cur_idx {
-                while idx < workspace_index {
-                    if state.wm.move_window_to_next_workspace(id, false).is_none() {
-                        break;
-                    }
-                    idx += 1;
+                .move_window_to_workspace_index(id, workspace_index, false)
+            {
+                if let Some(old_ws) = old_ws {
+                    state.relayout_auto_tiling_for_workspace(old_ws);
                 }
-                while idx > workspace_index {
-                    if state.wm.move_window_to_prev_workspace(id, false).is_none() {
-                        break;
-                    }
-                    idx -= 1;
-                }
+                state.relayout_auto_tiling_for_workspace(new_ws);
                 state.sync_active_workspace_space(serial);
+                state.needs_redraw = true;
             }
             IpcResult::Ok {
                 payload: IpcPayload::Ack,
@@ -539,15 +583,7 @@ fn handle_ipc_request(
         }
         IpcRequest::SnapWindow { window_id, region } => {
             let id = WindowId(window_id);
-            let parsed = match region.to_lowercase().as_str() {
-                "left" | "left_half" => Some(crate::window::SnapRegion::LeftHalf),
-                "right" | "right_half" => Some(crate::window::SnapRegion::RightHalf),
-                "top_left" => Some(crate::window::SnapRegion::TopLeft),
-                "top_right" => Some(crate::window::SnapRegion::TopRight),
-                "bottom_left" => Some(crate::window::SnapRegion::BottomLeft),
-                "bottom_right" => Some(crate::window::SnapRegion::BottomRight),
-                _ => None,
-            };
+            let parsed = crate::window::SnapRegion::from_name(&region);
             if state.wm.get(id).is_none() {
                 IpcResult::Err {
                     code: "window_not_found".into(),
@@ -562,6 +598,22 @@ fn handle_ipc_request(
                 IpcResult::Err {
                     code: "invalid_region".into(),
                     message: format!("Unknown snap region '{region}'"),
+                }
+            }
+        }
+        IpcRequest::ToggleWindowFloat { window_id } => {
+            let target = window_id.map(WindowId);
+            if let Some(id) = target
+                && state.wm.get(id).is_none()
+            {
+                IpcResult::Err {
+                    code: "window_not_found".into(),
+                    message: format!("Window {} does not exist", id.0),
+                }
+            } else {
+                state.toggle_window_float(target);
+                IpcResult::Ok {
+                    payload: IpcPayload::Ack,
                 }
             }
         }
@@ -650,6 +702,18 @@ fn handle_ipc_request(
                 payload: IpcPayload::Ack,
             }
         }
+        IpcRequest::ToggleClipboard => {
+            state.pending_clipboard_toggle = true;
+            IpcResult::Ok {
+                payload: IpcPayload::Ack,
+            }
+        }
+        IpcRequest::ToggleDynamicIsland => {
+            state.pending_island_toggle = true;
+            IpcResult::Ok {
+                payload: IpcPayload::Ack,
+            }
+        }
         IpcRequest::AnimateOverlay { namespace, opening } => {
             state.pending_overlay_anims.push((namespace, opening));
             state.needs_redraw = true;
@@ -661,6 +725,12 @@ fn handle_ipc_request(
             state
                 .window_dock_anchors
                 .insert(WindowId(window_id), (x, y).into());
+            IpcResult::Ok {
+                payload: IpcPayload::Ack,
+            }
+        }
+        IpcRequest::SetLaunchOrigin { x, y } => {
+            state.recent_launch_origin = Some(((x, y).into(), std::time::Instant::now()));
             IpcResult::Ok {
                 payload: IpcPayload::Ack,
             }
@@ -699,8 +769,8 @@ fn handle_ipc_request(
                     message: "preview path must be an absolute .png path without '..'".into(),
                 };
             }
-            let mw = max_width.unwrap_or(320).clamp(64, 640);
-            let mh = max_height.unwrap_or(200).clamp(64, 480);
+            let mw = max_width.unwrap_or(320).clamp(64, 960);
+            let mh = max_height.unwrap_or(200).clamp(64, 720);
             state
                 .pending_screencast_previews
                 .push(crate::state::PendingPreviewCapture {
@@ -767,18 +837,29 @@ fn handle_ipc_request(
             inactive_opacity,
             corner_radius,
             speed_scale,
+            open_animation,
+            close_animation,
+            minimize_animation,
+            maximize_animation,
+            workspace_animation,
+            overview_animation,
+            dock_animation,
         } => {
             if let Some(v) = enabled {
                 state.effects.config.enabled = v;
+                state.config.effects.enabled = v;
             }
             if let Some(v) = reduced_motion {
                 state.effects.config.reduced_motion = v;
+                state.config.effects.reduced_motion = v;
             }
             if let Some(v) = shadows_enabled {
                 state.effects.config.shadows_enabled = v;
+                state.config.effects.shadows_enabled = v;
             }
             if let Some(v) = borders_enabled {
                 state.effects.config.borders_enabled = v;
+                state.config.effects.borders_enabled = v;
             }
             if let Some(v) = blur_enabled {
                 state.effects.config.blur_enabled = v;
@@ -799,13 +880,86 @@ fn handle_ipc_request(
                 }
             }
             if let Some(v) = inactive_opacity {
-                state.effects.config.inactive_opacity = v.clamp(0.4, 1.0);
+                let clamped = v.clamp(0.4, 1.0);
+                state.effects.config.inactive_opacity = clamped;
+                state.config.effects.inactive_opacity = clamped;
             }
             if let Some(v) = corner_radius {
-                state.effects.config.corner_radius = v.clamp(0.0, 32.0);
+                let clamped = v.clamp(0.0, 32.0);
+                state.effects.config.corner_radius = clamped;
+                state.config.effects.corner_radius = clamped;
             }
             if let Some(v) = speed_scale {
-                state.effects.config.speed_scale = v.clamp(0.1, 5.0);
+                let clamped = v.clamp(0.1, 5.0);
+                state.effects.config.speed_scale = clamped;
+                state.config.effects.speed_scale = clamped;
+            }
+            if let Some(v) = open_animation {
+                state.effects.config.open_animation = v;
+                state.config.effects.open_animation = v;
+            }
+            if let Some(v) = close_animation {
+                state.effects.config.close_animation = v;
+                state.config.effects.close_animation = v;
+            }
+            if let Some(v) = minimize_animation {
+                state.effects.config.minimize_animation = v;
+                state.config.effects.minimize_animation = v;
+            }
+            if let Some(v) = maximize_animation {
+                state.effects.config.maximize_animation = v;
+                state.config.effects.maximize_animation = v;
+            }
+            if let Some(v) = workspace_animation {
+                state.effects.config.workspace_animation = v;
+                state.config.effects.workspace_animation = v;
+            }
+            if let Some(v) = overview_animation {
+                state.effects.config.overview_animation = v;
+                state.config.effects.overview_animation = v;
+            }
+            if let Some(v) = dock_animation {
+                state.effects.config.dock_animation = v;
+                state.config.effects.dock_animation = v;
+            }
+            let any_action_explicit = open_animation.is_some()
+                || close_animation.is_some()
+                || minimize_animation.is_some()
+                || maximize_animation.is_some()
+                || workspace_animation.is_some()
+                || overview_animation.is_some()
+                || dock_animation.is_some();
+            if enabled == Some(true)
+                && !any_action_explicit
+                && !state.effects.config.open_animation
+                && !state.effects.config.close_animation
+                && !state.effects.config.minimize_animation
+                && !state.effects.config.maximize_animation
+                && !state.effects.config.workspace_animation
+                && !state.effects.config.overview_animation
+                && !state.effects.config.dock_animation
+            {
+                state.effects.config.open_animation = true;
+                state.effects.config.close_animation = true;
+                state.effects.config.minimize_animation = true;
+                state.effects.config.maximize_animation = true;
+                state.effects.config.workspace_animation = true;
+                state.effects.config.overview_animation = true;
+                state.effects.config.dock_animation = true;
+                state.config.effects.open_animation = true;
+                state.config.effects.close_animation = true;
+                state.config.effects.minimize_animation = true;
+                state.config.effects.maximize_animation = true;
+                state.config.effects.workspace_animation = true;
+                state.config.effects.overview_animation = true;
+                state.config.effects.dock_animation = true;
+            }
+            state.config.validate_and_clamp();
+            if state.backend_name != "headless" {
+                let cfg_path = neon_config::default_config_path();
+                if let Err(err) = neon_config::save_atomic(&cfg_path, &state.config) {
+                    warn!(?err, "Failed to persist live effects config update");
+                }
             }
             state.needs_redraw = true;
             IpcResult::Ok {
@@ -822,11 +976,14 @@ fn handle_ipc_request(
             dock_smart_hide,
             dock_position,
             dock_icon_size,
+            dock_height,
             dock_magnification,
             dock_pinned_apps,
             panel_transparency,
             panel_visible,
             panel_smart_hide,
+            panel_mode,
+            dynamic_island_enabled,
             show_clock,
             clock_24h,
             show_workspaces,
@@ -878,6 +1035,11 @@ fn handle_ipc_request(
             if let Some(sz) = dock_icon_size {
                 state.config.dock.icon_size = sz.clamp(22, 64);
             }
+            if let Some(h) = dock_height {
+                let clamped = h.clamp(36, 88);
+                work_area_policy_changed |= state.config.dock.height != clamped;
+                state.config.dock.height = clamped;
+            }
             if let Some(mag) = dock_magnification {
                 state.config.dock.magnification = mag;
             }
@@ -887,7 +1049,21 @@ fn handle_ipc_request(
             if let Some(v) = panel_transparency {
                 state.config.panel.transparency = v;
             }
-            if let Some(v) = panel_visible {
+            if let Some(ref mode_str) = panel_mode {
+                let next_mode = if mode_str.eq_ignore_ascii_case("combined_bottom") {
+                    PanelMode::CombinedBottom
+                } else {
+                    PanelMode::TopAndDock
+                };
+                work_area_policy_changed |= state.config.panel.mode != next_mode;
+                state.config.panel.mode = next_mode;
+            }
+            if let Some(v) = dynamic_island_enabled {
+                state.config.panel.dynamic_island_enabled = v;
+            }
+            if let Some(v) = panel_visible
+                && (state.config.panel.mode == PanelMode::TopAndDock || v)
+            {
                 work_area_policy_changed |= state.config.panel.visible != v;
                 state.config.panel.visible = v;
             }
@@ -977,7 +1153,12 @@ fn handle_ipc_request(
         IpcRequest::UpdateWindowBehavior {
             focus_follows_mouse,
             snap_gap,
+            tiling_gap,
             button_layout,
+            auto_tiling,
+            tiling_layout,
+            auto_snap,
+            snap_layouts_bar,
         } => {
             if let Some(ffm) = focus_follows_mouse {
                 state.config.windows.focus_mode = if ffm {
@@ -991,10 +1172,20 @@ fn handle_ipc_request(
                     crate::window::FocusPolicy::ClickToFocus
                 });
             }
+            let mut gap_changed = false;
             if let Some(gap) = snap_gap {
                 let clamped = gap.clamp(0, 48);
                 state.config.windows.snap_gap = clamped;
                 state.wm.set_snap_gap(clamped);
+                gap_changed = true;
+            }
+            if let Some(gap) = tiling_gap {
+                let clamped = gap.clamp(0, 24);
+                state.config.windows.tiling_gap = clamped;
+                state.wm.set_tiling_gap(clamped);
+                gap_changed = true;
+            }
+            if gap_changed {
                 state.relayout_non_floating_windows();
             }
             if let Some(layout) = button_layout {
@@ -1003,6 +1194,19 @@ fn handle_ipc_request(
                     _ => WindowButtonLayout::LeftTrafficLights,
                 };
                 state.needs_redraw = true;
+            }
+            if let Some(v) = auto_snap {
+                state.config.windows.auto_snap = v;
+            }
+            if let Some(v) = snap_layouts_bar {
+                state.config.windows.snap_layouts_bar = v;
+            }
+            if let Some(layout_str) = tiling_layout {
+                let parsed = neon_config::TilingLayout::from_str_name(&layout_str);
+                state.set_tiling_layout(parsed, false);
+            }
+            if let Some(enabled) = auto_tiling {
+                state.set_auto_tiling(enabled, false);
             }
             state.config.validate_and_clamp();
             if state.backend_name != "headless" {
@@ -1066,6 +1270,7 @@ fn build_windows(state: &NeonState) -> Vec<WindowInfo> {
                 maximized: w.mode.is_maximized(),
                 fullscreen: w.mode.is_fullscreen(),
                 always_on_top: w.always_on_top,
+                tiled: w.mode.is_tiled(),
             })
         })
         .collect()
@@ -1123,6 +1328,13 @@ fn build_effects(state: &NeonState) -> EffectsInfo {
         inactive_opacity: cfg.inactive_opacity,
         corner_radius: cfg.corner_radius,
         speed_scale: cfg.speed_scale,
+        open_animation: cfg.open_animation,
+        close_animation: cfg.close_animation,
+        minimize_animation: cfg.minimize_animation,
+        maximize_animation: cfg.maximize_animation,
+        workspace_animation: cfg.workspace_animation,
+        overview_animation: cfg.overview_animation,
+        dock_animation: cfg.dock_animation,
     }
 }
 
@@ -1146,11 +1358,17 @@ fn build_appearance(state: &NeonState) -> AppearanceInfo {
         dock_smart_hide: state.config.dock.intelligent_hide,
         dock_position: dock_position.into(),
         dock_icon_size: state.config.dock.icon_size,
+        dock_height: state.config.dock.height,
         dock_magnification: state.config.dock.magnification,
         dock_pinned_apps: state.config.dock.pinned_apps.clone(),
         panel_transparency: state.config.panel.transparency,
         panel_visible: state.config.panel.visible,
         panel_smart_hide: state.config.panel.smart_hide,
+        panel_mode: match state.config.panel.mode {
+            PanelMode::CombinedBottom => "combined_bottom".into(),
+            PanelMode::TopAndDock => "top_and_dock".into(),
+        },
+        dynamic_island_enabled: state.config.panel.dynamic_island_enabled,
         show_clock: state.config.panel.show_clock,
         clock_24h: state.config.panel.clock_24h,
         show_workspaces: state.config.panel.show_workspaces,
@@ -1178,6 +1396,11 @@ fn build_window_behavior(state: &NeonState) -> WindowBehaviorInfo {
     WindowBehaviorInfo {
         focus_follows_mouse: state.config.windows.focus_mode == FocusMode::FocusFollowsMouse,
         snap_gap: state.config.windows.snap_gap,
+        tiling_gap: state.config.windows.tiling_gap,
         button_layout: button_layout.into(),
+        auto_tiling: state.wm.is_auto_tiling(),
+        tiling_layout: state.wm.tiling_layout().as_str().into(),
+        auto_snap: state.config.windows.auto_snap,
+        snap_layouts_bar: state.config.windows.snap_layouts_bar,
     }
 }

@@ -569,20 +569,43 @@ pub fn fulfill_screencast_previews(
             }
             ScreencastTarget::Window { window_id } => {
                 let wid = WindowId(window_id);
-                let elements = if let Some(win) = state.managed_windows.get(&wid) {
-                    collect_window_capture_elements(renderer, neon_renderer, win, mw, mh, 1.0, None)
+                if let Some(win) = state.managed_windows.get(&wid) {
+                    // Preserve each window's true aspect ratio with zero letterboxing so
+                    // Mission Control Exposé cards match wide and narrow windows cleanly.
+                    let win_sz = win.geometry().size;
+                    let (pw, ph) = if win_sz.w > 0 && win_sz.h > 0 {
+                        let s = (mw as f64 / win_sz.w as f64)
+                            .min(mh as f64 / win_sz.h as f64)
+                            .min(1.0);
+                        (
+                            ((win_sz.w as f64 * s).round() as i32).max(16),
+                            ((win_sz.h as f64 * s).round() as i32).max(16),
+                        )
+                    } else {
+                        (mw, mh)
+                    };
+                    let elements =
+                        collect_window_capture_elements(renderer, neon_renderer, win, pw, ph, 1.0, None);
+                    capture_preview_png_async(
+                        renderer,
+                        &elements,
+                        smithay::backend::renderer::Color32F::TRANSPARENT,
+                        pw,
+                        ph,
+                        1.0,
+                        req.path,
+                    )
                 } else {
-                    Vec::new()
-                };
-                capture_preview_png_async(
-                    renderer,
-                    &elements,
-                    WINDOW_CAPTURE_BG_COLOR,
-                    mw,
-                    mh,
-                    1.0,
-                    req.path,
-                )
+                    capture_preview_png_async(
+                        renderer,
+                        &[],
+                        WINDOW_CAPTURE_BG_COLOR,
+                        mw,
+                        mh,
+                        1.0,
+                        req.path,
+                    )
+                }
             }
             ScreencastTarget::Workspace { index } => {
                 let s = (mw as f64 / out_w).min(mh as f64 / out_h).min(1.0);

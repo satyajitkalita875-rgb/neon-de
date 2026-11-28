@@ -72,37 +72,98 @@ impl Rect {
     }
 }
 
-/// Supported smart window snapping / optional tiling regions.
+/// Supported Windows 11-style smart window snapping regions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SnapRegion {
     LeftHalf,
     RightHalf,
+    TopHalf,
+    BottomHalf,
     TopLeft,
     TopRight,
     BottomLeft,
     BottomRight,
+    LeftTwoThirds,
+    RightOneThird,
+    LeftThird,
+    CenterThird,
+    RightThird,
 }
 
 impl SnapRegion {
+    /// Parses an IPC / CLI snap region string.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "left" | "left_half" => Some(Self::LeftHalf),
+            "right" | "right_half" => Some(Self::RightHalf),
+            "top" | "top_half" => Some(Self::TopHalf),
+            "bottom" | "bottom_half" => Some(Self::BottomHalf),
+            "top_left" => Some(Self::TopLeft),
+            "top_right" => Some(Self::TopRight),
+            "bottom_left" => Some(Self::BottomLeft),
+            "bottom_right" => Some(Self::BottomRight),
+            "left_two_thirds" | "left_65" => Some(Self::LeftTwoThirds),
+            "right_one_third" | "right_35" => Some(Self::RightOneThird),
+            "left_third" => Some(Self::LeftThird),
+            "center_third" | "middle_third" => Some(Self::CenterThird),
+            "right_third" => Some(Self::RightThird),
+            _ => None,
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::LeftHalf => "left_half",
+            Self::RightHalf => "right_half",
+            Self::TopHalf => "top_half",
+            Self::BottomHalf => "bottom_half",
+            Self::TopLeft => "top_left",
+            Self::TopRight => "top_right",
+            Self::BottomLeft => "bottom_left",
+            Self::BottomRight => "bottom_right",
+            Self::LeftTwoThirds => "left_two_thirds",
+            Self::RightOneThird => "right_one_third",
+            Self::LeftThird => "left_third",
+            Self::CenterThird => "center_third",
+            Self::RightThird => "right_third",
+        }
+    }
+
     /// Computes the exact logical target rectangle inside `work_area` with optional `gap` pixels.
     pub fn target_rect(self, work_area: Rect, gap: i32) -> Rect {
         let gap = gap.max(0);
-        let usable_w = (work_area.size.w - gap * 3).max(160);
-        let usable_h = (work_area.size.h - gap * 3).max(100);
-        let half_w = usable_w / 2;
-        let right_w = usable_w - half_w;
-        let half_h = usable_h / 2;
-        let bottom_h = usable_h - half_h;
+        let usable_w_2 = (work_area.size.w - gap * 3).max(160);
+        let usable_h_2 = (work_area.size.h - gap * 3).max(100);
+        let half_w = usable_w_2 / 2;
+        let right_w = usable_w_2 - half_w;
+        let half_h = usable_h_2 / 2;
+        let bottom_h = usable_h_2 - half_h;
 
+        let full_w = (work_area.size.w - gap * 2).max(160);
         let full_h = (work_area.size.h - gap * 2).max(100);
         let left_x = work_area.loc.x + gap;
         let right_x = left_x + half_w + gap;
         let top_y = work_area.loc.y + gap;
         let bottom_y = top_y + half_h + gap;
 
+        // 65 / 35 asymmetric split (Windows 11 Snap Layout 2)
+        let two_thirds_w = ((usable_w_2 as f32) * 0.65).round() as i32;
+        let one_third_rem_w = (usable_w_2 - two_thirds_w).max(120);
+        let asym_right_x = left_x + two_thirds_w + gap;
+
+        // 3-column equal split (Windows 11 Snap Layout 3)
+        let usable_w_3 = (work_area.size.w - gap * 4).max(240);
+        let third_1 = usable_w_3 / 3;
+        let third_2 = usable_w_3 / 3;
+        let third_3 = usable_w_3 - third_1 - third_2;
+        let col2_x = left_x + third_1 + gap;
+        let col3_x = col2_x + third_2 + gap;
+
         match self {
             Self::LeftHalf => Rect::new(Point::new(left_x, top_y), Size::new(half_w, full_h)),
             Self::RightHalf => Rect::new(Point::new(right_x, top_y), Size::new(right_w, full_h)),
+            Self::TopHalf => Rect::new(Point::new(left_x, top_y), Size::new(full_w, half_h)),
+            Self::BottomHalf => Rect::new(Point::new(left_x, bottom_y), Size::new(full_w, bottom_h)),
             Self::TopLeft => Rect::new(Point::new(left_x, top_y), Size::new(half_w, half_h)),
             Self::TopRight => Rect::new(Point::new(right_x, top_y), Size::new(right_w, half_h)),
             Self::BottomLeft => {
@@ -111,6 +172,16 @@ impl SnapRegion {
             Self::BottomRight => {
                 Rect::new(Point::new(right_x, bottom_y), Size::new(right_w, bottom_h))
             }
+            Self::LeftTwoThirds => {
+                Rect::new(Point::new(left_x, top_y), Size::new(two_thirds_w, full_h))
+            }
+            Self::RightOneThird => Rect::new(
+                Point::new(asym_right_x, top_y),
+                Size::new(one_third_rem_w, full_h),
+            ),
+            Self::LeftThird => Rect::new(Point::new(left_x, top_y), Size::new(third_1, full_h)),
+            Self::CenterThird => Rect::new(Point::new(col2_x, top_y), Size::new(third_2, full_h)),
+            Self::RightThird => Rect::new(Point::new(col3_x, top_y), Size::new(third_3, full_h)),
         }
     }
 }
@@ -132,5 +203,17 @@ mod tests {
         let br = SnapRegion::BottomRight.target_rect(area, 0);
         assert_eq!(tl, Rect::new(Point::new(0, 0), Size::new(640, 400)));
         assert_eq!(br, Rect::new(Point::new(640, 400), Size::new(640, 400)));
+
+        let l3 = SnapRegion::LeftThird.target_rect(area, 0);
+        let c3 = SnapRegion::CenterThird.target_rect(area, 0);
+        let r3 = SnapRegion::RightThird.target_rect(area, 0);
+        assert_eq!(l3.size.w + c3.size.w + r3.size.w, 1280);
+        assert_eq!(c3.loc.x, l3.size.w);
+        assert_eq!(r3.loc.x, l3.size.w + c3.size.w);
+
+        let l65 = SnapRegion::LeftTwoThirds.target_rect(area, 8);
+        let r35 = SnapRegion::RightOneThird.target_rect(area, 8);
+        assert_eq!(r35.loc.x, l65.loc.x + l65.size.w + 8);
+        assert_eq!(r35.loc.x + r35.size.w + 8, 1280);
     }
 }

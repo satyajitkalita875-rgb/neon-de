@@ -1204,6 +1204,7 @@ mod tests {
             minimized: false,
             maximized: false,
             fullscreen: false,
+            tiled: false,
             always_on_top: false,
         };
         assert!(is_self_window(&picker_win));

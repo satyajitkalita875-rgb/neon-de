@@ -20,6 +20,9 @@ pub enum ShellIpcUpdate {
     Snapshot(DesktopSnapshot),
     OverviewToggled(bool),
     ScreenshotUiRequested,
+    ClipboardToggleRequested,
+    DynamicIslandToggleRequested,
+    DragStateChanged(bool),
     ContextMenuRequested {
         x: i32,
         y: i32,
@@ -76,6 +79,11 @@ pub fn start_ipc_bridge(socket_path: PathBuf) -> (IpcCommandSender, Receiver<She
                                 && appearance.protocol_rev < neon_ipc::APPEARANCE_PROTOCOL_REV
                             {
                                 persist_legacy_appearance_update(&req);
+                            } else if let IpcResult::Ok {
+                                payload: IpcPayload::WindowBehavior { ref behavior },
+                            } = res
+                            {
+                                persist_legacy_window_behavior_update(&req, behavior);
                             }
                         }
                         Err(err) => {
@@ -138,6 +146,30 @@ pub fn start_ipc_bridge(socket_path: PathBuf) -> (IpcCommandSender, Receiver<She
                                             return;
                                         }
                                     }
+                                    IpcEvent::ClipboardToggleRequested => {
+                                        if update_tx
+                                            .send(ShellIpcUpdate::ClipboardToggleRequested)
+                                            .is_err()
+                                        {
+                                            return;
+                                        }
+                                    }
+                                    IpcEvent::DynamicIslandToggleRequested => {
+                                        if update_tx
+                                            .send(ShellIpcUpdate::DynamicIslandToggleRequested)
+                                            .is_err()
+                                        {
+                                            return;
+                                        }
+                                    }
+                                    IpcEvent::DragStateChanged { active } => {
+                                        if update_tx
+                                            .send(ShellIpcUpdate::DragStateChanged(active))
+                                            .is_err()
+                                        {
+                                            return;
+                                        }
+                                    }
                                     IpcEvent::ContextMenuRequested { x, y, target } => {
                                         if update_tx
                                             .send(ShellIpcUpdate::ContextMenuRequested {
@@ -177,8 +209,12 @@ fn persist_legacy_appearance_update(req: &IpcRequest) {
     let IpcRequest::UpdateAppearance {
         dock_position,
         dock_icon_size,
+        dock_height,
         dock_magnification,
         dock_pinned_apps,
+        panel_mode,
+        dynamic_island_enabled,
+        panel_visible,
         clock_24h,
         show_app_title,
         show_system_tray,
@@ -195,8 +231,11 @@ fn persist_legacy_appearance_update(req: &IpcRequest) {
 
     let has_new_field = dock_position.is_some()
         || dock_icon_size.is_some()
+        || dock_height.is_some()
         || dock_magnification.is_some()
         || dock_pinned_apps.is_some()
+        || panel_mode.is_some()
+        || dynamic_island_enabled.is_some()
         || clock_24h.is_some()
         || show_app_title.is_some()
         || show_system_tray.is_some()
@@ -221,11 +260,33 @@ fn persist_legacy_appearance_update(req: &IpcRequest) {
     if let Some(sz) = dock_icon_size {
         cfg.dock.icon_size = (*sz).clamp(22, 64);
     }
+    if let Some(h) = dock_height {
+        cfg.dock.height = (*h).clamp(36, 88);
+    }
     if let Some(mag) = dock_magnification {
         cfg.dock.magnification = *mag;
     }
     if let Some(pins) = dock_pinned_apps {
         cfg.dock.pinned_apps = pins.clone();
+    }
+    if let Some(mode) = panel_mode {
+        cfg.panel.mode = if mode.eq_ignore_ascii_case("combined_bottom") {
+            neon_config::PanelMode::CombinedBottom
+        } else {
+            neon_config::PanelMode::TopAndDock
+        };
+    }
+    if let Some(v) = panel_visible {
+        // Legacy compositors expect panel_visible=false to drop Top Bar work-area when switching
+        // into Combined Bottom mode; preserve the user's underlying Top Bar visibility preference.
+        if cfg.panel.mode == neon_config::PanelMode::CombinedBottom && !*v {
+            cfg.panel.visible = true;
+        } else {
+            cfg.panel.visible = *v;
+        }
+    }
+    if let Some(v) = dynamic_island_enabled {
+        cfg.panel.dynamic_island_enabled = *v;
     }
     if let Some(v) = clock_24h {
         cfg.panel.clock_24h = *v;
@@ -260,23 +321,117 @@ pub fn overlay_legacy_appearance(
     appearance: &mut neon_ipc::AppearanceInfo,
     cfg: &neon_config::NeonConfig,
 ) {
-    if appearance.protocol_rev >= neon_ipc::APPEARANCE_PROTOCOL_REV {
+    if appearance.protocol_rev < 2 {
+        appearance.dock_position = match cfg.dock.position {
+            neon_config::DockPosition::Left => "left".into(),
+            neon_config::DockPosition::Right => "right".into(),
+            neon_config::DockPosition::Bottom => "bottom".into(),
+        };
+        appearance.dock_icon_size = cfg.dock.icon_size.clamp(22, 64);
+        appearance.dock_magnification = cfg.dock.magnification;
+        appearance.dock_pinned_apps = cfg.dock.pinned_apps.clone();
+        appearance.clock_24h = cfg.panel.clock_24h;
+        appearance.show_app_title = cfg.panel.show_app_title;
+        appearance.show_system_tray = cfg.panel.show_system_tray;
+        appearance.show_battery = cfg.panel.show_battery;
+        appearance.show_quick_settings = cfg.panel.show_quick_settings;
+        appearance.show_desktop_icons = cfg.desktop.show_desktop_icons;
+        appearance.desktop_sort_by = cfg.desktop.desktop_sort_by.clone();
+        appearance.desktop_auto_arrange = cfg.desktop.desktop_auto_arrange;
+    }
+    if appearance.protocol_rev < 4 {
+        appearance.panel_mode = match cfg.panel.mode {
+            neon_config::PanelMode::CombinedBottom => "combined_bottom".into(),
+            neon_config::PanelMode::TopAndDock => "top_and_dock".into(),
+        };
+        appearance.dynamic_island_enabled = cfg.panel.dynamic_island_enabled;
+    }
+    if appearance.protocol_rev < 5 {
+        appearance.dock_height = cfg.dock.height.clamp(36, 88);
+    }
+}
+
+/// Overlays per-action Material 3 Expressive animation toggles from `NeonConfig` onto a snapshot
+/// emitted by a pre-restart `neon-compositor` (`protocol_rev < 3`).
+pub fn overlay_legacy_effects(
+    effects: &mut neon_ipc::EffectsInfo,
+    protocol_rev: u32,
+    cfg: &neon_config::NeonConfig,
+) {
+    if protocol_rev >= 3 {
         return;
     }
-    appearance.dock_position = match cfg.dock.position {
-        neon_config::DockPosition::Left => "left".into(),
-        neon_config::DockPosition::Right => "right".into(),
-        neon_config::DockPosition::Bottom => "bottom".into(),
+    effects.open_animation = cfg.effects.open_animation;
+    effects.close_animation = cfg.effects.close_animation;
+    effects.minimize_animation = cfg.effects.minimize_animation;
+    effects.maximize_animation = cfg.effects.maximize_animation;
+    effects.workspace_animation = cfg.effects.workspace_animation;
+    effects.overview_animation = cfg.effects.overview_animation;
+    effects.dock_animation = cfg.effects.dock_animation;
+}
+
+/// Persists newer snapping/auto-tiling window behavior fields directly to XDG `config.toml`
+/// when talking to an older pre-restart `neon-compositor` that ignores those fields.
+fn persist_legacy_window_behavior_update(req: &IpcRequest, returned: &neon_ipc::WindowBehaviorInfo) {
+    let IpcRequest::UpdateWindowBehavior {
+        tiling_gap,
+        auto_tiling,
+        tiling_layout,
+        auto_snap,
+        snap_layouts_bar,
+        ..
+    } = req
+    else {
+        return;
     };
-    appearance.dock_icon_size = cfg.dock.icon_size.clamp(22, 64);
-    appearance.dock_magnification = cfg.dock.magnification;
-    appearance.dock_pinned_apps = cfg.dock.pinned_apps.clone();
-    appearance.clock_24h = cfg.panel.clock_24h;
-    appearance.show_app_title = cfg.panel.show_app_title;
-    appearance.show_system_tray = cfg.panel.show_system_tray;
-    appearance.show_battery = cfg.panel.show_battery;
-    appearance.show_quick_settings = cfg.panel.show_quick_settings;
-    appearance.show_desktop_icons = cfg.desktop.show_desktop_icons;
-    appearance.desktop_sort_by = cfg.desktop.desktop_sort_by.clone();
-    appearance.desktop_auto_arrange = cfg.desktop.desktop_auto_arrange;
+    let mismatch = tiling_gap.is_some_and(|v| v != returned.tiling_gap)
+        || auto_tiling.is_some_and(|v| v != returned.auto_tiling)
+        || tiling_layout
+            .as_deref()
+            .is_some_and(|s| !s.eq_ignore_ascii_case(&returned.tiling_layout))
+        || auto_snap.is_some_and(|v| v != returned.auto_snap)
+        || snap_layouts_bar.is_some_and(|v| v != returned.snap_layouts_bar);
+    if !mismatch {
+        return;
+    }
+    let cfg_path = neon_config::default_config_path();
+    let mut cfg = neon_config::load_or_default(&cfg_path);
+    if let Some(v) = tiling_gap {
+        cfg.windows.tiling_gap = *v;
+    }
+    if let Some(v) = auto_tiling {
+        cfg.windows.auto_tiling = *v;
+    }
+    if let Some(s) = tiling_layout {
+        cfg.windows.tiling_layout = match s.to_ascii_lowercase().as_str() {
+            "master_stack" | "master-stack" | "master" => neon_config::TilingLayout::MasterStack,
+            _ => neon_config::TilingLayout::Dwindle,
+        };
+    }
+    if let Some(v) = auto_snap {
+        cfg.windows.auto_snap = *v;
+    }
+    if let Some(v) = snap_layouts_bar {
+        cfg.windows.snap_layouts_bar = *v;
+    }
+    let _ = neon_config::save_atomic(&cfg_path, &cfg);
+}
+
+/// Overlays snapping & auto-tiling fields from `NeonConfig` onto a snapshot emitted by an older
+/// pre-restart `neon-compositor` (`protocol_rev < 6`).
+pub fn overlay_legacy_window_behavior(
+    behavior: &mut neon_ipc::WindowBehaviorInfo,
+    protocol_rev: u32,
+    cfg: &neon_config::NeonConfig,
+) {
+    if protocol_rev >= 6 {
+        return;
+    }
+    behavior.auto_tiling = cfg.windows.auto_tiling;
+    behavior.tiling_layout = match cfg.windows.tiling_layout {
+        neon_config::TilingLayout::Dwindle => "dwindle".into(),
+        neon_config::TilingLayout::MasterStack => "master_stack".into(),
+    };
+    behavior.auto_snap = cfg.windows.auto_snap;
+    behavior.snap_layouts_bar = cfg.windows.snap_layouts_bar;
 }

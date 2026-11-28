@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 /// Current NEON DE configuration schema version.
-pub const CURRENT_SCHEMA_VERSION: u32 = 3;
+pub const CURRENT_SCHEMA_VERSION: u32 = 4;
 
 /// Built-in NEON DE color theme modes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -78,6 +78,15 @@ pub enum PanelPosition {
     #[default]
     Top,
     Bottom,
+}
+
+/// Unified shell panel layout mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PanelMode {
+    #[default]
+    TopAndDock,
+    CombinedBottom,
 }
 
 /// Window focus behaviour.
@@ -389,6 +398,35 @@ impl Default for WindowRuleConfig {
     }
 }
 
+/// Active automatic window tiling layout when Hyprland Auto-Tiling is enabled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TilingLayout {
+    #[default]
+    Dwindle,
+    MasterStack,
+}
+
+impl TilingLayout {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Dwindle => "dwindle",
+            Self::MasterStack => "master_stack",
+        }
+    }
+
+    pub fn from_str_name(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "master" | "master_stack" | "master-stack" => Self::MasterStack,
+            _ => Self::Dwindle,
+        }
+    }
+}
+
+fn default_tiling_gap() -> i32 {
+    6
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct WindowConfigData {
@@ -396,7 +434,12 @@ pub struct WindowConfigData {
     pub raise_on_focus: bool,
     pub placement: WindowPlacement,
     pub snap_gap: i32,
+    #[serde(default = "default_tiling_gap")]
+    pub tiling_gap: i32,
     pub auto_snap: bool,
+    pub snap_layouts_bar: bool,
+    pub auto_tiling: bool,
+    pub tiling_layout: TilingLayout,
     pub center_dialogs: bool,
     pub dynamic_workspaces: bool,
     pub static_workspace_count: usize,
@@ -412,8 +455,12 @@ impl Default for WindowConfigData {
             focus_mode: FocusMode::ClickToFocus,
             raise_on_focus: true,
             placement: WindowPlacement::Smart,
-            snap_gap: 0,
+            snap_gap: 6,
+            tiling_gap: default_tiling_gap(),
             auto_snap: true,
+            snap_layouts_bar: true,
+            auto_tiling: false,
+            tiling_layout: TilingLayout::Dwindle,
             center_dialogs: true,
             dynamic_workspaces: true,
             static_workspace_count: 4,
@@ -430,6 +477,7 @@ impl Default for WindowConfigData {
 pub struct DockConfigData {
     pub position: DockPosition,
     pub icon_size: u32,
+    pub height: u32,
     pub auto_hide: bool,
     pub intelligent_hide: bool,
     pub magnification: bool,
@@ -448,6 +496,7 @@ impl Default for DockConfigData {
         Self {
             position: DockPosition::Bottom,
             icon_size: 36,
+            height: 52,
             auto_hide: false,
             intelligent_hide: false,
             magnification: true,
@@ -491,6 +540,8 @@ impl Default for ExtraPanelConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PanelConfigData {
+    pub mode: PanelMode,
+    pub dynamic_island_enabled: bool,
     pub position: PanelPosition,
     pub height: u32,
     pub visible: bool,
@@ -512,6 +563,8 @@ pub struct PanelConfigData {
 impl Default for PanelConfigData {
     fn default() -> Self {
         Self {
+            mode: PanelMode::TopAndDock,
+            dynamic_island_enabled: true,
             position: PanelPosition::Top,
             height: 36,
             visible: true,
@@ -573,6 +626,22 @@ pub fn default_shortcuts() -> Vec<ShortcutBindingConfig> {
             category: "System".into(),
             label: "Lock Screen".into(),
             accelerator: "Super+L".into(),
+            command: None,
+            custom: false,
+        },
+        ShortcutBindingConfig {
+            id: "dynamic_island".into(),
+            category: "System".into(),
+            label: "Open / Close Dynamic Island".into(),
+            accelerator: "Super+N".into(),
+            command: None,
+            custom: false,
+        },
+        ShortcutBindingConfig {
+            id: "clipboard".into(),
+            category: "System".into(),
+            label: "Open Clipboard History (Dynamic Island)".into(),
+            accelerator: "Super+V".into(),
             command: None,
             custom: false,
         },
@@ -645,6 +714,70 @@ pub fn default_shortcuts() -> Vec<ShortcutBindingConfig> {
             category: "Windows".into(),
             label: "Snap Window Right Half".into(),
             accelerator: "Super+Right".into(),
+            command: None,
+            custom: false,
+        },
+        ShortcutBindingConfig {
+            id: "toggle_tiling".into(),
+            category: "Windows".into(),
+            label: "Toggle Auto-Tiling (Hyprland Mode)".into(),
+            accelerator: "Super+T".into(),
+            command: None,
+            custom: false,
+        },
+        ShortcutBindingConfig {
+            id: "cycle_tiling_layout".into(),
+            category: "Windows".into(),
+            label: "Switch Tiling Layout (Dwindle / Master–Stack)".into(),
+            accelerator: "Super+Shift+T".into(),
+            command: None,
+            custom: false,
+        },
+        ShortcutBindingConfig {
+            id: "toggle_float".into(),
+            category: "Windows".into(),
+            label: "Toggle Floating for Focused Window".into(),
+            accelerator: "Super+Shift+F".into(),
+            command: None,
+            custom: false,
+        },
+        ShortcutBindingConfig {
+            id: "toggle_split".into(),
+            category: "Windows".into(),
+            label: "Toggle Tiling Split Direction".into(),
+            accelerator: "Super+J".into(),
+            command: None,
+            custom: false,
+        },
+        ShortcutBindingConfig {
+            id: "tile_focus_dir".into(),
+            category: "Windows".into(),
+            label: "Focus Tiled Window (Auto-Tiling Mode)".into(),
+            accelerator: "Super+Arrows".into(),
+            command: None,
+            custom: false,
+        },
+        ShortcutBindingConfig {
+            id: "tile_swap_dir".into(),
+            category: "Windows".into(),
+            label: "Swap Tiled Window in Direction".into(),
+            accelerator: "Super+Shift+Arrows".into(),
+            command: None,
+            custom: false,
+        },
+        ShortcutBindingConfig {
+            id: "tile_resize_dir".into(),
+            category: "Windows".into(),
+            label: "Resize Tiled Split".into(),
+            accelerator: "Super+Ctrl+Arrows".into(),
+            command: None,
+            custom: false,
+        },
+        ShortcutBindingConfig {
+            id: "tile_promote_master".into(),
+            category: "Windows".into(),
+            label: "Promote Tiled Window to Primary Slot".into(),
+            accelerator: "Super+Shift+Return".into(),
             command: None,
             custom: false,
         },
@@ -989,9 +1122,11 @@ impl NeonConfig {
         self.effects.speed_scale = clamp_finite_f64(self.effects.speed_scale, 0.1, 5.0, 1.0);
 
         self.windows.snap_gap = self.windows.snap_gap.clamp(0, 48);
+        self.windows.tiling_gap = self.windows.tiling_gap.clamp(0, 24);
         self.windows.static_workspace_count = self.windows.static_workspace_count.clamp(1, 16);
 
         self.dock.icon_size = self.dock.icon_size.clamp(22, 64);
+        self.dock.height = self.dock.height.clamp(36, 88);
         self.dock.transparency = clamp_finite_f32(self.dock.transparency, 0.0, 1.0, 0.68);
 
         self.panel.height = self.panel.height.clamp(24, 56);
@@ -1137,6 +1272,49 @@ fn migrate_toml_value(value: &mut toml::Value) {
                 desktop.insert("show_desktop_icons".into(), toml::Value::Boolean(true));
             }
         }
+        if version < 4 {
+            // Schema <= v3 configs could retain all 7 per-action animation booleans as `false`
+            // (left over from testing the legacy Performance preset before per-action toggles
+            // were wired into compositor and shell motion) even while `enabled = true` and
+            // `reduced_motion = false`. Restore them once during migration to v4 so Material 3
+            // Expressive animations work out of the box.
+            if let Some(effects) = table.get_mut("effects").and_then(|v| v.as_table_mut()) {
+                let enabled = effects
+                    .get("enabled")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true);
+                let reduced = effects
+                    .get("reduced_motion")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let action_keys = [
+                    "open_animation",
+                    "close_animation",
+                    "minimize_animation",
+                    "maximize_animation",
+                    "workspace_animation",
+                    "overview_animation",
+                    "dock_animation",
+                ];
+                let all_actions_false = action_keys
+                    .iter()
+                    .all(|k| effects.get(*k).and_then(|v| v.as_bool()) == Some(false));
+                if enabled && !reduced && all_actions_false {
+                    for k in action_keys {
+                        effects.insert(k.into(), toml::Value::Boolean(true));
+                    }
+                    let blur_on = effects
+                        .get("blur_enabled")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(true);
+                    if blur_on
+                        && effects.get("preset").and_then(|v| v.as_str()) == Some("performance")
+                    {
+                        effects.insert("preset".into(), toml::Value::String("balanced".into()));
+                    }
+                }
+            }
+        }
         if version < CURRENT_SCHEMA_VERSION as i64 {
             table.insert(
                 "schema_version".into(),
@@ -1264,5 +1442,93 @@ show_desktop_icons = false
 "#;
         let explicit_off = NeonConfig::from_toml_str(v3_raw).unwrap();
         assert!(!explicit_off.desktop.show_desktop_icons);
+    }
+
+    #[test]
+    fn schema_v3_migrates_orphaned_disabled_action_animations_while_v4_respects_explicit_false() {
+        let v3_orphaned = r#"
+schema_version = 3
+[effects]
+preset = "performance"
+enabled = true
+reduced_motion = false
+blur_enabled = true
+blur_strength = 0.92
+open_animation = false
+close_animation = false
+minimize_animation = false
+maximize_animation = false
+workspace_animation = false
+overview_animation = false
+dock_animation = false
+"#;
+        let migrated = NeonConfig::from_toml_str(v3_orphaned).unwrap();
+        assert_eq!(migrated.schema_version, CURRENT_SCHEMA_VERSION);
+        assert_eq!(migrated.effects.preset, EffectsPreset::Balanced);
+        assert!(migrated.effects.open_animation);
+        assert!(migrated.effects.close_animation);
+        assert!(migrated.effects.minimize_animation);
+        assert!(migrated.effects.maximize_animation);
+        assert!(migrated.effects.workspace_animation);
+        assert!(migrated.effects.overview_animation);
+        assert!(migrated.effects.dock_animation);
+
+        let v4_explicit = r#"
+schema_version = 4
+[effects]
+enabled = true
+reduced_motion = false
+open_animation = false
+close_animation = false
+minimize_animation = false
+maximize_animation = false
+workspace_animation = false
+overview_animation = false
+dock_animation = false
+"#;
+        let explicit = NeonConfig::from_toml_str(v4_explicit).unwrap();
+        assert!(!explicit.effects.open_animation);
+        assert!(!explicit.effects.overview_animation);
+        assert!(!explicit.effects.dock_animation);
+    }
+
+    #[test]
+    fn panel_mode_and_dynamic_island_roundtrip_and_default_safely() {
+        let legacy_toml = r#"
+schema_version = 4
+[panel]
+visible = true
+show_clock = true
+"#;
+        let loaded = NeonConfig::from_toml_str(legacy_toml).unwrap();
+        assert_eq!(loaded.panel.mode, PanelMode::TopAndDock);
+        assert!(loaded.panel.dynamic_island_enabled);
+
+        let combined_toml = r#"
+schema_version = 4
+[panel]
+mode = "combined_bottom"
+dynamic_island_enabled = false
+"#;
+        let combined = NeonConfig::from_toml_str(combined_toml).unwrap();
+        assert_eq!(combined.panel.mode, PanelMode::CombinedBottom);
+        assert!(!combined.panel.dynamic_island_enabled);
+        assert_eq!(combined.dock.height, 52);
+
+        let dock_h_toml = r#"
+schema_version = 4
+[dock]
+height = 120
+"#;
+        let clamped_hi = NeonConfig::from_toml_str(dock_h_toml).unwrap();
+        assert_eq!(clamped_hi.dock.height, 88);
+
+        let dock_h_low = r#"
+schema_version = 4
+[dock]
+height = 12
+"#;
+        let clamped_lo = NeonConfig::from_toml_str(dock_h_low).unwrap();
+        assert_eq!(clamped_lo.dock.height, 36);
     }
 }

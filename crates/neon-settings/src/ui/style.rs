@@ -4,7 +4,7 @@
 
 use std::cell::RefCell;
 
-use gtk4::{CssProvider, STYLE_PROVIDER_PRIORITY_APPLICATION, gdk};
+use gtk4::{CssProvider, STYLE_PROVIDER_PRIORITY_APPLICATION, gdk, prelude::*};
 use neon_config::ThemeMode;
 
 /// Holds the active GTK4 CSS provider for live Light/Dark/Accent updates without redundant reloads.
@@ -39,8 +39,24 @@ impl SettingsTheme {
         *self.last_state.borrow_mut() = Some(key);
 
         let light = theme == ThemeMode::NeonLight;
+        let is_hidpi = gdk::Display::default()
+            .and_then(|d| d.monitors().item(0))
+            .and_then(|obj| obj.downcast::<gdk::Monitor>().ok())
+            .is_some_and(|m| m.scale_factor() >= 2);
         if let Some(settings) = gtk4::Settings::default() {
             settings.set_gtk_application_prefer_dark_theme(!light);
+            // Smooth, pixel-aligned anti-aliased typography on 1x (metric hinting on) and HiDPI (>=2x).
+            settings.set_gtk_xft_antialias(1);
+            settings.set_gtk_xft_hinting(1);
+            settings.set_gtk_xft_hintstyle(Some("hintslight"));
+            settings.set_gtk_xft_rgba(Some("rgb"));
+            settings.set_gtk_hint_font_metrics(!is_hidpi);
+            if let Some(pspec) = settings.find_property("gtk-font-rendering")
+                && let Some(enum_cls) = gtk4::glib::EnumClass::with_type(pspec.value_type())
+                && let Some(val) = enum_cls.to_value_by_nick("manual")
+            {
+                settings.set_property_from_value("gtk-font-rendering", &val);
+            }
         }
         let css = build_css(light, accent);
         self.provider.load_from_string(&css);
@@ -128,7 +144,7 @@ fn build_css(light: bool, accent_hex: &str) -> String {
 window.neon-settings-window {{
     background-color: {win_bg};
     color: {fg};
-    font-family: "Inter", "SF Pro Text", "Adwaita Sans", "Ubuntu", sans-serif;
+    font-family: "Inter", "SF Pro Text", "Adwaita Sans", "Noto Sans", "Ubuntu Sans", "Roboto", sans-serif;
     font-size: 13px;
 }}
 
@@ -156,13 +172,13 @@ window.neon-settings-window {{
 /* Crisp macOS traffic lights */
 button.mac-dot {{
     background-image: none;
-    border-radius: 999px;
+    border-radius: 6px;
     min-width: 12px;
     min-height: 12px;
     padding: 0;
     margin: 0;
     border: 1px solid rgba(0, 0, 0, 0.22);
-    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.25);
+    box-shadow: none;
 }}
 
 button.mac-dot-close {{ background-color: #FF5F57; }}
@@ -203,21 +219,31 @@ searchentry.settings-search:focus-within {{
 }}
 
 .settings-nav-row {{
-    border-radius: 6px;
+    border-radius: 7px;
     padding: 5px 8px;
     margin: 1px 0;
     color: {fg};
     font-size: 13px;
     font-weight: 500;
     min-height: 26px;
+    transition: background-color 150ms cubic-bezier(0.31, 0.94, 0.34, 1.00),
+                color 150ms cubic-bezier(0.31, 0.94, 0.34, 1.00),
+                border-radius 220ms cubic-bezier(0.34, 0.80, 0.34, 1.00),
+                transform 350ms cubic-bezier(0.42, 1.67, 0.21, 0.90);
 }}
 
 .settings-nav-row:hover {{
     background-color: {row_hover};
+    transform: translateX(2px);
+}}
+
+.settings-nav-row:active {{
+    transform: scale(0.97);
 }}
 
 .settings-nav-row:selected {{
     background-color: #0A68D8;
+    border-radius: 9px;
     color: #FFFFFF;
     font-weight: 600;
 }}
@@ -392,7 +418,7 @@ button.nav-chevron-btn:disabled {{
     color: {muted};
 }}
 
-/* ===================== NEUTRAL macOS BUTTONS (NO LOUD BLUE!) ===================== */
+/* ===================== MATERIAL 3 EXPRESSIVE BUTTONS ===================== */
 
 button.settings-action-btn,
 button.settings-secondary-btn {{
@@ -401,22 +427,30 @@ button.settings-secondary-btn {{
     color: {fg};
     border: 1px solid {btn_border};
     border-top-color: {btn_top_hl};
-    border-radius: 6px;
+    border-radius: 8px;
     padding: 4px 12px;
     min-height: 24px;
     font-size: 12.5px;
     font-weight: 500;
     box-shadow: 0 1px 1px rgba(0, 0, 0, 0.14);
+    transition: background-color 150ms cubic-bezier(0.31, 0.94, 0.34, 1.00),
+                border-color 150ms cubic-bezier(0.31, 0.94, 0.34, 1.00),
+                border-radius 220ms cubic-bezier(0.34, 0.80, 0.34, 1.00),
+                transform 350ms cubic-bezier(0.42, 1.67, 0.21, 0.90);
 }}
 
 button.settings-action-btn:hover,
 button.settings-secondary-btn:hover {{
     background-color: {btn_hover};
+    border-radius: 12px;
+    transform: scale(1.03);
 }}
 
 button.settings-action-btn:active,
 button.settings-secondary-btn:active {{
     background-color: {btn_active};
+    border-radius: 6px;
+    transform: scale(0.94);
 }}
 
 button.settings-destructive-btn {{
@@ -424,37 +458,54 @@ button.settings-destructive-btn {{
     background-color: alpha(#FF453A, 0.16);
     color: #FF6961;
     border: 1px solid alpha(#FF453A, 0.30);
-    border-radius: 6px;
+    border-radius: 8px;
     padding: 4px 12px;
     min-height: 24px;
     font-size: 12.5px;
     font-weight: 600;
     box-shadow: none;
+    transition: background-color 150ms cubic-bezier(0.31, 0.94, 0.34, 1.00),
+                color 150ms cubic-bezier(0.31, 0.94, 0.34, 1.00),
+                border-radius 220ms cubic-bezier(0.34, 0.80, 0.34, 1.00),
+                transform 350ms cubic-bezier(0.42, 1.67, 0.21, 0.90);
 }}
 
 button.settings-destructive-btn:hover {{
     background-color: #D93025;
     color: #FFFFFF;
     border-color: #D93025;
+    border-radius: 12px;
+    transform: scale(1.03);
 }}
 
-/* ===================== SWITCHES, DROPDOWNS, SEGMENTED & SLIDERS ===================== */
+button.settings-destructive-btn:active {{
+    transform: scale(0.94);
+}}
+
+/* ===================== MATERIAL 3 EXPRESSIVE SWITCHES, SEGMENTED & SLIDERS ===================== */
 
 switch {{
     background-image: none;
     background-color: {switch_off};
-    border: none;
-    border-radius: 12px;
-    min-width: 40px;
-    min-height: 22px;
+    border: 1.5px solid {btn_border};
+    border-radius: 999px;
+    min-width: 46px;
+    min-height: 26px;
     padding: 2px;
     box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.14);
+    transition: background-color 180ms cubic-bezier(0.31, 0.94, 0.34, 1.00),
+                border-color 180ms cubic-bezier(0.31, 0.94, 0.34, 1.00);
+}}
+
+switch:hover {{
+    border-color: alpha({accent}, 0.55);
 }}
 
 switch:checked {{
     background-image: none;
     background-color: {accent};
-    border: none;
+    border-color: {accent};
+    box-shadow: 0 2px 10px alpha({accent}, 0.34);
 }}
 
 switch > image {{
@@ -464,19 +515,41 @@ switch > image {{
     min-height: 0;
 }}
 
-switch > slider,
-switch:hover > slider,
-switch:checked > slider,
-switch:checked:hover > slider {{
+/* Authentic Material 3 Expressive thumb: compact when OFF, springs larger when ON, squishes on press */
+switch > slider {{
     background-image: none;
     background-color: #FFFFFF;
     border: none;
     outline: none;
     margin: 0;
-    border-radius: 9px;
-    min-width: 18px;
-    min-height: 18px;
+    border-radius: 999px;
+    min-width: 20px;
+    min-height: 20px;
+    transform: scale(0.76);
     box-shadow: 0 1px 3px rgba(0, 0, 0, 0.28);
+    transition: transform 350ms cubic-bezier(0.42, 1.67, 0.21, 0.90),
+                background-color 150ms cubic-bezier(0.31, 0.94, 0.34, 1.00);
+}}
+
+switch:hover > slider {{
+    transform: scale(0.86);
+}}
+
+switch:active > slider {{
+    transform: scaleX(1.14) scaleY(0.96);
+}}
+
+switch:checked > slider {{
+    transform: scale(1.0);
+    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.30);
+}}
+
+switch:checked:hover > slider {{
+    transform: scale(1.08);
+}}
+
+switch:checked:active > slider {{
+    transform: scaleX(1.20) scaleY(1.04);
 }}
 
 dropdown > button {{
@@ -484,21 +557,29 @@ dropdown > button {{
     background-color: {btn_bg};
     color: {fg};
     border: 1px solid {btn_border};
-    border-radius: 6px;
+    border-radius: 8px;
     padding: 3px 10px;
     min-height: 24px;
     font-size: 12.5px;
     box-shadow: 0 1px 1px rgba(0, 0, 0, 0.12);
+    transition: background-color 150ms cubic-bezier(0.31, 0.94, 0.34, 1.00),
+                border-radius 220ms cubic-bezier(0.34, 0.80, 0.34, 1.00),
+                transform 350ms cubic-bezier(0.42, 1.67, 0.21, 0.90);
 }}
 
 dropdown > button:hover {{
     background-color: {btn_hover};
+    border-radius: 11px;
+}}
+
+dropdown > button:active {{
+    transform: scale(0.96);
 }}
 
 .settings-seg-track {{
     background-color: {seg_track};
     border: 1px solid {card_border};
-    border-radius: 7px;
+    border-radius: 10px;
     padding: 2px;
 }}
 
@@ -507,18 +588,31 @@ button.settings-seg-btn {{
     background-color: transparent;
     border: none;
     box-shadow: none;
-    border-radius: 5px;
+    border-radius: 7px;
     padding: 4px 11px;
     font-size: 12px;
     font-weight: 500;
     color: {muted};
+    transition: background-color 180ms cubic-bezier(0.31, 0.94, 0.34, 1.00),
+                color 150ms cubic-bezier(0.31, 0.94, 0.34, 1.00),
+                border-radius 220ms cubic-bezier(0.34, 0.80, 0.34, 1.00),
+                transform 350ms cubic-bezier(0.42, 1.67, 0.21, 0.90);
+}}
+
+button.settings-seg-btn:hover {{
+    color: {fg};
+}}
+
+button.settings-seg-btn:active {{
+    transform: scale(0.93);
 }}
 
 button.settings-seg-btn.active {{
     background-color: {seg_active};
     color: {fg};
     font-weight: 600;
-    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.18);
+    border-radius: 10px;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.20);
 }}
 
 scale,
@@ -532,8 +626,8 @@ scale.settings-scale > trough {{
     background-image: none;
     background-color: {trough_bg};
     border: none;
-    border-radius: 3px;
-    min-height: 4px;
+    border-radius: 999px;
+    min-height: 5px;
     box-shadow: none;
 }}
 
@@ -543,25 +637,34 @@ scale.settings-scale > trough > highlight {{
     background-color: {accent};
     border: none;
     margin: 0;
-    border-radius: 3px;
+    border-radius: 999px;
     box-shadow: none;
 }}
 
 scale > trough > slider,
-scale > trough > slider:hover,
-scale > trough > slider:active,
-scale.settings-scale > trough > slider,
-scale.settings-scale > trough > slider:hover,
-scale.settings-scale > trough > slider:active {{
+scale.settings-scale > trough > slider {{
     background-image: none;
     background-color: #FFFFFF;
     border: none;
     outline: none;
-    border-radius: 8px;
-    min-width: 16px;
-    min-height: 16px;
+    border-radius: 999px;
+    min-width: 17px;
+    min-height: 17px;
     margin: -6px 0;
     box-shadow: 0 1px 4px rgba(0, 0, 0, 0.34);
+    transition: transform 350ms cubic-bezier(0.42, 1.67, 0.21, 0.90);
+}}
+
+scale:hover > trough > slider,
+scale.settings-scale:hover > trough > slider {{
+    transform: scale(1.16);
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.38);
+}}
+
+scale:active > trough > slider,
+scale.settings-scale:active > trough > slider {{
+    transform: scale(1.26);
+    box-shadow: 0 2px 10px alpha({accent}, 0.48);
 }}
 
 scale > value,
@@ -578,19 +681,30 @@ button.style-preview-btn {{
     border: none;
     box-shadow: none;
     padding: 4px;
-    border-radius: 10px;
+    border-radius: 12px;
+    transition: transform 350ms cubic-bezier(0.42, 1.67, 0.21, 0.90);
+}}
+
+button.style-preview-btn:hover {{
+    transform: translateY(-2px) scale(1.03);
+}}
+
+button.style-preview-btn:active {{
+    transform: scale(0.95);
 }}
 
 .style-preview-frame {{
-    border-radius: 9px;
+    border-radius: 10px;
     min-width: 120px;
     min-height: 74px;
     border: 2.5px solid transparent;
     padding: 8px;
+    transition: border-color 160ms cubic-bezier(0.31, 0.94, 0.34, 1.00);
 }}
 
 button.style-preview-btn.active .style-preview-frame {{
     border-color: {accent};
+    box-shadow: 0 4px 14px alpha({accent}, 0.28);
 }}
 
 .style-preview-light-bg {{
@@ -624,16 +738,27 @@ button.style-preview-btn.active .style-preview-frame {{
 
 button.accent-circle {{
     background-image: none;
-    border-radius: 999px;
+    border-radius: 11px;
     min-width: 22px;
     min-height: 22px;
     padding: 0;
     border: 2px solid transparent;
-    box-shadow: inset 0 1px 1px rgba(255, 255, 255, 0.25);
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.22);
+    transition: transform 350ms cubic-bezier(0.42, 1.67, 0.21, 0.90),
+                border-color 150ms cubic-bezier(0.31, 0.94, 0.34, 1.00);
+}}
+
+button.accent-circle:hover {{
+    transform: scale(1.16);
+}}
+
+button.accent-circle:active {{
+    transform: scale(0.90);
 }}
 
 button.accent-circle.active {{
     border: 2.5px solid {fg};
+    transform: scale(1.10);
 }}
 
 button.accent-blue    {{ background-color: #0A84FF; }}
@@ -649,12 +774,19 @@ button.wp-thumb-btn {{
     background-color: {seg_track};
     border: 2.5px solid transparent;
     box-shadow: none;
-    border-radius: 9px;
+    border-radius: 10px;
     padding: 2px;
+    transition: transform 350ms cubic-bezier(0.42, 1.67, 0.21, 0.90),
+                border-color 160ms cubic-bezier(0.31, 0.94, 0.34, 1.00);
 }}
 
 button.wp-thumb-btn:hover {{
     border-color: {btn_border};
+    transform: translateY(-2px) scale(1.03);
+}}
+
+button.wp-thumb-btn:active {{
+    transform: scale(0.95);
 }}
 
 button.wp-thumb-btn.active {{

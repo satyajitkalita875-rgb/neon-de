@@ -139,6 +139,8 @@ pub struct WindowInfo {
     pub fullscreen: bool,
     #[serde(default)]
     pub always_on_top: bool,
+    #[serde(default)]
+    pub tiled: bool,
 }
 
 /// Snapshot of a dynamic workspace.
@@ -178,12 +180,49 @@ pub struct EffectsInfo {
     pub inactive_opacity: f32,
     pub corner_radius: f32,
     pub speed_scale: f64,
+    #[serde(default = "default_true")]
+    pub open_animation: bool,
+    #[serde(default = "default_true")]
+    pub close_animation: bool,
+    #[serde(default = "default_true")]
+    pub minimize_animation: bool,
+    #[serde(default = "default_true")]
+    pub maximize_animation: bool,
+    #[serde(default = "default_true")]
+    pub workspace_animation: bool,
+    #[serde(default = "default_true")]
+    pub overview_animation: bool,
+    #[serde(default = "default_true")]
+    pub dock_animation: bool,
 }
 
-/// Appearance payload revision emitted by current `neon-compositor` builds.
-/// Older pre-restart compositors omit this field (deserializing as `0`), allowing `neon-shell`
+impl Default for EffectsInfo {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            reduced_motion: false,
+            shadows_enabled: true,
+            borders_enabled: true,
+            blur_enabled: true,
+            blur_strength: 1.0,
+            inactive_opacity: 0.96,
+            corner_radius: 12.0,
+            speed_scale: 1.0,
+            open_animation: true,
+            close_animation: true,
+            minimize_animation: true,
+            maximize_animation: true,
+            workspace_animation: true,
+            overview_animation: true,
+            dock_animation: true,
+        }
+    }
+}
+
+/// Appearance & effects payload revision emitted by current `neon-compositor` builds.
+/// Older pre-restart compositors omit or emit a lower revision, allowing `neon-shell`
 /// to gracefully overlay newly added shell preferences from XDG config until next login.
-pub const APPEARANCE_PROTOCOL_REV: u32 = 2;
+pub const APPEARANCE_PROTOCOL_REV: u32 = 6;
 
 fn default_blur_strength() -> f32 {
     1.0
@@ -195,6 +234,14 @@ fn default_dock_position() -> String {
 
 fn default_dock_icon_size() -> u32 {
     36
+}
+
+fn default_dock_height() -> u32 {
+    52
+}
+
+fn default_panel_mode() -> String {
+    "top_and_dock".into()
 }
 
 fn default_true() -> bool {
@@ -221,6 +268,8 @@ pub struct AppearanceInfo {
     pub dock_position: String,
     #[serde(default = "default_dock_icon_size")]
     pub dock_icon_size: u32,
+    #[serde(default = "default_dock_height")]
+    pub dock_height: u32,
     #[serde(default = "default_true")]
     pub dock_magnification: bool,
     #[serde(default)]
@@ -229,6 +278,10 @@ pub struct AppearanceInfo {
     pub panel_visible: bool,
     #[serde(default)]
     pub panel_smart_hide: bool,
+    #[serde(default = "default_panel_mode")]
+    pub panel_mode: String,
+    #[serde(default = "default_true")]
+    pub dynamic_island_enabled: bool,
     pub show_clock: bool,
     #[serde(default = "default_true")]
     pub clock_24h: bool,
@@ -272,11 +325,14 @@ impl Default for AppearanceInfo {
             dock_smart_hide: false,
             dock_position: default_dock_position(),
             dock_icon_size: default_dock_icon_size(),
+            dock_height: default_dock_height(),
             dock_magnification: true,
             dock_pinned_apps: Vec::new(),
             panel_transparency: 0.76,
             panel_visible: true,
             panel_smart_hide: false,
+            panel_mode: default_panel_mode(),
+            dynamic_island_enabled: true,
             show_clock: true,
             clock_24h: true,
             show_workspaces: true,
@@ -307,11 +363,14 @@ pub struct AppearanceUpdate {
     pub dock_smart_hide: Option<bool>,
     pub dock_position: Option<String>,
     pub dock_icon_size: Option<u32>,
+    pub dock_height: Option<u32>,
     pub dock_magnification: Option<bool>,
     pub dock_pinned_apps: Option<Vec<String>>,
     pub panel_transparency: Option<f32>,
     pub panel_visible: Option<bool>,
     pub panel_smart_hide: Option<bool>,
+    pub panel_mode: Option<String>,
+    pub dynamic_island_enabled: Option<bool>,
     pub show_clock: Option<bool>,
     pub clock_24h: Option<bool>,
     pub show_workspaces: Option<bool>,
@@ -340,11 +399,14 @@ impl From<AppearanceUpdate> for IpcRequest {
             dock_smart_hide: u.dock_smart_hide,
             dock_position: u.dock_position,
             dock_icon_size: u.dock_icon_size,
+            dock_height: u.dock_height,
             dock_magnification: u.dock_magnification,
             dock_pinned_apps: u.dock_pinned_apps,
             panel_transparency: u.panel_transparency,
             panel_visible: u.panel_visible,
             panel_smart_hide: u.panel_smart_hide,
+            panel_mode: u.panel_mode,
+            dynamic_island_enabled: u.dynamic_island_enabled,
             show_clock: u.show_clock,
             clock_24h: u.clock_24h,
             show_workspaces: u.show_workspaces,
@@ -383,13 +445,46 @@ fn default_button_layout() -> String {
     "left".into()
 }
 
+fn default_tiling_layout() -> String {
+    "dwindle".into()
+}
+
+fn default_tiling_gap() -> i32 {
+    6
+}
+
 /// Snapshot of live window manager behavior settings.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WindowBehaviorInfo {
     pub focus_follows_mouse: bool,
     pub snap_gap: i32,
+    #[serde(default = "default_tiling_gap")]
+    pub tiling_gap: i32,
     #[serde(default = "default_button_layout")]
     pub button_layout: String,
+    #[serde(default)]
+    pub auto_tiling: bool,
+    #[serde(default = "default_tiling_layout")]
+    pub tiling_layout: String,
+    #[serde(default = "default_true")]
+    pub auto_snap: bool,
+    #[serde(default = "default_true")]
+    pub snap_layouts_bar: bool,
+}
+
+impl Default for WindowBehaviorInfo {
+    fn default() -> Self {
+        Self {
+            focus_follows_mouse: false,
+            snap_gap: 6,
+            tiling_gap: default_tiling_gap(),
+            button_layout: default_button_layout(),
+            auto_tiling: false,
+            tiling_layout: default_tiling_layout(),
+            auto_snap: true,
+            snap_layouts_bar: true,
+        }
+    }
 }
 
 /// Complete desktop state snapshot consumed by `neon-shell` and `neon-settings`.
@@ -470,6 +565,10 @@ pub enum IpcRequest {
     SetFloatingWindow {
         window_id: u64,
     },
+    ToggleWindowFloat {
+        #[serde(default)]
+        window_id: Option<u64>,
+    },
     MoveWindowToOutput {
         window_id: u64,
         output_name: String,
@@ -479,12 +578,21 @@ pub enum IpcRequest {
         x: i32,
         y: i32,
     },
+    /// Records the exact screen coordinates of a clicked Dock, App Drawer, or Desktop icon
+    /// so the next newly mapped application window opens with an Android-style Material 3
+    /// Expressive container-transform spring directly out of that icon.
+    SetLaunchOrigin {
+        x: i32,
+        y: i32,
+    },
     ToggleOverview,
     SetOverview {
         open: bool,
     },
     LockSession,
     OpenScreenshotUi,
+    ToggleClipboard,
+    ToggleDynamicIsland,
     AnimateOverlay {
         namespace: String,
         opening: bool,
@@ -524,6 +632,20 @@ pub enum IpcRequest {
         inactive_opacity: Option<f32>,
         corner_radius: Option<f32>,
         speed_scale: Option<f64>,
+        #[serde(default)]
+        open_animation: Option<bool>,
+        #[serde(default)]
+        close_animation: Option<bool>,
+        #[serde(default)]
+        minimize_animation: Option<bool>,
+        #[serde(default)]
+        maximize_animation: Option<bool>,
+        #[serde(default)]
+        workspace_animation: Option<bool>,
+        #[serde(default)]
+        overview_animation: Option<bool>,
+        #[serde(default)]
+        dock_animation: Option<bool>,
     },
     UpdateAppearance {
         theme: Option<String>,
@@ -538,6 +660,8 @@ pub enum IpcRequest {
         #[serde(default)]
         dock_icon_size: Option<u32>,
         #[serde(default)]
+        dock_height: Option<u32>,
+        #[serde(default)]
         dock_magnification: Option<bool>,
         #[serde(default)]
         dock_pinned_apps: Option<Vec<String>>,
@@ -545,6 +669,10 @@ pub enum IpcRequest {
         panel_visible: Option<bool>,
         #[serde(default)]
         panel_smart_hide: Option<bool>,
+        #[serde(default)]
+        panel_mode: Option<String>,
+        #[serde(default)]
+        dynamic_island_enabled: Option<bool>,
         show_clock: Option<bool>,
         #[serde(default)]
         clock_24h: Option<bool>,
@@ -580,7 +708,17 @@ pub enum IpcRequest {
         focus_follows_mouse: Option<bool>,
         snap_gap: Option<i32>,
         #[serde(default)]
+        tiling_gap: Option<i32>,
+        #[serde(default)]
         button_layout: Option<String>,
+        #[serde(default)]
+        auto_tiling: Option<bool>,
+        #[serde(default)]
+        tiling_layout: Option<String>,
+        #[serde(default)]
+        auto_snap: Option<bool>,
+        #[serde(default)]
+        snap_layouts_bar: Option<bool>,
     },
     Subscribe {
         topics: Vec<EventTopic>,
@@ -667,6 +805,11 @@ pub enum IpcEvent {
         open: bool,
     },
     ScreenshotUiRequested,
+    ClipboardToggleRequested,
+    DynamicIslandToggleRequested,
+    DragStateChanged {
+        active: bool,
+    },
     ContextMenuRequested {
         x: i32,
         y: i32,

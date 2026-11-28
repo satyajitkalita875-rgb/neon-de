@@ -3,7 +3,7 @@
 use smithay::{
     desktop::{
         PopupKeyboardGrab, PopupKind, PopupPointerGrab, PopupUngrabStrategy, Window,
-        find_popup_root_surface, get_popup_toplevel_coords,
+        find_popup_root_surface, get_popup_toplevel_coords, layer_map_for_output,
     },
     input::{
         Seat,
@@ -31,10 +31,11 @@ use smithay::{
 use tracing::{debug, info, warn};
 
 use crate::{
-    grabs::{MoveSurfaceGrab, ResizeEdge, ResizeSurfaceGrab},
+    grabs::{MoveSurfaceGrab, ResizeEdge, ResizeSurfaceGrab, TileSplitResizeGrab},
     state::NeonState,
     window::{WindowId, attach_window_id, from_wm_point, window_id},
 };
+use neon_window_manager::tiling::SplitAxis;
 
 impl XdgShellHandler for NeonState {
     fn xdg_shell_state(&mut self) -> &mut XdgShellState {
@@ -86,9 +87,16 @@ impl XdgShellHandler for NeonState {
             if self.hovered_titlebar_window == Some(id) {
                 self.hovered_titlebar_window = None;
             }
+            let closed_ws = self.wm.get(id).map(|w| w.workspace_id);
             self.wm.remove_window(id);
             self.effects.remove_window(id);
             self.scene.remove_window(id);
+            if self.drag_snap.dragged_window == Some(id) {
+                self.drag_snap.clear();
+            }
+            if let Some(ws_id) = closed_ws {
+                self.relayout_auto_tiling_for_workspace(ws_id);
+            }
             self.needs_redraw = true;
             info!(?id, "Destroyed xdg_toplevel window");
             if was_focused {
@@ -125,6 +133,16 @@ impl XdgShellHandler for NeonState {
                 debug!(?id, ?app_id, "Window app_id updated");
                 record.app_id = app_id;
             }
+            if self.wm.evaluate_auto_float(id)
+                && self.wm.is_auto_tiling()
+                && self.wm.get(id).is_some_and(|w| w.mode.is_tiled())
+            {
+                let ws_id = self.wm.get(id).map(|w| w.workspace_id);
+                let _ = self.set_floating_window_by_id(id);
+                if let Some(ws) = ws_id {
+                    self.relayout_auto_tiling_for_workspace(ws);
+                }
+            }
             self.maybe_apply_rules(id);
         }
     }
@@ -136,6 +154,8 @@ impl XdgShellHandler for NeonState {
             .map(|(pid, _)| pid);
 
         if let Some((id, window)) = self.find_window_by_surface(surface.wl_surface()) {
+            let was_tiled = self.wm.get(id).is_some_and(|w| w.mode.is_tiled());
+            let ws_id = self.wm.get(id).map(|w| w.workspace_id);
             let work_area = self.work_area();
             if let Some(new_loc) = self.wm.set_parent(id, parent_id, work_area)
                 && self
@@ -145,6 +165,16 @@ impl XdgShellHandler for NeonState {
                     .unwrap_or(false)
             {
                 self.map_preserving_z_order(window.clone(), from_wm_point(new_loc));
+            }
+            if was_tiled
+                && parent_id.is_some()
+                && self.wm.is_auto_tiling()
+                && let Some(ws) = ws_id
+            {
+                if let Some(up) = self.wm.set_floating(id, work_area) {
+                    self.apply_layout_update(&up);
+                }
+                self.relayout_auto_tiling_for_workspace(ws);
             }
             if parent_id.is_some()
                 && self
@@ -227,10 +257,12 @@ impl XdgShellHandler for NeonState {
 
         // Defer restoring maximized/snapped windows until the user actually drags (> 6 px)
         // so double-clicking a CSD titlebar never falsely unmaximizes on click 1.
+        // Keep tiled windows in WindowMode::Tiled so dragging swaps tile slots cleanly.
+        let is_tiled = self.wm.get(id).map(|r| r.mode.is_tiled()).unwrap_or(false);
         let is_non_floating = self
             .wm
             .get(id)
-            .map(|r| !r.mode.is_floating())
+            .map(|r| !r.mode.is_floating() && !r.mode.is_tiled())
             .unwrap_or(false);
 
         let Some(initial_window_location) = self.space.element_location(&window) else {
@@ -242,6 +274,8 @@ impl XdgShellHandler for NeonState {
             window,
             initial_window_location,
             pending_unmaximize: is_non_floating,
+            pending_tile_drag: is_tiled,
+            committed: false,
         };
         if let Some(pointer) = seat.get_pointer() {
             pointer.set_grab(self, grab, serial, Focus::Clear);
@@ -262,6 +296,53 @@ impl XdgShellHandler for NeonState {
         let Some((id, window)) = self.find_window_by_surface(surface.wl_surface()) else {
             return;
         };
+        let resize_edges = ResizeEdge::from(edges);
+
+        // In Auto-Tiling mode, dragging a tiled window's border resizes its split divider live
+        // instead of ripping the window out of tiling into floating!
+        if self.wm.is_auto_tiling() && self.wm.get(id).is_some_and(|w| w.mode.is_tiled()) {
+            let ws_id = self
+                .wm
+                .get(id)
+                .map(|w| w.workspace_id)
+                .unwrap_or_else(|| self.wm.active_workspace_id());
+            let wa = self.work_area();
+            let has_horiz = resize_edges.intersects(ResizeEdge::LEFT | ResizeEdge::RIGHT);
+            let has_vert = resize_edges.intersects(ResizeEdge::TOP | ResizeEdge::BOTTOM);
+            let chosen = if has_horiz {
+                self.wm
+                    .divider_for_window_edge(id, true, resize_edges.contains(ResizeEdge::RIGHT), wa)
+                    .or_else(|| {
+                        has_vert.then(|| {
+                            self.wm.divider_for_window_edge(
+                                id,
+                                false,
+                                resize_edges.contains(ResizeEdge::BOTTOM),
+                                wa,
+                            )
+                        })?
+                    })
+            } else if has_vert {
+                self.wm
+                    .divider_for_window_edge(id, false, resize_edges.contains(ResizeEdge::BOTTOM), wa)
+            } else {
+                None
+            };
+            if let Some(div) = chosen
+                && let Some(pointer) = seat.get_pointer()
+            {
+                let icon = match div.axis {
+                    SplitAxis::VerticalDivider => smithay::input::pointer::CursorIcon::EwResize,
+                    SplitAxis::HorizontalDivider => smithay::input::pointer::CursorIcon::NsResize,
+                };
+                self.cursor_status = smithay::input::pointer::CursorImageStatus::Named(icon);
+                self.needs_redraw = true;
+                let grab = TileSplitResizeGrab::start(start_data, ws_id, div);
+                pointer.set_grab(self, grab, serial, Focus::Clear);
+            }
+            return;
+        }
+
         // Interactive resize transitions snapped/maximized windows cleanly back to floating.
         let work_area = self.work_area();
         if let Some(update) = self.wm.set_floating(id, work_area) {
@@ -281,7 +362,7 @@ impl XdgShellHandler for NeonState {
         let grab = ResizeSurfaceGrab::start(
             start_data,
             window,
-            ResizeEdge::from(edges),
+            resize_edges,
             Rectangle::new(initial_window_location, initial_window_size),
         );
         if let Some(pointer) = seat.get_pointer() {
@@ -290,53 +371,37 @@ impl XdgShellHandler for NeonState {
     }
 
     fn maximize_request(&mut self, surface: ToplevelSurface) {
-        if let Some((id, _)) = self.find_window_by_surface(surface.wl_surface()) {
-            let work_area = self.effective_work_area_for(id);
-            if let Some(update) = self.wm.set_maximized(id, true, work_area) {
-                self.begin_geometry_transition(id, update.configure_size);
-                self.apply_layout_update(&update);
-                self.needs_redraw = true;
-                return;
-            }
+        if let Some((id, _)) = self.find_window_by_surface(surface.wl_surface())
+            && self.set_window_maximized(id, true)
+        {
+            return;
         }
         surface.send_configure();
     }
 
     fn unmaximize_request(&mut self, surface: ToplevelSurface) {
-        if let Some((id, _)) = self.find_window_by_surface(surface.wl_surface()) {
-            let work_area = self.effective_work_area_for(id);
-            if let Some(update) = self.wm.set_maximized(id, false, work_area) {
-                self.begin_geometry_transition(id, update.configure_size);
-                self.apply_layout_update(&update);
-                self.needs_redraw = true;
-                return;
-            }
+        if let Some((id, _)) = self.find_window_by_surface(surface.wl_surface())
+            && self.set_window_maximized(id, false)
+        {
+            return;
         }
         surface.send_configure();
     }
 
     fn fullscreen_request(&mut self, surface: ToplevelSurface, _output: Option<WlOutput>) {
-        if let Some((id, _)) = self.find_window_by_surface(surface.wl_surface()) {
-            let full = self.output_full_rect();
-            if let Some(update) = self.wm.set_fullscreen(id, true, full) {
-                self.begin_geometry_transition(id, update.configure_size);
-                self.apply_layout_update(&update);
-                self.needs_redraw = true;
-                return;
-            }
+        if let Some((id, _)) = self.find_window_by_surface(surface.wl_surface())
+            && self.set_window_fullscreen(id, true)
+        {
+            return;
         }
         surface.send_configure();
     }
 
     fn unfullscreen_request(&mut self, surface: ToplevelSurface) {
-        if let Some((id, _)) = self.find_window_by_surface(surface.wl_surface()) {
-            let work_area = self.effective_work_area_for(id);
-            if let Some(update) = self.wm.set_fullscreen(id, false, work_area) {
-                self.begin_geometry_transition(id, update.configure_size);
-                self.apply_layout_update(&update);
-                self.needs_redraw = true;
-                return;
-            }
+        if let Some((id, _)) = self.find_window_by_surface(surface.wl_surface())
+            && self.set_window_fullscreen(id, false)
+        {
+            return;
         }
         surface.send_configure();
     }
@@ -401,30 +466,79 @@ impl NeonState {
         }
     }
 
-    fn unconstrain_popup(&self, popup: &PopupSurface) {
+    pub(crate) fn unconstrain_popup(&self, popup: &PopupSurface) {
         let Ok(root) = find_popup_root_surface(&PopupKind::Xdg(popup.clone())) else {
             return;
         };
-        let Some((_, window)) = self.find_window_by_surface(&root) else {
-            return;
-        };
+        self.unconstrain_popup_with_root(popup, &root);
+    }
 
+    pub(crate) fn unconstrain_popup_with_root(
+        &self,
+        popup: &PopupSurface,
+        root: &smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
+    ) {
         let Some(output) = self.primary_output.as_ref() else {
             return;
         };
         let Some(output_geo) = self.space.output_geometry(output) else {
             return;
         };
-        let Some(window_geo) = self.space.element_geometry(&window) else {
-            return;
+
+        let root_loc = if let Some((_, window)) = self.find_window_by_surface(root) {
+            let Some(window_geo) = self.space.element_geometry(&window) else {
+                return;
+            };
+            window_geo.loc
+        } else {
+            let map = layer_map_for_output(output);
+            let root_id = root.id();
+            let Some(layer) = map.layers().find(|l| l.wl_surface().id() == root_id) else {
+                return;
+            };
+            let Some(layer_geo) = map.layer_geometry(layer) else {
+                return;
+            };
+            layer_geo.loc
         };
 
         let mut target = output_geo;
         target.loc -= get_popup_toplevel_coords(&PopupKind::Xdg(popup.clone()));
-        target.loc -= window_geo.loc;
+        target.loc -= root_loc;
 
         popup.with_pending_state(|state| {
-            state.geometry = state.positioner.get_unconstrained_geometry(target);
+            let mut geo = state.positioner.get_unconstrained_geometry(target);
+            let target_right = target.loc.x + target.size.w;
+            let target_bottom = target.loc.y + target.size.h;
+
+            // If constraint_adjustment still leaves the popup hanging below the bottom edge
+            // (common for tooltips on bottom layer-shell panels/docks), flip it above its
+            // anchor rect when room exists, or clamp it inside the output.
+            if geo.loc.y + geo.size.h > target_bottom {
+                let above_y = state.positioner.anchor_rect.loc.y - geo.size.h - 4;
+                if above_y >= target.loc.y {
+                    geo.loc.y = above_y;
+                } else {
+                    geo.loc.y = (target_bottom - geo.size.h).max(target.loc.y);
+                }
+            }
+            if geo.loc.y < target.loc.y {
+                let below_y =
+                    state.positioner.anchor_rect.loc.y + state.positioner.anchor_rect.size.h + 4;
+                if below_y + geo.size.h <= target_bottom {
+                    geo.loc.y = below_y;
+                } else {
+                    geo.loc.y = target.loc.y;
+                }
+            }
+            if geo.loc.x + geo.size.w > target_right {
+                geo.loc.x = (target_right - geo.size.w).max(target.loc.x);
+            }
+            if geo.loc.x < target.loc.x {
+                geo.loc.x = target.loc.x;
+            }
+
+            state.geometry = geo;
         });
     }
 

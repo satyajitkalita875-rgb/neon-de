@@ -486,6 +486,28 @@ impl ContextMenuOverlay {
         self.submenu_window.set_visible(false);
     }
 
+    pub fn close_immediate(&self) {
+        {
+            let mut nav = self.nav.borrow_mut();
+            nav.is_open = false;
+            nav.hover_epoch = nav.hover_epoch.wrapping_add(1);
+            nav.main_rows.clear();
+            nav.main_focus = None;
+            nav.open_submenu_parent_idx = None;
+            nav.sub_rows.clear();
+            nav.sub_focus = None;
+            nav.pointer_in_submenu = false;
+        }
+        let epoch = self.anim_gen.get().wrapping_add(1);
+        self.anim_gen.set(epoch);
+        if gtk4_layer_shell::is_supported() {
+            self.menu_window.set_keyboard_mode(KeyboardMode::None);
+        }
+        self.submenu_window.set_visible(false);
+        self.backdrop_window.set_visible(false);
+        self.menu_window.set_visible(false);
+    }
+
     pub fn close(&self) {
         let was_open = {
             let mut nav = self.nav.borrow_mut();
@@ -509,14 +531,27 @@ impl ContextMenuOverlay {
         self.submenu_window.set_visible(false);
         self.backdrop_window.set_visible(false);
 
-        if was_open {
+        let (motion_on, speed) = self
+            .last_snapshot
+            .borrow()
+            .as_ref()
+            .map(|s| {
+                (
+                    s.effects.enabled && !s.effects.reduced_motion,
+                    s.effects.speed_scale.clamp(0.5, 2.5),
+                )
+            })
+            .unwrap_or((true, 1.0));
+
+        if was_open && motion_on {
             self.ipc.send(IpcRequest::AnimateOverlay {
                 namespace: "neon-context-menu".into(),
                 opening: false,
             });
+            let hide_ms = ((155.0 / speed).round() as u64).clamp(60, 340);
             let win = self.menu_window.clone();
             let gen_c = Rc::clone(&self.anim_gen);
-            glib::timeout_add_local_once(Duration::from_millis(95), move || {
+            glib::timeout_add_local_once(Duration::from_millis(hide_ms), move || {
                 if gen_c.get() == epoch {
                     win.set_visible(false);
                 }
@@ -1952,6 +1987,10 @@ impl ContextMenuOverlay {
 
         let ipc_mag = self.ipc.clone();
         let mag_on = app_info.dock_magnification;
+        let is_combined = app_info.panel_mode.eq_ignore_ascii_case("combined_bottom");
+        let ipc_pm = self.ipc.clone();
+        let island_on = app_info.dynamic_island_enabled;
+        let ipc_isl = self.ipc.clone();
 
         let items = vec![
             ContextMenuItem::Header("Dock".into()),
@@ -1964,6 +2003,25 @@ impl ContextMenuOverlay {
                 }));
             }),
             ContextMenuItem::submenu("view-conceal-symbolic", "Auto Hide", hide_sub),
+            ContextMenuItem::Separator,
+            ContextMenuItem::toggle("Combined Bottom Taskbar", is_combined, false, move || {
+                let next_mode = if is_combined {
+                    "top_and_dock"
+                } else {
+                    "combined_bottom"
+                };
+                ipc_pm.send(IpcRequest::from(AppearanceUpdate {
+                    panel_mode: Some(next_mode.to_string()),
+                    panel_visible: Some(is_combined),
+                    ..Default::default()
+                }));
+            }),
+            ContextMenuItem::toggle("Dynamic Island", island_on, false, move || {
+                ipc_isl.send(IpcRequest::from(AppearanceUpdate {
+                    dynamic_island_enabled: Some(!island_on),
+                    ..Default::default()
+                }));
+            }),
             ContextMenuItem::Separator,
             ContextMenuItem::action("preferences-system-symbolic", "Dock Settings…", || {
                 launch_settings_page(Some("dock"))
@@ -2402,7 +2460,29 @@ impl ContextMenuOverlay {
                 let edit_sub = {
                     let ipc_sh = self.ipc.clone();
                     let sh = app_info.panel_smart_hide;
+                    let is_combined = app_info.panel_mode.eq_ignore_ascii_case("combined_bottom");
+                    let ipc_pm = self.ipc.clone();
+                    let island_on = app_info.dynamic_island_enabled;
+                    let ipc_isl = self.ipc.clone();
                     let mut list = vec![
+                        ContextMenuItem::toggle("Combined Bottom Taskbar", is_combined, false, move || {
+                            let next_mode = if is_combined {
+                                "top_and_dock"
+                            } else {
+                                "combined_bottom"
+                            };
+                            ipc_pm.send(IpcRequest::from(AppearanceUpdate {
+                                panel_mode: Some(next_mode.to_string()),
+                                panel_visible: Some(is_combined),
+                                ..Default::default()
+                            }));
+                        }),
+                        ContextMenuItem::toggle("Dynamic Island", island_on, false, move || {
+                            ipc_isl.send(IpcRequest::from(AppearanceUpdate {
+                                dynamic_island_enabled: Some(!island_on),
+                                ..Default::default()
+                            }));
+                        }),
                         ContextMenuItem::toggle("Smart Hide Top Bar", sh, false, move || {
                             ipc_sh.send(IpcRequest::from(AppearanceUpdate {
                                 panel_smart_hide: Some(!sh),

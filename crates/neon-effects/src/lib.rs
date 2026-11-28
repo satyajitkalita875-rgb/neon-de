@@ -335,7 +335,8 @@ struct WindowAnimations {
     last_focus_value: f32,
 }
 
-/// Global effects configuration (supports accessibility reduced motion, blur, and speed scaling).
+/// Global effects configuration (supports accessibility reduced motion, blur, speed scaling,
+/// and per-action Material 3 Expressive animation toggles).
 #[derive(Debug, Clone, Copy)]
 pub struct EffectsConfig {
     pub enabled: bool,
@@ -347,6 +348,13 @@ pub struct EffectsConfig {
     pub blur_strength: f32,
     pub inactive_opacity: f32,
     pub corner_radius: f32,
+    pub open_animation: bool,
+    pub close_animation: bool,
+    pub minimize_animation: bool,
+    pub maximize_animation: bool,
+    pub workspace_animation: bool,
+    pub overview_animation: bool,
+    pub dock_animation: bool,
 }
 
 impl Default for EffectsConfig {
@@ -361,6 +369,13 @@ impl Default for EffectsConfig {
             blur_strength: 1.0,
             inactive_opacity: 0.96,
             corner_radius: 12.0,
+            open_animation: true,
+            close_animation: true,
+            minimize_animation: true,
+            maximize_animation: true,
+            workspace_animation: true,
+            overview_animation: true,
+            dock_animation: true,
         }
     }
 }
@@ -421,10 +436,27 @@ impl EffectsManager {
         Duration::from_secs_f64((base_ms as f64 / 1000.0) / speed)
     }
 
-    /// Hyprland `popin` × Material 3 Expressive Default Spatial open animation.
+    /// Android 16 × Material 3 Expressive Default Spatial open animation (default upward bloom).
     pub fn animate_window_open(&mut self, id: WindowId, now: Duration) {
-        let spatial_dur = self.scaled_duration(360);
-        let fade_dur = self.scaled_duration(200);
+        self.animate_window_open_from(id, 0.0, 42.0, 0.80, now);
+    }
+
+    /// Android 16 Material 3 Expressive container-transform app launch springing directly out of
+    /// a clicked Dock, App Drawer, or Desktop icon at relative offset `(from_dx, from_dy)`.
+    pub fn animate_window_open_from(
+        &mut self,
+        id: WindowId,
+        from_dx: f64,
+        from_dy: f64,
+        start_scale: f64,
+        now: Duration,
+    ) {
+        let spatial_dur = if self.config.open_animation {
+            self.scaled_duration(430)
+        } else {
+            Duration::ZERO
+        };
+        let fade_dur = self.scaled_duration(155);
         let entry = self.window_anims.entry(id).or_default();
         if spatial_dur.is_zero() {
             entry.opacity = None;
@@ -434,30 +466,41 @@ impl EffectsManager {
             entry.scale_y = None;
             return;
         }
+        let s0 = start_scale.clamp(0.18, 0.94);
         entry.opacity = Some(Animation::new(
             0.0,
             1.0,
             now,
             fade_dur,
-            Easing::M3_EXPRESSIVE_DEFAULT_EFFECTS,
+            Easing::M3_EXPRESSIVE_FAST_EFFECTS,
         ));
-        entry.offset_x = None;
+        entry.offset_x = if from_dx.abs() > 1.0 {
+            Some(Animation::new(
+                from_dx,
+                0.0,
+                now,
+                spatial_dur,
+                Easing::M3_EXPRESSIVE_DEFAULT_SPATIAL,
+            ))
+        } else {
+            None
+        };
         entry.offset_y = Some(Animation::new(
-            24.0,
+            from_dy,
             0.0,
             now,
             spatial_dur,
             Easing::M3_EXPRESSIVE_DEFAULT_SPATIAL,
         ));
         entry.scale_x = Some(Animation::new(
-            0.86,
+            s0,
             1.0,
             now,
             spatial_dur,
             Easing::M3_EXPRESSIVE_DEFAULT_SPATIAL,
         ));
         entry.scale_y = Some(Animation::new(
-            0.86,
+            s0,
             1.0,
             now,
             spatial_dur,
@@ -465,13 +508,13 @@ impl EffectsManager {
         ));
     }
 
-    /// Hyprland `popout` × Material 3 Expressive close animation. Returns its duration.
+    /// Android 16 × Material 3 Expressive close animation. Returns its duration.
     pub fn animate_window_close(&mut self, id: WindowId, now: Duration) -> Duration {
-        self.animate_window_close_toward(id, 0.0, 24.0, now)
+        self.animate_window_close_toward(id, 0.0, 48.0, now)
     }
 
-    /// Hyprland `popout` × Material 3 Expressive close animation drifting subtly by
-    /// `(delta_x, delta_y)` (for example slightly toward the window's Dock icon).
+    /// Android 16 × Material 3 Expressive return-to-icon close animation gliding smoothly toward
+    /// the window's Dock icon by `(delta_x, delta_y)` with expressive scale collapse and late fade.
     pub fn animate_window_close_toward(
         &mut self,
         id: WindowId,
@@ -479,7 +522,10 @@ impl EffectsManager {
         delta_y: f64,
         now: Duration,
     ) -> Duration {
-        let dur = self.scaled_duration(220);
+        if !self.config.close_animation {
+            return Duration::ZERO;
+        }
+        let dur = self.scaled_duration(290);
         let entry = self.window_anims.entry(id).or_default();
         if dur.is_zero() {
             return Duration::ZERO;
@@ -490,41 +536,28 @@ impl EffectsManager {
         let cur_ox = entry.offset_x.as_ref().map(|a| a.sample(now)).unwrap_or(0.0);
         let cur_oy = entry.offset_y.as_ref().map(|a| a.sample(now)).unwrap_or(0.0);
 
+        // Smooth M3 Expressive Slow Effects spatial retreat + delayed fade so the return-to-icon
+        // glide stays crisp and clearly visible before dissolving.
+        let exit_curve = Easing::CubicBezier {
+            x1: 0.34,
+            y1: 0.88,
+            x2: 0.34,
+            y2: 1.00,
+        };
+        let fade_delay = Duration::from_secs_f64(dur.as_secs_f64() * 0.24);
+        let fade_dur = dur.saturating_sub(fade_delay);
+
         entry.opacity = Some(Animation::new(
             cur_op,
             0.0,
-            now,
-            dur,
-            Easing::M3_EXPRESSIVE_FAST_EFFECTS,
+            now + fade_delay,
+            fade_dur,
+            Easing::M3_EXPRESSIVE_DEFAULT_EFFECTS,
         ));
-        entry.scale_x = Some(Animation::new(
-            cur_sx,
-            0.78,
-            now,
-            dur,
-            Easing::M3_EXPRESSIVE_FAST_EFFECTS,
-        ));
-        entry.scale_y = Some(Animation::new(
-            cur_sy,
-            0.78,
-            now,
-            dur,
-            Easing::M3_EXPRESSIVE_FAST_EFFECTS,
-        ));
-        entry.offset_x = Some(Animation::new(
-            cur_ox,
-            cur_ox + delta_x,
-            now,
-            dur,
-            Easing::M3_EXPRESSIVE_FAST_EFFECTS,
-        ));
-        entry.offset_y = Some(Animation::new(
-            cur_oy,
-            cur_oy + delta_y,
-            now,
-            dur,
-            Easing::M3_EXPRESSIVE_FAST_EFFECTS,
-        ));
+        entry.scale_x = Some(Animation::new(cur_sx, 0.36, now, dur, exit_curve));
+        entry.scale_y = Some(Animation::new(cur_sy, 0.36, now, dur, exit_curve));
+        entry.offset_x = Some(Animation::new(cur_ox, cur_ox + delta_x, now, dur, exit_curve));
+        entry.offset_y = Some(Animation::new(cur_oy, cur_oy + delta_y, now, dur, exit_curve));
         dur
     }
 
@@ -576,7 +609,7 @@ impl EffectsManager {
         ));
     }
 
-    /// macOS dock-swoop minimize animation toward `(target_dx, target_dy)` below the window.
+    /// Android / macOS dock-swoop minimize animation toward `(target_dx, target_dy)` on the Dock.
     pub fn animate_window_minimize(
         &mut self,
         id: WindowId,
@@ -584,7 +617,10 @@ impl EffectsManager {
         target_dy: f64,
         now: Duration,
     ) -> Duration {
-        let dur = self.scaled_duration(270);
+        if !self.config.minimize_animation {
+            return Duration::ZERO;
+        }
+        let dur = self.scaled_duration(310);
         let entry = self.window_anims.entry(id).or_default();
         if dur.is_zero() {
             return Duration::ZERO;
@@ -595,21 +631,30 @@ impl EffectsManager {
         let cur_sx = entry.scale_x.as_ref().map(|a| a.sample(now)).unwrap_or(1.0);
         let cur_sy = entry.scale_y.as_ref().map(|a| a.sample(now)).unwrap_or(1.0);
 
+        let swoop = Easing::CubicBezier {
+            x1: 0.34,
+            y1: 0.88,
+            x2: 0.34,
+            y2: 1.00,
+        };
+        let fade_delay = Duration::from_secs_f64(dur.as_secs_f64() * 0.30);
+        let fade_dur = dur.saturating_sub(fade_delay);
+
         entry.opacity = Some(Animation::new(
             cur_op,
             0.0,
-            now,
-            dur,
+            now + fade_delay,
+            fade_dur,
             Easing::M3_EXPRESSIVE_DEFAULT_EFFECTS,
         ));
-        entry.offset_x = Some(Animation::new(cur_ox, target_dx, now, dur, Easing::NEON_STANDARD));
-        entry.offset_y = Some(Animation::new(cur_oy, target_dy, now, dur, Easing::NEON_STANDARD));
-        entry.scale_x = Some(Animation::new(cur_sx, 0.15, now, dur, Easing::NEON_STANDARD));
-        entry.scale_y = Some(Animation::new(cur_sy, 0.15, now, dur, Easing::NEON_STANDARD));
+        entry.offset_x = Some(Animation::new(cur_ox, target_dx, now, dur, swoop));
+        entry.offset_y = Some(Animation::new(cur_oy, target_dy, now, dur, swoop));
+        entry.scale_x = Some(Animation::new(cur_sx, 0.16, now, dur, swoop));
+        entry.scale_y = Some(Animation::new(cur_sy, 0.16, now, dur, swoop));
         dur
     }
 
-    /// macOS × Material 3 Expressive spring restore animation rising back up from the Dock.
+    /// Android / macOS × Material 3 Expressive spring restore rising directly out of the Dock icon.
     pub fn animate_window_restore(
         &mut self,
         id: WindowId,
@@ -617,8 +662,12 @@ impl EffectsManager {
         from_dy: f64,
         now: Duration,
     ) {
-        let spatial_dur = self.scaled_duration(360);
-        let fade_dur = self.scaled_duration(190);
+        let spatial_dur = if self.config.minimize_animation {
+            self.scaled_duration(420)
+        } else {
+            Duration::ZERO
+        };
+        let fade_dur = self.scaled_duration(165);
         let entry = self.window_anims.entry(id).or_default();
         if spatial_dur.is_zero() {
             entry.opacity = None;
@@ -633,7 +682,7 @@ impl EffectsManager {
             1.0,
             now,
             fade_dur,
-            Easing::M3_EXPRESSIVE_DEFAULT_EFFECTS,
+            Easing::M3_EXPRESSIVE_FAST_EFFECTS,
         ));
         entry.offset_x = Some(Animation::new(
             from_dx,
@@ -650,14 +699,14 @@ impl EffectsManager {
             Easing::M3_EXPRESSIVE_DEFAULT_SPATIAL,
         ));
         entry.scale_x = Some(Animation::new(
-            0.18,
+            0.20,
             1.0,
             now,
             spatial_dur,
             Easing::M3_EXPRESSIVE_DEFAULT_SPATIAL,
         ));
         entry.scale_y = Some(Animation::new(
-            0.18,
+            0.20,
             1.0,
             now,
             spatial_dur,
@@ -674,7 +723,10 @@ impl EffectsManager {
         new_rect: Rect,
         now: Duration,
     ) {
-        let dur = self.scaled_duration(380);
+        if !self.config.maximize_animation {
+            return;
+        }
+        let dur = self.scaled_duration(420);
         if dur.is_zero() || old_rect.size.w <= 0 || old_rect.size.h <= 0 || new_rect.size.w <= 0 || new_rect.size.h <= 0 {
             return;
         }
@@ -770,6 +822,10 @@ impl EffectsManager {
         output_width: f64,
         now: Duration,
     ) -> bool {
+        if !self.config.workspace_animation {
+            self.workspace_transition = None;
+            return false;
+        }
         let dur = self.scaled_duration(380);
         if dur.is_zero() {
             self.workspace_transition = None;
@@ -1123,5 +1179,74 @@ mod tests {
             .expect("reverse outgoing active");
         assert!(in_rev.offset_x < 0.0, "expected negative incoming offset, got {in_rev:?}");
         assert!(out_rev.offset_x > 0.0, "expected positive outgoing offset, got {out_rev:?}");
+    }
+
+    #[test]
+    fn android_origin_anchored_open_springs_from_icon() {
+        let mut fx = EffectsManager::default();
+        let id = WindowId(77);
+        let t0 = Duration::from_millis(100);
+        // Simulate launching from a bottom-left Dock icon relative to window center.
+        fx.animate_window_open_from(id, -180.0, 260.0, 0.34, t0);
+
+        let s0 = fx.sample_window(id, true, t0);
+        assert!((s0.offset_x - (-180.0)).abs() < 1e-3);
+        assert!((s0.offset_y - 260.0).abs() < 1e-3);
+        assert!((s0.scale_x - 0.34).abs() < 1e-3);
+        assert!((s0.scale_y - 0.34).abs() < 1e-3);
+
+        // Mid-spring: opacity is already crisp while scale/offset glide toward window target.
+        let s_mid = fx.sample_window(id, true, t0 + Duration::from_millis(180));
+        assert!(s_mid.opacity > 0.95, "opacity should lock in fast: {}", s_mid.opacity);
+        assert!(s_mid.scale_x > 0.85, "scale should bloom fast: {}", s_mid.scale_x);
+        assert!(s_mid.offset_y < 120.0 && s_mid.offset_y > -20.0);
+
+        // Settled cleanly at end of 430ms Default Spatial spring.
+        let s_end = fx.sample_window(id, true, t0 + Duration::from_millis(450));
+        assert!((s_end.offset_x).abs() < 1e-6);
+        assert!((s_end.offset_y).abs() < 1e-6);
+        assert!((s_end.scale_x - 1.0).abs() < 1e-6);
+        assert!((s_end.scale_y - 1.0).abs() < 1e-6);
+        assert!((s_end.opacity - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn per_action_animation_toggles_disable_individually() {
+        let t0 = Duration::from_millis(50);
+        let id = WindowId(99);
+
+        let mut fx = EffectsManager::new(EffectsConfig {
+            open_animation: false,
+            close_animation: false,
+            minimize_animation: false,
+            maximize_animation: false,
+            workspace_animation: false,
+            ..Default::default()
+        });
+
+        fx.animate_window_open_from(id, -120.0, 200.0, 0.34, t0);
+        assert!(!fx.has_active_animations(t0));
+
+        assert!(fx.animate_window_close_toward(id, 0.0, 180.0, t0).is_zero());
+        assert!(fx.animate_window_minimize(id, 0.0, 180.0, t0).is_zero());
+        fx.animate_window_restore(id, 0.0, 180.0, t0);
+        assert!(!fx.has_active_animations(t0));
+
+        fx.animate_window_geometry(
+            id,
+            Rect::new(
+                neon_window_manager::geometry::Point::new(100, 100),
+                neon_window_manager::geometry::Size::new(800, 500),
+            ),
+            Rect::new(
+                neon_window_manager::geometry::Point::new(0, 32),
+                neon_window_manager::geometry::Size::new(1920, 976),
+            ),
+            t0,
+        );
+        assert!(!fx.has_active_animations(t0));
+
+        assert!(!fx.animate_workspace_switch_with_width(1, 1920.0, t0));
+        assert!(!fx.is_workspace_transition_active(t0));
     }
 }

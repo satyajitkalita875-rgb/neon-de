@@ -152,7 +152,7 @@ pub fn collect_workspace_capture_elements(
         let mut lower = Vec::new();
         if include_top_chrome && !has_fullscreen {
             for layer in layer_map.layers_on(WlrLayer::Top).rev() {
-                if layer.namespace() == "neon-overview" {
+                if matches!(layer.namespace(), "neon-overview" | "neon-workspaces-panel") {
                     continue;
                 }
                 if let Some(geo) = layer_map.layer_geometry(layer) {

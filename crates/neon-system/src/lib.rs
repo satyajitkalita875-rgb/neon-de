@@ -12,6 +12,7 @@
 pub mod apps;
 pub mod audio;
 pub mod bluetooth;
+pub mod clipboard;
 pub mod datetime;
 pub mod media;
 pub mod network;
@@ -19,6 +20,7 @@ pub mod notifications;
 pub mod polkit;
 pub mod portals;
 pub mod storage;
+pub mod telemetry;
 pub mod tray;
 pub mod updates;
 pub mod users;
@@ -65,6 +67,12 @@ pub enum SystemAction {
     SetPowerProfile(String),
     SetBrightness(u32),
     MediaCommand { bus_name: Option<String>, method: String },
+    MediaSeek {
+        bus_name: Option<String>,
+        track_id: Option<String>,
+        position_us: i64,
+        current_position_us: Option<i64>,
+    },
     InvokePowerAction(String),
     LogOut,
     SendTestNotification { bus_name: String },
@@ -124,6 +132,17 @@ pub fn execute_system_action(action: &SystemAction) -> Result<(), String> {
         SystemAction::MediaCommand { bus_name, method } => {
             media::invoke_media_command(bus_name.as_deref(), method)
         }
+        SystemAction::MediaSeek {
+            bus_name,
+            track_id,
+            position_us,
+            current_position_us,
+        } => media::invoke_media_seek(
+            bus_name.as_deref(),
+            track_id.as_deref(),
+            *position_us,
+            *current_position_us,
+        ),
         SystemAction::InvokePowerAction(method) => power::invoke_logind_action(method),
         SystemAction::LogOut => power::terminate_current_session(),
         SystemAction::SendTestNotification { bus_name } => notifications::send_dbus_notification(

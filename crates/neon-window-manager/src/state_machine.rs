@@ -12,7 +12,9 @@ pub enum WindowMode {
     /// Standard GNOME-inspired floating window.
     #[default]
     Floating,
-    /// Snapped / tiled into a half or quarter output region.
+    /// Automatically tiled by the Hyprland-style tiling layout engine (Dwindle / Master-Stack).
+    Tiled,
+    /// Snapped / tiled into an explicit Windows 11 snap region.
     Snapped(SnapRegion),
     /// Maximized to fill the output work area.
     Maximized,
@@ -25,6 +27,10 @@ pub enum WindowMode {
 impl WindowMode {
     pub fn is_floating(&self) -> bool {
         matches!(self, Self::Floating)
+    }
+
+    pub fn is_tiled(&self) -> bool {
+        matches!(self, Self::Tiled)
     }
 
     pub fn is_maximized(&self) -> bool {
@@ -52,6 +58,24 @@ impl WindowMode {
             return false;
         }
         *self = Self::Floating;
+        true
+    }
+
+    /// Transitions into `Tiled`, returning `true` if the mode changed.
+    pub fn set_tiled(&mut self) -> bool {
+        if matches!(self, Self::Tiled) {
+            return false;
+        }
+        *self = Self::Tiled;
+        true
+    }
+
+    /// Explicitly snaps into `region` (does not toggle back to Floating if already there).
+    pub fn set_snapped(&mut self, region: SnapRegion) -> bool {
+        if matches!(self, Self::Snapped(cur) if *cur == region) {
+            return false;
+        }
+        *self = Self::Snapped(region);
         true
     }
 

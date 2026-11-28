@@ -16,7 +16,7 @@ use std::{
     time::Instant,
 };
 
-use neon_scene::{BorderStyle, NodeContent, SceneGraph, ShadowStyle, TitlebarStyle};
+use neon_scene::{BorderStyle, NodeContent, SceneGraph, SceneLayer, ShadowStyle, TitlebarStyle};
 use neon_window_manager::WindowId;
 use smithay::{
     backend::renderer::{
@@ -38,6 +38,7 @@ use smithay::{
     desktop::{PopupManager, Window, WindowSurface, layer_map_for_output},
     input::pointer::{CursorIcon, CursorImageAttributes, CursorImageStatus},
     output::Output,
+    reexports::wayland_server::protocol::wl_surface::WlSurface,
     render_elements,
     utils::{Buffer as BufferCoord, Logical, Physical, Point, Rectangle, Scale, Size, Transform},
     wayland::{
@@ -65,12 +66,14 @@ pub const FALLBACK_CLEAR_COLOR: Color32F = Color32F::new(0.047, 0.059, 0.090, 1.
 /// Opaque security curtain color (`#05070D`) used while `ext_session_lock_v1` is locked.
 pub const LOCK_CURTAIN_COLOR: Color32F = Color32F::new(0.020, 0.027, 0.051, 1.0);
 
-/// Live blur parameters supplied to [`NeonRenderer::render_scene`].
+/// Live blur and overlay motion parameters supplied to [`NeonRenderer::render_scene`].
 #[derive(Debug, Clone, Copy)]
 pub struct BlurSettings {
     pub enabled: bool,
     pub strength: f32,
     pub corner_radius: f32,
+    pub animations_enabled: bool,
+    pub speed_scale: f32,
 }
 
 impl Default for BlurSettings {
@@ -79,6 +82,8 @@ impl Default for BlurSettings {
             enabled: true,
             strength: 1.0,
             corner_radius: 12.0,
+            animations_enabled: true,
+            speed_scale: 1.0,
         }
     }
 }
@@ -248,6 +253,8 @@ pub struct NeonRenderer {
     ws_slide_layer_ids: HashMap<String, Vec<Id>>,
     mapped_blur_overlays: HashSet<String>,
     overlay_anims: HashMap<String, OverlayAnim>,
+    overlay_motion_enabled: bool,
+    overlay_speed_scale: f32,
     blur_anim_commit: CommitCounter,
     last_blur_tex_commit: CommitCounter,
     chrome_blur_commit: CommitCounter,
@@ -294,6 +301,8 @@ impl NeonRenderer {
             ws_slide_layer_ids: HashMap::new(),
             mapped_blur_overlays: HashSet::new(),
             overlay_anims: HashMap::new(),
+            overlay_motion_enabled: true,
+            overlay_speed_scale: 1.0,
             blur_anim_commit: CommitCounter::default(),
             last_blur_tex_commit: CommitCounter::default(),
             chrome_blur_commit: CommitCounter::default(),
@@ -307,6 +316,11 @@ impl NeonRenderer {
         self.cursor_cache.set_theme_and_size(theme, size);
     }
 
+    pub fn set_motion_config(&mut self, animations_enabled: bool, speed_scale: f32) {
+        self.overlay_motion_enabled = animations_enabled;
+        self.overlay_speed_scale = speed_scale.clamp(0.5, 2.5);
+    }
+
     pub fn has_shaders(&self) -> bool {
         self.shaders.is_some()
     }
@@ -314,6 +328,19 @@ impl NeonRenderer {
     /// Triggers a 60 FPS GPU open or close animation for a blurred shell overlay
     /// (`"neon-quick-settings"`, `"neon-workspaces-panel"`, or `"neon-power-menu"`).
     pub fn trigger_overlay_anim(&mut self, namespace: &str, opening: bool) {
+        if !self.overlay_motion_enabled {
+            if opening {
+                self.overlay_anims.remove(namespace);
+            } else {
+                self.overlay_anims.insert(
+                    namespace.to_string(),
+                    OverlayAnim::Closing {
+                        started: Instant::now(),
+                    },
+                );
+            }
+            return;
+        }
         let anim = if opening {
             if self.mapped_blur_overlays.contains(namespace) {
                 OverlayAnim::Opening {
@@ -364,68 +391,93 @@ impl NeonRenderer {
     /// Returns `true` while any shell overlay open/close GPU animation or closing-window ghost
     /// is still in progress so the compositor schedules continuous VBlank-locked frames until settled.
     pub fn has_active_overlay_animation(&self) -> bool {
+        let motion_on = self.overlay_motion_enabled;
+        let speed = self.overlay_speed_scale;
         self.closing_ghosts.iter().any(|g| !g.is_finished())
-            || self.overlay_anims.iter().any(|(ns, &anim)| {
-                let (_, _, _, _, active) = Self::eval_overlay_anim(ns, Some(anim));
-                active
-            })
+            || (motion_on
+                && self.overlay_anims.iter().any(|(ns, &anim)| {
+                    let (_, _, _, _, active) = Self::eval_overlay_anim(ns, Some(anim), true, speed);
+                    active
+                }))
     }
 
     /// Evaluates `(offset_x_logical, offset_y_logical, scale, alpha, is_animating)` for a shell overlay.
-    fn eval_overlay_anim(namespace: &str, anim: Option<OverlayAnim>) -> (f32, f32, f32, f32, bool) {
+    fn eval_overlay_anim(
+        namespace: &str,
+        anim: Option<OverlayAnim>,
+        motion_enabled: bool,
+        speed_scale: f32,
+    ) -> (f32, f32, f32, f32, bool) {
         let Some(anim) = anim else {
             return (0.0, 0.0, 1.0, 1.0, false);
         };
+        if !motion_enabled {
+            return match anim {
+                OverlayAnim::Closing { .. } => (0.0, 0.0, 1.0, 0.0, false),
+                _ => (0.0, 0.0, 1.0, 1.0, false),
+            };
+        }
+        let speed = speed_scale.clamp(0.5, 2.5);
         if let OverlayAnim::PendingOpen { queued } = anim {
             // Keep scheduling frames until GTK attaches its first real buffer (capped at 600ms).
             return (0.0, 0.0, 1.0, 0.0, queued.elapsed().as_millis() < 600);
         }
+        // Helper: official Material 3 Expressive damped spatial spring (ζ < 1 organic overshoot,
+        // feathered smoothly over the final 10% so arrival at 1.0 never snaps).
+        let eval_m3_spring = |t: f32, zeta: f32, omega0: f32| -> f32 {
+            let settle = (5.0 / (zeta * omega0)).clamp(0.22, 0.72);
+            let tau = t * settle;
+            let wd = omega0 * (1.0 - zeta * zeta).sqrt();
+            let raw =
+                1.0 - (-zeta * omega0 * tau).exp() * ((wd * tau).cos() + (zeta * omega0 / wd) * (wd * tau).sin());
+            let tail = ((t - 0.88) / 0.12).clamp(0.0, 1.0);
+            let st = tail * tail * (3.0 - 2.0 * tail);
+            raw * (1.0 - st) + st
+        };
+
         match namespace {
-            "neon-quick-settings" => match anim {
+            "neon-quick-settings" | "neon-notification-center" => match anim {
                 OverlayAnim::Opening { started } => {
-                    let elapsed = started.elapsed().as_secs_f32();
-                    const DUR: f32 = 0.25;
+                    let elapsed = started.elapsed().as_secs_f32() * speed;
+                    const DUR: f32 = 0.36;
                     if elapsed >= DUR {
                         return (0.0, 0.0, 1.0, 1.0, false);
                     }
                     let t = (elapsed / DUR).clamp(0.0, 1.0);
-                    // Material 3 Expressive damped spring with subtle top-anchored overshoot
-                    // and smooth tail settle to exact 1.0 (zero end-frame pop).
-                    let raw =
-                        1.0 - (-8.5 * t).exp() * ((8.5 * t).cos() + 0.35 * (8.5 * t).sin());
-                    let tail = ((t - 0.85) / 0.15).clamp(0.0, 1.0);
-                    let smooth_tail = tail * tail * (3.0 - 2.0 * tail);
-                    let spring = raw * (1.0 - smooth_tail) + smooth_tail;
-                    let scale = (0.93 + 0.07 * spring).clamp(0.90, 1.018);
-                    let offset_y = -14.0 * (1.0 - spring);
-                    let at = (elapsed / 0.12).clamp(0.0, 1.0);
+                    // M3 Expressive Default Spatial (k=380, ζ=0.72): lively top-anchored pop-in.
+                    let spring = eval_m3_spring(t, 0.72, 19.5);
+                    let scale = (0.90 + 0.10 * spring).clamp(0.88, 1.024);
+                    let offset_y = -20.0 * (1.0 - spring);
+                    // M3 Expressive Fast Effects opacity (zero overshoot).
+                    let at = (elapsed / 0.135).clamp(0.0, 1.0);
                     let alpha = 1.0 - (1.0 - at).powi(3);
                     (0.0, offset_y, scale, alpha, true)
                 }
                 OverlayAnim::Closing { started } => {
-                    let elapsed = started.elapsed().as_secs_f32();
-                    const DUR: f32 = 0.155;
+                    let elapsed = started.elapsed().as_secs_f32() * speed;
+                    const DUR: f32 = 0.22;
                     if elapsed >= DUR {
-                        return (0.0, -12.0, 0.935, 0.0, false);
+                        return (0.0, -18.0, 0.91, 0.0, false);
                     }
                     let t = (elapsed / DUR).clamp(0.0, 1.0);
-                    let p = t * t * (3.0 - 2.0 * t);
-                    let scale = 1.0 - 0.065 * p;
-                    let offset_y = -12.0 * p;
-                    let alpha = (1.0 - p).clamp(0.0, 1.0);
+                    let p = 1.0 - (1.0 - t).powi(3);
+                    let scale = 1.0 - 0.09 * p;
+                    let offset_y = -18.0 * p;
+                    // Slight delay before alpha hits 0 so the tuck-up motion stays clearly visible.
+                    let at = ((t - 0.16) / 0.84).clamp(0.0, 1.0);
+                    let alpha = (1.0 - at * at * (3.0 - 2.0 * at)).clamp(0.0, 1.0);
                     (0.0, offset_y, scale, alpha, true)
                 }
                 OverlayAnim::PendingOpen { .. } => unreachable!(),
             },
             "neon-workspaces-panel" => match anim {
                 OverlayAnim::Opening { started } => {
-                    let elapsed = started.elapsed().as_secs_f32();
+                    let elapsed = started.elapsed().as_secs_f32() * speed;
                     const DUR: f32 = 0.24;
                     if elapsed >= DUR {
                         return (0.0, 0.0, 1.0, 1.0, false);
                     }
                     let t = (elapsed / DUR).clamp(0.0, 1.0);
-                    // Critically-damped quartic ease-out (zero wobble, zero edge-clip glitch).
                     let p = 1.0 - (1.0 - t).powi(4);
                     let offset_x = -248.0 * (1.0 - p);
                     let at = (elapsed / 0.11).clamp(0.0, 1.0);
@@ -433,7 +485,7 @@ impl NeonRenderer {
                     (offset_x, 0.0, 1.0, alpha, true)
                 }
                 OverlayAnim::Closing { started } => {
-                    let elapsed = started.elapsed().as_secs_f32();
+                    let elapsed = started.elapsed().as_secs_f32() * speed;
                     const DUR: f32 = 0.175;
                     if elapsed >= DUR {
                         return (-248.0, 0.0, 1.0, 0.0, false);
@@ -446,80 +498,115 @@ impl NeonRenderer {
                 }
                 OverlayAnim::PendingOpen { .. } => unreachable!(),
             },
-            "neon-screencast-picker" => match anim {
+            "neon-screencast-picker" | "neon-screenshot-bar" => match anim {
                 OverlayAnim::Opening { started } => {
-                    let elapsed = started.elapsed().as_secs_f32();
-                    const DUR: f32 = 0.22;
+                    let elapsed = started.elapsed().as_secs_f32() * speed;
+                    const DUR: f32 = 0.34;
                     if elapsed >= DUR {
                         return (0.0, 0.0, 1.0, 1.0, false);
                     }
                     let t = (elapsed / DUR).clamp(0.0, 1.0);
-                    let p = 1.0 - (1.0 - t).powi(3);
-                    let scale = 0.94 + 0.06 * p;
-                    let offset_y = 14.0 * (1.0 - p);
-                    let at = (elapsed / 0.12).clamp(0.0, 1.0);
+                    let spring = eval_m3_spring(t, 0.74, 19.5);
+                    let scale = (0.90 + 0.10 * spring).clamp(0.88, 1.022);
+                    let offset_y = 20.0 * (1.0 - spring);
+                    let at = (elapsed / 0.13).clamp(0.0, 1.0);
                     let alpha = 1.0 - (1.0 - at).powi(3);
                     (0.0, offset_y, scale, alpha, true)
                 }
                 OverlayAnim::Closing { started } => {
-                    let elapsed = started.elapsed().as_secs_f32();
-                    const DUR: f32 = 0.14;
+                    let elapsed = started.elapsed().as_secs_f32() * speed;
+                    const DUR: f32 = 0.21;
                     if elapsed >= DUR {
-                        return (0.0, 10.0, 0.95, 0.0, false);
+                        return (0.0, 16.0, 0.91, 0.0, false);
                     }
                     let t = (elapsed / DUR).clamp(0.0, 1.0);
-                    let p = t * t * (3.0 - 2.0 * t);
-                    (0.0, 10.0 * p, 1.0 - 0.05 * p, (1.0 - p).clamp(0.0, 1.0), true)
+                    let p = 1.0 - (1.0 - t).powi(3);
+                    let at = ((t - 0.15) / 0.85).clamp(0.0, 1.0);
+                    let alpha = (1.0 - at * at * (3.0 - 2.0 * at)).clamp(0.0, 1.0);
+                    (0.0, 16.0 * p, 1.0 - 0.09 * p, alpha, true)
                 }
                 OverlayAnim::PendingOpen { .. } => unreachable!(),
             },
             "neon-context-menu" | "neon-context-submenu" => match anim {
                 OverlayAnim::Opening { started } => {
-                    let elapsed = started.elapsed().as_secs_f32();
-                    const DUR: f32 = 0.135;
+                    let elapsed = started.elapsed().as_secs_f32() * speed;
+                    const DUR: f32 = 0.22;
                     if elapsed >= DUR {
                         return (0.0, 0.0, 1.0, 1.0, false);
                     }
                     let t = (elapsed / DUR).clamp(0.0, 1.0);
-                    let p = 1.0 - (1.0 - t).powi(3);
-                    let scale = 0.955 + 0.045 * p;
-                    let offset_y = -4.0 * (1.0 - p);
-                    let at = (elapsed / 0.085).clamp(0.0, 1.0);
-                    let alpha = 1.0 - (1.0 - at).powi(2);
+                    // M3 Expressive Fast Spatial (k=800, ζ=0.68): snappy crisp spring pop.
+                    let spring = eval_m3_spring(t, 0.68, 28.0);
+                    let scale = (0.90 + 0.10 * spring).clamp(0.88, 1.02);
+                    let offset_y = -7.0 * (1.0 - spring);
+                    let at = (elapsed / 0.10).clamp(0.0, 1.0);
+                    let alpha = 1.0 - (1.0 - at).powi(3);
                     (0.0, offset_y, scale, alpha, true)
                 }
                 OverlayAnim::Closing { started } => {
-                    let elapsed = started.elapsed().as_secs_f32();
-                    const DUR: f32 = 0.095;
+                    let elapsed = started.elapsed().as_secs_f32() * speed;
+                    const DUR: f32 = 0.145;
                     if elapsed >= DUR {
-                        return (0.0, -3.0, 0.96, 0.0, false);
+                        return (0.0, -6.0, 0.92, 0.0, false);
                     }
                     let t = (elapsed / DUR).clamp(0.0, 1.0);
-                    let p = t * t * (3.0 - 2.0 * t);
-                    (0.0, -3.0 * p, 1.0 - 0.04 * p, (1.0 - p).clamp(0.0, 1.0), true)
+                    let p = 1.0 - (1.0 - t).powi(3);
+                    let at = ((t - 0.12) / 0.88).clamp(0.0, 1.0);
+                    let alpha = (1.0 - at * at * (3.0 - 2.0 * at)).clamp(0.0, 1.0);
+                    (0.0, -6.0 * p, 1.0 - 0.08 * p, alpha, true)
                 }
                 OverlayAnim::PendingOpen { .. } => unreachable!(),
             },
-            "neon-power-menu" => match anim {
+            "neon-dock-preview" => match anim {
                 OverlayAnim::Opening { started } => {
-                    let elapsed = started.elapsed().as_secs_f32();
+                    let elapsed = started.elapsed().as_secs_f32() * speed;
                     const DUR: f32 = 0.18;
                     if elapsed >= DUR {
                         return (0.0, 0.0, 1.0, 1.0, false);
                     }
                     let t = (elapsed / DUR).clamp(0.0, 1.0);
-                    let alpha = 1.0 - (1.0 - t).powi(3);
-                    (0.0, 0.0, 1.0, alpha, true)
+                    let p = 1.0 - (1.0 - t).powi(3);
+                    let scale = 0.96 + 0.04 * p;
+                    let offset_y = -8.0 * (1.0 - p);
+                    (0.0, offset_y, scale, p, true)
                 }
                 OverlayAnim::Closing { started } => {
-                    let elapsed = started.elapsed().as_secs_f32();
-                    const DUR: f32 = 0.135;
+                    let elapsed = started.elapsed().as_secs_f32() * speed;
+                    const DUR: f32 = 0.12;
                     if elapsed >= DUR {
-                        return (0.0, 0.0, 1.0, 0.0, false);
+                        return (0.0, -6.0, 0.96, 0.0, false);
                     }
                     let t = (elapsed / DUR).clamp(0.0, 1.0);
-                    let p = t * t * (3.0 - 2.0 * t);
-                    (0.0, 0.0, 1.0, (1.0 - p).clamp(0.0, 1.0), true)
+                    let p = 1.0 - (1.0 - t).powi(2);
+                    (0.0, -6.0 * p, 1.0 - 0.04 * p, 1.0 - p, true)
+                }
+                OverlayAnim::PendingOpen { .. } => unreachable!(),
+            },
+            "neon-power-menu" => match anim {
+                OverlayAnim::Opening { started } => {
+                    let elapsed = started.elapsed().as_secs_f32() * speed;
+                    const DUR: f32 = 0.30;
+                    if elapsed >= DUR {
+                        return (0.0, 0.0, 1.0, 1.0, false);
+                    }
+                    let t = (elapsed / DUR).clamp(0.0, 1.0);
+                    let spring = eval_m3_spring(t, 0.78, 19.0);
+                    let scale = (0.95 + 0.05 * spring).clamp(0.94, 1.012);
+                    let at = (elapsed / 0.17).clamp(0.0, 1.0);
+                    let alpha = 1.0 - (1.0 - at).powi(3);
+                    (0.0, 0.0, scale, alpha, true)
+                }
+                OverlayAnim::Closing { started } => {
+                    let elapsed = started.elapsed().as_secs_f32() * speed;
+                    const DUR: f32 = 0.21;
+                    if elapsed >= DUR {
+                        return (0.0, 0.0, 0.96, 0.0, false);
+                    }
+                    let t = (elapsed / DUR).clamp(0.0, 1.0);
+                    let p = 1.0 - (1.0 - t).powi(3);
+                    let at = ((t - 0.14) / 0.86).clamp(0.0, 1.0);
+                    let alpha = (1.0 - at * at * (3.0 - 2.0 * at)).clamp(0.0, 1.0);
+                    (0.0, 0.0, 1.0 - 0.04 * p, alpha, true)
                 }
                 OverlayAnim::PendingOpen { .. } => unreachable!(),
             },
@@ -621,6 +708,37 @@ impl NeonRenderer {
         }
     }
 
+    /// Renders an active Wayland client Drag-and-Drop icon surface (`wl_data_device.start_drag`)
+    /// directly beneath the pointer cursor.
+    pub fn dnd_icon_elements(
+        &self,
+        renderer: &mut GlesRenderer,
+        pointer_loc: Point<f64, Logical>,
+        output_origin: Point<i32, Logical>,
+        scale_f: f64,
+        dnd_icon: Option<&WlSurface>,
+    ) -> Vec<NeonRenderElement> {
+        let Some(wl_surface) = dnd_icon else {
+            return Vec::new();
+        };
+        let render_loc: Point<i32, Logical> = (
+            (pointer_loc.x - output_origin.x as f64).round() as i32 + 6,
+            (pointer_loc.y - output_origin.y as f64).round() as i32 + 6,
+        )
+            .into();
+        let phys_loc: Point<i32, Physical> = render_loc.to_physical_precise_round(scale_f);
+        let elems: Vec<WaylandSurfaceRenderElement<GlesRenderer>> =
+            render_elements_from_surface_tree(
+                renderer,
+                wl_surface,
+                phys_loc,
+                Scale::from(scale_f),
+                0.94,
+                Kind::Unspecified,
+            );
+        elems.into_iter().map(NeonRenderElement::from).collect()
+    }
+
     fn render_named_cursor(
         &mut self,
         renderer: &mut GlesRenderer,
@@ -680,36 +798,44 @@ impl NeonRenderer {
     where
         F: FnMut(WindowId) -> Option<&'a Window>,
     {
+        self.overlay_motion_enabled = blur.animations_enabled;
+        self.overlay_speed_scale = blur.speed_scale.clamp(0.5, 2.5);
         let scale_f = output.current_scale().fractional_scale();
         let scale = Scale::from(scale_f);
         let nodes = scene.collect_front_to_back();
 
         let mut elements: Vec<NeonRenderElement> =
             Vec::with_capacity(nodes.len() * 3 + override_redirect.len() * 2 + 8);
+        let mut front_scene_elements: Vec<NeonRenderElement> = Vec::new();
         let mut seen_windows: HashSet<WindowId> = HashSet::new();
 
+        // Ignore departing outgoing-workspace slide nodes (`z_index < 0`) so switching from a
+        // fullscreen video workspace to an empty/normal workspace immediately shows Top Bar & Dock.
         let has_fullscreen_window = nodes.iter().any(|n| {
-            matches!(
-                n.content,
-                NodeContent::Window {
-                    fullscreen: true,
-                    ..
-                }
-            )
+            n.z_index >= 0
+                && matches!(
+                    n.content,
+                    NodeContent::Window {
+                        fullscreen: true,
+                        ..
+                    }
+                )
         });
 
         // Collect zwlr_layer_shell_v1 surfaces on this output split into:
-        // - `front_overlays`: non-blur `Layer::Overlay` surfaces (context menus, toasts, screenshot UI)
-        // - `blur_overlays`: `Layer::Overlay` surfaces that receive a real-time GPU Gaussian backdrop
-        //   blur behind their exact bounds (`neon-quick-settings` rounded 24px, `neon-power-menu` full screen)
+        // - `front_overlays`: topmost non-blur `Layer::Overlay` surfaces (toasts, screenshot UI, dialogs)
+        // - `blur_overlays`: `Layer::Overlay` popups that receive a real-time GPU Gaussian backdrop
+        //   blur (`neon-context-menu`, `neon-quick-settings`, `neon-power-menu`, `neon-screencast-picker`)
         // - `backdrop_overlays`: transparent click-catcher backdrops stacked directly below blur overlays
-        // - `top_layers`: `Layer::Top` chrome (panel, dock, sensors) — completely omitted when a
-        //   fullscreen window is active and Overview is closed
+        // - `chrome_overlays`: elevated Top Bar & Dock (`Layer::Overlay` during Launchpad / Mission
+        //   Control) — stacked ABOVE fullscreen `Layer::Top` backdrops and ALWAYS BELOW popups/menus
+        // - `top_layers`: `Layer::Top` chrome (panel, dock, sensors, overview, mission control)
         // - `lower_layers`: `Layer::Bottom` / `Layer::Background` (wallpaper)
         let (
             front_overlays,
             blur_overlays,
             backdrop_overlays,
+            chrome_overlays,
             top_layers,
             lower_layers,
             has_overview_layer,
@@ -718,11 +844,12 @@ impl NeonRenderer {
             let mut front = Vec::new();
             let mut blur_ov = Vec::new();
             let mut backdrop_ov = Vec::new();
+            let mut chrome_ov = Vec::new();
             let mut top = Vec::new();
             let mut lower = Vec::new();
-            let has_overview_layer = layer_map
-                .layers_on(WlrLayer::Top)
-                .any(|l| l.namespace() == "neon-overview");
+            let has_overview_layer = layer_map.layers_on(WlrLayer::Top).any(|l| {
+                matches!(l.namespace(), "neon-overview" | "neon-workspaces-panel")
+            });
 
             for layer in layer_map.layers_on(WlrLayer::Overlay).rev() {
                 if let Some(geo) = layer_map.layer_geometry(layer) {
@@ -738,8 +865,11 @@ impl NeonRenderer {
                             );
                             blur_ov.insert(idx, (layer.clone(), geo, 13.0_f32, 22i32));
                         }
-                        "neon-quick-settings" => {
+                        "neon-quick-settings" | "neon-notification-center" => {
                             blur_ov.push((layer.clone(), geo, 24.0_f32, 0i32));
+                        }
+                        "neon-dock-preview" => {
+                            blur_ov.push((layer.clone(), geo, 14.0_f32, 0i32));
                         }
                         "neon-workspaces-panel" => {
                             blur_ov.push((layer.clone(), geo, 16.0_f32, 0i32));
@@ -747,14 +877,22 @@ impl NeonRenderer {
                         "neon-screencast-picker" => {
                             blur_ov.push((layer.clone(), geo, 22.0_f32, 0i32));
                         }
+                        "neon-screenshot-bar" => {
+                            blur_ov.push((layer.clone(), geo, 26.0_f32, 18i32));
+                        }
                         "neon-power-menu" => {
                             blur_ov.push((layer.clone(), geo, 0.0_f32, 0i32));
                         }
                         "neon-quick-settings-backdrop"
+                        | "neon-notification-center-backdrop"
                         | "neon-workspaces-backdrop"
                         | "neon-screencast-picker-backdrop"
-                        | "neon-context-menu-backdrop" => {
+                        | "neon-context-menu-backdrop"
+                        | "neon-screenshot-ui" => {
                             backdrop_ov.push((layer.clone(), geo.loc));
+                        }
+                        "neon-panel" | "neon-dock" => {
+                            chrome_ov.push((layer.clone(), geo.loc));
                         }
                         _ => {
                             front.push((layer.clone(), geo.loc));
@@ -766,7 +904,10 @@ impl NeonRenderer {
                 if let Some(geo) = layer_map.layer_geometry(layer)
                     && (!has_fullscreen_window
                         || has_overview_layer
-                        || layer.namespace() == "neon-overview")
+                        || matches!(
+                            layer.namespace(),
+                            "neon-overview" | "neon-workspaces-panel"
+                        ))
                 {
                     top.push((layer.clone(), geo));
                 }
@@ -782,6 +923,7 @@ impl NeonRenderer {
                 front,
                 blur_ov,
                 backdrop_ov,
+                chrome_ov,
                 top,
                 lower,
                 has_overview_layer,
@@ -1163,7 +1305,64 @@ impl NeonRenderer {
                             node.opacity,
                             Kind::Unspecified,
                         );
-                        elements.push(NeonRenderElement::from(elem));
+                        if node.layer >= SceneLayer::Overview {
+                            front_scene_elements.push(NeonRenderElement::from(elem));
+                        } else {
+                            elements.push(NeonRenderElement::from(elem));
+                        }
+                    }
+                }
+                NodeContent::RoundedRect {
+                    fill_color,
+                    border_color,
+                    border_width,
+                } => {
+                    if eff_rect.size.w > 0 && eff_rect.size.h > 0 {
+                        if let Some(program) = self.shaders.as_ref().map(|s| s.rounded_rect.clone())
+                        {
+                            let uniforms = vec![
+                                Uniform::new("u_corner_radius", node.corner_radius),
+                                Uniform::new("u_border_width", *border_width),
+                                Uniform::new("u_fill_color", *fill_color),
+                                Uniform::new("u_border_color", *border_color),
+                                Uniform::new("u_opacity", node.opacity),
+                            ];
+                            let elem = PixelShaderElement::new(
+                                program,
+                                eff_rect,
+                                None,
+                                1.0,
+                                uniforms,
+                                Kind::Unspecified,
+                            );
+                            if node.layer >= SceneLayer::Overview {
+                                front_scene_elements.push(NeonRenderElement::from(elem));
+                            } else {
+                                elements.push(NeonRenderElement::from(elem));
+                            }
+                        } else {
+                            let buf = SolidColorBuffer::new(
+                                eff_rect.size,
+                                Color32F::new(
+                                    fill_color[0],
+                                    fill_color[1],
+                                    fill_color[2],
+                                    fill_color[3] * node.opacity,
+                                ),
+                            );
+                            let elem = SolidColorRenderElement::from_buffer(
+                                &buf,
+                                eff_rect.loc.to_physical_precise_round(scale_f),
+                                scale_f,
+                                node.opacity,
+                                Kind::Unspecified,
+                            );
+                            if node.layer >= SceneLayer::Overview {
+                                front_scene_elements.push(NeonRenderElement::from(elem));
+                            } else {
+                                elements.push(NeonRenderElement::from(elem));
+                            }
+                        }
                     }
                 }
             }
@@ -1273,7 +1472,11 @@ impl NeonRenderer {
                 let blur_rect_and_radius: Option<(Rectangle<i32, Logical>, f32)> = match ns {
                     "neon-panel" => Some((*geo, 0.0)),
                     "neon-dock" => {
-                        if geo.size.h > geo.size.w {
+                        let out_w_logical = ((out_phys.w as f64) / scale_f).round() as i32;
+                        if geo.size.w >= out_w_logical - 8 && geo.loc.x <= 4 {
+                            // Full-width Combined Bottom Taskbar renders edge-to-edge without outer padding.
+                            Some((*geo, 0.0))
+                        } else if geo.size.h > geo.size.w {
                             // Vertical Left/Right dock wrapper uses `padding: 16px 7px;`
                             let pw = geo.size.w - 14;
                             let ph = geo.size.h - 32;
@@ -1290,14 +1493,15 @@ impl NeonRenderer {
                                 None
                             }
                         } else {
-                            // Horizontal Bottom dock wrapper uses `padding: 7px 20px 5px 20px;`
-                            let pw = geo.size.w - 40;
-                            let ph = geo.size.h - 12;
+                            // Horizontal Bottom dock wrapper uses `padding: 16px 24px 5px 24px;`
+                            // (16px top headroom for macOS wave magnification without clipping).
+                            let pw = geo.size.w - 48;
+                            let ph = geo.size.h - 21;
                             if pw > 16 && ph > 16 {
                                 let rad = if ph <= 42 { 15.0 } else { 20.0 };
                                 Some((
                                     Rectangle::new(
-                                        (geo.loc.x + 20, geo.loc.y + 7).into(),
+                                        (geo.loc.x + 24, geo.loc.y + 16).into(),
                                         (pw, ph).into(),
                                     ),
                                     rad,
@@ -1334,7 +1538,25 @@ impl NeonRenderer {
             }
         }
         scene_below_overlay.extend(elements);
-        let elements = scene_below_overlay;
+        // Prepend elevated Top Bar & Dock (`chrome_overlays`) cleanly above `Layer::Top`
+        // fullscreen backdrops (`neon-overview`, `neon-workspaces-panel`), while keeping them
+        // strictly BELOW popups (`neon-context-menu`, `neon-quick-settings`, `neon-power-menu`,
+        // `neon-screenshot-ui`, `neon-notifications`) and their click-catcher backdrops.
+        let elements = if chrome_overlays.is_empty() {
+            scene_below_overlay
+        } else {
+            let mut with_chrome =
+                Vec::with_capacity(scene_below_overlay.len() + chrome_overlays.len() * 2);
+            for (layer, loc) in &chrome_overlays {
+                let phys_loc: Point<i32, Physical> = loc.to_physical_precise_round(scale_f);
+                let layer_elements = AsRenderElements::<GlesRenderer>::render_elements::<
+                    WaylandSurfaceRenderElement<GlesRenderer>,
+                >(layer, renderer, phys_loc, scale, 1.0);
+                with_chrome.extend(layer_elements.into_iter().map(NeonRenderElement::from));
+            }
+            with_chrome.extend(scene_below_overlay);
+            with_chrome
+        };
 
         // Fast path when no `Layer::Overlay` surfaces are mapped (0 extra allocations / GPU passes).
         if blur_overlays.is_empty() {
@@ -1351,7 +1573,11 @@ impl NeonRenderer {
                 )
             });
         }
-        if front_overlays.is_empty() && blur_overlays.is_empty() && backdrop_overlays.is_empty() {
+        if front_overlays.is_empty()
+            && blur_overlays.is_empty()
+            && backdrop_overlays.is_empty()
+            && front_scene_elements.is_empty()
+        {
             return elements;
         }
 
@@ -1394,6 +1620,12 @@ impl NeonRenderer {
             >(layer, renderer, phys_loc, scale, 1.0);
             final_elements.extend(layer_elements.into_iter().map(NeonRenderElement::from));
         }
+        let front_overlay_elem_count = final_elements.len();
+
+        let out_h_logical = output
+            .current_mode()
+            .map(|m| ((f64::from(m.size.h)) / scale_f).round() as i32)
+            .unwrap_or(1080);
 
         let mut seen_blur_ns: HashSet<String> = HashSet::new();
         for (layer, geo, corner_radius_logical, blur_inset_logical) in &blur_overlays {
@@ -1429,18 +1661,40 @@ impl NeonRenderer {
                 continue;
             }
 
-            let (offset_x, offset_y, overlay_scale, alpha, is_animating) =
-                Self::eval_overlay_anim(ns, self.overlay_anims.get(ns).copied());
+            let (offset_x, raw_offset_y, overlay_scale, alpha, is_animating) =
+                Self::eval_overlay_anim(
+                    ns,
+                    self.overlay_anims.get(ns).copied(),
+                    self.overlay_motion_enabled,
+                    self.overlay_speed_scale,
+                );
             if alpha <= 0.005 {
                 continue;
             }
+
+            let bottom_anchored = matches!(
+                ns,
+                "neon-quick-settings" | "neon-notification-center" | "neon-dock-preview"
+            ) && geo.loc.y + geo.size.h / 2 > out_h_logical / 2;
+            let offset_y = if bottom_anchored {
+                -raw_offset_y
+            } else {
+                raw_offset_y
+            };
 
             let dx_phys = (offset_x as f64 * scale_f).round() as i32;
             let dy_phys = (offset_y as f64 * scale_f).round() as i32;
             let shifted_loc: Point<i32, Physical> =
                 (base_phys.loc.x + dx_phys, base_phys.loc.y + dy_phys).into();
-            let anchor_phys: Point<i32, Physical> =
-                (shifted_loc.x + base_phys.size.w / 2, shifted_loc.y).into();
+            let anchor_phys: Point<i32, Physical> = if bottom_anchored {
+                (
+                    shifted_loc.x + base_phys.size.w / 2,
+                    shifted_loc.y + base_phys.size.h,
+                )
+                    .into()
+            } else {
+                (shifted_loc.x + base_phys.size.w / 2, shifted_loc.y).into()
+            };
             let is_scaled = (overlay_scale - 1.0).abs() > 0.001;
 
             let layer_elements = AsRenderElements::<GlesRenderer>::render_elements::<
@@ -1489,10 +1743,12 @@ impl NeonRenderer {
                         .round()
                         .max(1.0) as i32;
                     let scaled_inset_y = (inset_phys as f64 * overlay_scale as f64).round() as i32;
-                    Rectangle::new(
-                        (anchor_phys.x - sw / 2, anchor_phys.y + scaled_inset_y).into(),
-                        (sw, sh).into(),
-                    )
+                    let dst_y = if bottom_anchored {
+                        anchor_phys.y - scaled_inset_y - sh
+                    } else {
+                        anchor_phys.y + scaled_inset_y
+                    };
+                    Rectangle::new((anchor_phys.x - sw / 2, dst_y).into(), (sw, sh).into())
                 } else {
                     Rectangle::new(inner_loc, inner_size)
                 };
@@ -1536,6 +1792,13 @@ impl NeonRenderer {
                 WaylandSurfaceRenderElement<GlesRenderer>,
             >(layer, renderer, phys_loc, scale, 1.0);
             final_elements.extend(layer_elements.into_iter().map(NeonRenderElement::from));
+        }
+
+        if !front_scene_elements.is_empty() {
+            // Place topmost scene overlays (e.g. Windows 11 Snap Layouts drop bar) right above
+            // Top Bar & Dock while remaining cleanly under cursor & front alerts.
+            let insert_at = front_overlay_elem_count.min(final_elements.len());
+            final_elements.splice(insert_at..insert_at, front_scene_elements);
         }
 
         final_elements.extend(elements);

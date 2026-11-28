@@ -10,7 +10,7 @@
 //!   H.264 MP4s to `~/Videos/Screencasts/`, paired with a pulsing red Top Bar stop indicator
 
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::HashSet,
     f64::consts::TAU,
     fs,
@@ -23,7 +23,7 @@ use std::{
 
 use gtk4::{
     Align, Application, ApplicationWindow, Box as GtkBox, Button, DrawingArea, EventControllerKey,
-    GestureClick, GestureDrag, Image, Label, Orientation, Overlay, gdk, glib, prelude::*,
+    GestureClick, GestureDrag, Image, Label, Orientation, gdk, glib, prelude::*,
 };
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 use neon_ipc::{DesktopSnapshot, IpcRequest, WindowInfo};
@@ -99,10 +99,17 @@ struct ActiveRecording {
     started_at: Instant,
 }
 
-/// Interactive GNOME 47-style Screenshot & Screen Record overlay.
+/// Interactive Liquid Glass Screenshot & Screen Record overlay.
+///
+/// Uses a fullscreen selection/cutout canvas (`"neon-screenshot-ui"`) paired with a dedicated
+/// tight-fitting floating toolbar window (`"neon-screenshot-bar"`) so `neon-renderer` applies
+/// real-time GPU Gaussian Liquid Glass blur strictly behind the toolbar, matching Control Center.
 #[derive(Clone)]
 pub struct ScreenshotOverlay {
     window: ApplicationWindow,
+    bar_window: ApplicationWindow,
+    toolbar: GtkBox,
+    anim_gen: Rc<Cell<u64>>,
     drawing_area: DrawingArea,
     state: Rc<RefCell<SelState>>,
     mode_sel_btn: Button,
@@ -166,7 +173,24 @@ impl ScreenshotOverlay {
         let last_snapshot: Rc<RefCell<Option<DesktopSnapshot>>> = Rc::new(RefCell::new(None));
         let recording: Rc<RefCell<Option<ActiveRecording>>> = Rc::new(RefCell::new(None));
 
-        let overlay = Overlay::new();
+        // Dedicated tight-fitting Liquid Glass toolbar window rendered above the selection canvas
+        // with true real-time GPU frosted backdrop blur (matching Control Center / Quick Settings).
+        let bar_window = ApplicationWindow::builder()
+            .application(app)
+            .title("NEON DE Capture Controls")
+            .decorated(false)
+            .resizable(false)
+            .build();
+        bar_window.add_css_class("neon-screenshot-window");
+        if gtk4_layer_shell::is_supported() {
+            bar_window.init_layer_shell();
+            bar_window.set_namespace(Some("neon-screenshot-bar"));
+            bar_window.set_layer(Layer::Overlay);
+            bar_window.set_anchor(Edge::Bottom, true);
+            bar_window.set_margin(Edge::Bottom, 18);
+            bar_window.set_exclusive_zone(-1);
+            bar_window.set_keyboard_mode(KeyboardMode::None);
+        }
 
         // Fullscreen Cairo canvas drawing dimmed surround + crisp selection/window cutout
         let drawing_area = DrawingArea::new();
@@ -176,10 +200,21 @@ impl ScreenshotOverlay {
             let st = Rc::clone(&state);
             let snap_ref = Rc::clone(&last_snapshot);
             drawing_area.set_draw_func(move |_, cr, w, h| {
+                cr.set_antialias(gtk4::cairo::Antialias::Best);
+                if let Ok(mut fo) = gtk4::cairo::FontOptions::new() {
+                    fo.set_antialias(gtk4::cairo::Antialias::Subpixel);
+                    fo.set_subpixel_order(gtk4::cairo::SubpixelOrder::Rgb);
+                    fo.set_hint_style(gtk4::cairo::HintStyle::Slight);
+                    fo.set_hint_metrics(gtk4::cairo::HintMetrics::Off);
+                    cr.set_font_options(&fo);
+                }
                 let wf = f64::from(w);
                 let hf = f64::from(h);
                 let cur = *st.borrow();
                 let is_record = cur.kind == CaptureKind::Record;
+                let is_light = snap_ref.borrow().as_ref().is_some_and(|s| {
+                    s.appearance.theme == "neon_light" || s.appearance.theme == "light"
+                });
 
                 match cur.mode {
                     CaptureMode::Screen => {
@@ -201,7 +236,7 @@ impl ScreenshotOverlay {
                         } else {
                             format!("Full Screen  {w} x {h}")
                         };
-                        draw_pill_badge(cr, (wf - 220.0) * 0.5, 46.0, &badge, is_record);
+                        draw_pill_badge(cr, (wf - 220.0) * 0.5, 46.0, &badge, is_record, is_light);
                     }
                     CaptureMode::Selection => {
                         let (rx, ry, rw, rh) = cur.rect();
@@ -212,7 +247,9 @@ impl ScreenshotOverlay {
                         } else {
                             format!("{:.0} x {:.0}", rw, rh)
                         };
-                        draw_cutout_mask(cr, wf, hf, rx, ry, rw, rh, true, is_record, &label);
+                        draw_cutout_mask(
+                            cr, wf, hf, rx, ry, rw, rh, true, is_record, is_light, &label,
+                        );
                     }
                     CaptureMode::Window => {
                         if let Some((wx, wy, ww, wh, title)) =
@@ -224,7 +261,9 @@ impl ScreenshotOverlay {
                             } else {
                                 format!("{short}  {:.0}x{:.0}", ww, wh)
                             };
-                            draw_cutout_mask(cr, wf, hf, wx, wy, ww, wh, false, is_record, &label);
+                            draw_cutout_mask(
+                                cr, wf, hf, wx, wy, ww, wh, false, is_record, is_light, &label,
+                            );
                         } else {
                             cr.set_source_rgba(0.0, 0.0, 0.0, 0.38);
                             cr.rectangle(0.0, 0.0, wf, hf);
@@ -235,6 +274,7 @@ impl ScreenshotOverlay {
                                 46.0,
                                 "No open window to capture",
                                 false,
+                                is_light,
                             );
                         }
                     }
@@ -358,16 +398,21 @@ impl ScreenshotOverlay {
             });
         }
         drawing_area.add_controller(click_pick);
-        overlay.set_child(Some(&drawing_area));
+        window.set_child(Some(&drawing_area));
 
         // =========================================================================
-        // GNOME 47 Signature Floating Bottom Pill Toolbar
+        // Liquid Glass Floating Bottom Capture & Screen Record Pill Toolbar
         // =========================================================================
+        let bar_surface = GtkBox::new(Orientation::Vertical, 0);
+        bar_surface.add_css_class("neon-shot-bar-surface");
+        bar_surface.set_halign(Align::Center);
+        bar_surface.set_valign(Align::Center);
+
         let toolbar = GtkBox::new(Orientation::Vertical, 12);
         toolbar.add_css_class("neon-gnome-shot-bar");
+        toolbar.add_css_class("shot-closed");
         toolbar.set_halign(Align::Center);
-        toolbar.set_valign(Align::End);
-        toolbar.set_margin_bottom(38);
+        toolbar.set_valign(Align::Center);
 
         // Top row: Selection | Screen | Window  +  Audio toggle (Record mode)  +  Close
         let mode_row = GtkBox::new(Orientation::Horizontal, 6);
@@ -435,13 +480,17 @@ impl ScreenshotOverlay {
         toolbar.append(&mode_row);
         toolbar.append(&action_row);
         toolbar.append(&hint_label);
-        overlay.add_overlay(&toolbar);
+        bar_surface.append(&toolbar);
+        bar_window.set_child(Some(&bar_surface));
 
-        window.set_child(Some(&overlay));
         window.set_visible(false);
+        bar_window.set_visible(false);
 
         let shot = Self {
             window,
+            bar_window,
+            toolbar,
+            anim_gen: Rc::new(Cell::new(0)),
             drawing_area,
             state,
             mode_sel_btn,
@@ -522,9 +571,9 @@ impl ScreenshotOverlay {
             });
         }
 
-        // Keyboard shortcuts: Esc cancels, Enter/Space captures or records
-        let key_ctrl = EventControllerKey::new();
-        {
+        // Keyboard shortcuts: Esc cancels, Enter/Space captures or records (on both canvas & toolbar)
+        for target_win in [&shot.window, &shot.bar_window] {
+            let key_ctrl = EventControllerKey::new();
             let this = shot.clone();
             key_ctrl.connect_key_pressed(move |_, key, _, _| {
                 if key == gdk::Key::Escape {
@@ -537,8 +586,8 @@ impl ScreenshotOverlay {
                 }
                 glib::Propagation::Proceed
             });
+            target_win.add_controller(key_ctrl);
         }
-        shot.window.add_controller(key_ctrl);
 
         shot
     }
@@ -570,18 +619,85 @@ impl ScreenshotOverlay {
         let is_rec = self.recording.borrow().is_some();
         self.stop_rec_btn.set_visible(is_rec);
 
+        let epoch = self.anim_gen.get().wrapping_add(1);
+        self.anim_gen.set(epoch);
+        self.toolbar.remove_css_class("shot-open");
+        self.toolbar.remove_css_class("shot-closing");
+        self.toolbar.add_css_class("shot-closed");
+
         if gtk4_layer_shell::is_supported() {
             self.window.set_keyboard_mode(KeyboardMode::Exclusive);
         }
         self.window.set_visible(true);
         self.window.present();
+        self.bar_window.set_default_size(-1, -1);
+        self.bar_window.queue_resize();
+        self.bar_window.set_visible(true);
+        self.bar_window.present();
         self.drawing_area.queue_draw();
+
+        let gen_c = Rc::clone(&self.anim_gen);
+        self.toolbar.add_tick_callback(move |w, _| {
+            if gen_c.get() == epoch {
+                w.remove_css_class("shot-closed");
+                w.add_css_class("shot-open");
+            }
+            glib::ControlFlow::Break
+        });
     }
 
     pub fn close(&self) {
+        if !self.window.is_visible() && !self.bar_window.is_visible() {
+            return;
+        }
+        let (motion_on, speed) = self
+            .last_snapshot
+            .borrow()
+            .as_ref()
+            .map(|s| {
+                (
+                    s.effects.enabled && !s.effects.reduced_motion,
+                    s.effects.speed_scale.clamp(0.5, 2.5),
+                )
+            })
+            .unwrap_or((true, 1.0));
+        if !motion_on {
+            self.close_immediate();
+            return;
+        }
+        let epoch = self.anim_gen.get().wrapping_add(1);
+        self.anim_gen.set(epoch);
         if gtk4_layer_shell::is_supported() {
             self.window.set_keyboard_mode(KeyboardMode::None);
         }
+        self.toolbar.remove_css_class("shot-open");
+        self.toolbar.add_css_class("shot-closing");
+
+        let hide_ms = ((185.0 / speed).round() as u64).clamp(70, 400);
+        let win = self.window.clone();
+        let bar_win = self.bar_window.clone();
+        let tb = self.toolbar.clone();
+        let gen_c = Rc::clone(&self.anim_gen);
+        glib::timeout_add_local_once(Duration::from_millis(hide_ms), move || {
+            if gen_c.get() == epoch {
+                tb.remove_css_class("shot-closing");
+                tb.add_css_class("shot-closed");
+                bar_win.set_visible(false);
+                win.set_visible(false);
+            }
+        });
+    }
+
+    pub fn close_immediate(&self) {
+        let epoch = self.anim_gen.get().wrapping_add(1);
+        self.anim_gen.set(epoch);
+        if gtk4_layer_shell::is_supported() {
+            self.window.set_keyboard_mode(KeyboardMode::None);
+        }
+        self.toolbar.remove_css_class("shot-open");
+        self.toolbar.remove_css_class("shot-closing");
+        self.toolbar.add_css_class("shot-closed");
+        self.bar_window.set_visible(false);
         self.window.set_visible(false);
     }
 
@@ -772,8 +888,8 @@ impl ScreenshotOverlay {
         let cur = *self.state.borrow();
         let region = self.current_region();
 
-        // Hide the overlay before screenshot or starting video recording so UI never leaks in.
-        self.close();
+        // Hide the overlay immediately before screenshot or starting video recording so UI never leaks in.
+        self.close_immediate();
 
         match cur.kind {
             CaptureKind::Screenshot => {
@@ -893,19 +1009,22 @@ fn make_kind_btn(icon_name: &str, label: &str) -> Button {
 }
 
 fn active_workspace_windows(snap: &DesktopSnapshot) -> Vec<&WindowInfo> {
-    let active_ws_ids: HashSet<u64> = snap
+    let active_ws = snap
         .workspaces
         .iter()
         .find(|ws| ws.active)
-        .map(|ws| ws.window_ids.iter().copied().collect())
-        .unwrap_or_default();
+        .or_else(|| snap.workspaces.get(snap.active_workspace_index));
+    let active_ws_info: Option<(u64, HashSet<u64>)> =
+        active_ws.map(|ws| (ws.id, ws.window_ids.iter().copied().collect()));
     snap.windows
         .iter()
         .filter(|w| {
             !w.minimized
                 && w.width > 0
                 && w.height > 0
-                && (active_ws_ids.is_empty() || active_ws_ids.contains(&w.id))
+                && active_ws_info.as_ref().is_none_or(|(ws_id, ws_win_ids)| {
+                    w.workspace_id == *ws_id || ws_win_ids.contains(&w.id)
+                })
         })
         .collect()
 }
@@ -982,7 +1101,14 @@ fn rounded_rect_path(cr: &gtk4::cairo::Context, x: f64, y: f64, w: f64, h: f64, 
     cr.close_path();
 }
 
-fn draw_pill_badge(cr: &gtk4::cairo::Context, x: f64, y: f64, text: &str, is_record: bool) {
+fn draw_pill_badge(
+    cr: &gtk4::cairo::Context,
+    x: f64,
+    y: f64,
+    text: &str,
+    is_record: bool,
+    is_light: bool,
+) {
     cr.set_font_size(12.5);
     let text_w = cr
         .text_extents(text)
@@ -994,16 +1120,20 @@ fn draw_pill_badge(cr: &gtk4::cairo::Context, x: f64, y: f64, text: &str, is_rec
 
     rounded_rect_path(cr, x, y, pw, ph, 13.0);
     if is_record {
-        cr.set_source_rgba(0.14, 0.06, 0.08, 0.92);
+        cr.set_source_rgba(0.18, 0.06, 0.09, 0.84);
+    } else if is_light {
+        cr.set_source_rgba(0.96, 0.97, 1.0, 0.84);
     } else {
-        cr.set_source_rgba(0.08, 0.10, 0.15, 0.88);
+        cr.set_source_rgba(0.09, 0.13, 0.20, 0.76);
     }
     let _ = cr.fill_preserve();
 
     if is_record {
-        cr.set_source_rgba(0.95, 0.32, 0.32, 0.78);
+        cr.set_source_rgba(0.98, 0.36, 0.36, 0.72);
+    } else if is_light {
+        cr.set_source_rgba(1.0, 1.0, 1.0, 0.88);
     } else {
-        cr.set_source_rgba(1.0, 1.0, 1.0, 0.24);
+        cr.set_source_rgba(1.0, 1.0, 1.0, 0.28);
     }
     cr.set_line_width(1.0);
     let _ = cr.stroke();
@@ -1014,7 +1144,11 @@ fn draw_pill_badge(cr: &gtk4::cairo::Context, x: f64, y: f64, text: &str, is_rec
         let _ = cr.fill();
     }
 
-    cr.set_source_rgba(1.0, 1.0, 1.0, 0.96);
+    if is_light && !is_record {
+        cr.set_source_rgba(0.04, 0.07, 0.13, 0.94);
+    } else {
+        cr.set_source_rgba(1.0, 1.0, 1.0, 0.96);
+    }
     cr.move_to(x + 12.0 + dot_pad, y + 17.5);
     let _ = cr.show_text(text);
 }
@@ -1030,6 +1164,7 @@ fn draw_cutout_mask(
     rh: f64,
     show_handles: bool,
     is_record: bool,
+    is_light: bool,
     badge_text: &str,
 ) {
     // Dim everything OUTSIDE the selection rectangle
@@ -1040,7 +1175,7 @@ fn draw_cutout_mask(
     cr.rectangle(rx + rw, ry, (wf - (rx + rw)).max(0.0), rh);
     let _ = cr.fill();
 
-    // Crisp GNOME 47 border (white for screenshot, warm red for screen record)
+    // Crisp Liquid Glass border (white for screenshot, warm red for screen record)
     if is_record {
         cr.set_source_rgba(0.97, 0.34, 0.34, 0.96);
     } else {
@@ -1078,5 +1213,5 @@ fn draw_cutout_mask(
 
     let bx = (rx + 10.0).clamp(10.0, (wf - 180.0).max(10.0));
     let by = if ry > 38.0 { ry - 34.0 } else { ry + 12.0 };
-    draw_pill_badge(cr, bx, by, badge_text, is_record);
+    draw_pill_badge(cr, bx, by, badge_text, is_record, is_light);
 }

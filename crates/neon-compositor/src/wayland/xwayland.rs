@@ -359,6 +359,13 @@ impl XwmHandler for NeonState {
         let is_splash = matches!(win_type, Some(WmWindowType::Splash));
         let is_dialog = matches!(win_type, Some(WmWindowType::Dialog)) || parent_id.is_some();
         let is_client_pos = is_client_positioned_type(&surface);
+        let is_fixed_x11 = match (surface.min_size(), surface.max_size()) {
+            (Some(min_s), Some(max_s)) => min_s.w > 0 && min_s.h > 0 && min_s == max_s,
+            _ => false,
+        };
+        if is_splash || is_dialog || is_client_pos || is_fixed_x11 {
+            self.wm.set_float_override(id, true);
+        }
 
         // Honor initial _NET_WM_STATE_FULLSCREEN as well as borderless full-output Qt/X11 windows
         // (such as DaVinci Resolve's main workspace window).
@@ -461,9 +468,17 @@ impl XwmHandler for NeonState {
             .unwrap_or(false)
         {
             self.space.map_element(window.clone(), geo.loc, true);
+            if self.wm.is_auto_tiling()
+                && !is_splash
+                && !is_dialog
+                && !is_client_pos
+                && !wants_fullscreen
+                && let Some(ws_id) = self.wm.get(id).map(|r| r.workspace_id)
+            {
+                self.relayout_auto_tiling_for_workspace(ws_id);
+            }
             if !skip_open_anim {
-                let now = self.now_duration();
-                self.effects.animate_window_open(id, now);
+                self.animate_window_open_android(id, &window);
             }
             if !self.is_locked() && !skip_focus {
                 self.focus_window(Some(&window), SERIAL_COUNTER.next_serial());
@@ -531,9 +546,16 @@ impl XwmHandler for NeonState {
             if self.hovered_titlebar_window == Some(id) {
                 self.hovered_titlebar_window = None;
             }
+            let closed_ws = self.wm.get(id).map(|r| r.workspace_id);
             self.wm.remove_window(id);
             self.effects.remove_window(id);
             self.scene.remove_window(id);
+            if self.drag_snap.dragged_window == Some(id) {
+                self.drag_snap.clear();
+            }
+            if let Some(ws_id) = closed_ws {
+                self.relayout_auto_tiling_for_workspace(ws_id);
+            }
             if !surface.is_override_redirect() {
                 let _ = surface.set_mapped(false);
             }
@@ -587,6 +609,19 @@ impl XwmHandler for NeonState {
                 WindowMode::Maximized => {
                     let eff_wa = self.effective_work_area_for(*id);
                     Rectangle::new(from_wm_point(eff_wa.loc), from_wm_size(eff_wa.size))
+                }
+                WindowMode::Tiled | WindowMode::Snapped(_) => {
+                    let mut tile_rect = self
+                        .wm
+                        .get(*id)
+                        .map(|r| r.current_geometry)
+                        .unwrap_or_else(|| self.work_area());
+                    if matches!(mode, WindowMode::Tiled) && self.ssd_windows.contains(id) {
+                        tile_rect.loc.y += neon_scene::MACOS_TITLEBAR_HEIGHT;
+                        tile_rect.size.h =
+                            (tile_rect.size.h - neon_scene::MACOS_TITLEBAR_HEIGHT).max(100);
+                    }
+                    Rectangle::new(from_wm_point(tile_rect.loc), from_wm_size(tile_rect.size))
                 }
                 _ => {
                     let mut geo = window.geometry();
@@ -773,70 +808,28 @@ impl XwmHandler for NeonState {
     fn maximize_request(&mut self, _xwm: XwmId, surface: X11Surface) {
         let xid = surface.window_id();
         if let Some((id, _)) = self.find_managed_x11(xid) {
-            let eff_wa = self.effective_work_area_for(id);
-            if let Some(update) = self.wm.set_maximized(id, true, eff_wa) {
-                self.begin_geometry_transition(id, update.configure_size);
-                let _ = surface.set_maximized(true);
-                if let (Some(loc), Some(sz)) = (update.target_location, update.configure_size) {
-                    let _ = surface.configure(Rectangle::new(from_wm_point(loc), from_wm_size(sz)));
-                }
-                self.apply_layout_update(&update);
-                self.needs_redraw = true;
-            }
+            self.set_window_maximized(id, true);
         }
     }
 
     fn unmaximize_request(&mut self, _xwm: XwmId, surface: X11Surface) {
         let xid = surface.window_id();
         if let Some((id, _)) = self.find_managed_x11(xid) {
-            let eff_wa = self.effective_work_area_for(id);
-            if let Some(update) = self.wm.set_maximized(id, false, eff_wa) {
-                self.begin_geometry_transition(id, update.configure_size);
-                let _ = surface.set_maximized(false);
-                if let (Some(loc), Some(sz)) = (update.target_location, update.configure_size) {
-                    let _ = surface.configure(Rectangle::new(from_wm_point(loc), from_wm_size(sz)));
-                }
-                self.apply_layout_update(&update);
-                self.needs_redraw = true;
-            }
+            self.set_window_maximized(id, false);
         }
     }
 
     fn fullscreen_request(&mut self, _xwm: XwmId, surface: X11Surface) {
         let xid = surface.window_id();
         if let Some((id, _)) = self.find_managed_x11(xid) {
-            self.ssd_windows.remove(&id);
-            let full = self.output_full_rect();
-            if let Some(update) = self.wm.set_fullscreen(id, true, full) {
-                self.begin_geometry_transition(id, update.configure_size);
-                let _ = surface.set_fullscreen(true);
-                if let (Some(loc), Some(sz)) = (update.target_location, update.configure_size) {
-                    let _ = surface.configure(Rectangle::new(from_wm_point(loc), from_wm_size(sz)));
-                }
-                self.apply_layout_update(&update);
-                self.needs_redraw = true;
-            }
+            self.set_window_fullscreen(id, true);
         }
     }
 
     fn unfullscreen_request(&mut self, _xwm: XwmId, surface: X11Surface) {
         let xid = surface.window_id();
         if let Some((id, _)) = self.find_managed_x11(xid) {
-            if x11_wants_ssd_non_fullscreen(&surface) {
-                self.ssd_windows.insert(id);
-            } else {
-                self.ssd_windows.remove(&id);
-            }
-            let eff_wa = self.effective_work_area_for(id);
-            if let Some(update) = self.wm.set_fullscreen(id, false, eff_wa) {
-                self.begin_geometry_transition(id, update.configure_size);
-                let _ = surface.set_fullscreen(false);
-                if let (Some(loc), Some(sz)) = (update.target_location, update.configure_size) {
-                    let _ = surface.configure(Rectangle::new(from_wm_point(loc), from_wm_size(sz)));
-                }
-                self.apply_layout_update(&update);
-                self.needs_redraw = true;
-            }
+            self.set_window_fullscreen(id, false);
         }
     }
 

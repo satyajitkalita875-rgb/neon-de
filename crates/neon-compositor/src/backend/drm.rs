@@ -306,7 +306,7 @@ pub fn run_drm(config: DrmConfig) -> Result<()> {
             conn_name.clone(),
             PhysicalProperties {
                 size: (phys_w as i32, phys_h as i32).into(),
-                subpixel: Subpixel::Unknown,
+                subpixel: Subpixel::HorizontalRgb,
                 make: "NEON DE".into(),
                 model: conn_name.clone(),
             },
@@ -617,6 +617,8 @@ fn render_all_drm_outputs(rt: &mut DrmRuntime, state: &mut NeonState) {
             && state.effects.config.blur_strength > 0.01,
         strength: state.effects.config.blur_strength,
         corner_radius: state.effects.config.corner_radius,
+        animations_enabled: state.effects.config.enabled && !state.effects.config.reduced_motion,
+        speed_scale: state.effects.config.speed_scale as f32,
     };
     let cursor_theme = state.config.appearance.cursor_theme.clone();
     let cursor_size = state.config.appearance.cursor_size;
@@ -624,6 +626,11 @@ fn render_all_drm_outputs(rt: &mut DrmRuntime, state: &mut NeonState) {
     let now = state.clock.now();
 
     let crtcs: Vec<crtc::Handle> = rt.outputs.keys().copied().collect();
+    for active in rt.outputs.values_mut() {
+        active
+            .neon_renderer
+            .set_motion_config(blur.animations_enabled, blur.speed_scale);
+    }
     if !state.pending_overlay_anims.is_empty() {
         let anims = std::mem::take(&mut state.pending_overlay_anims);
         for active in rt.outputs.values_mut() {
@@ -819,6 +826,13 @@ fn render_all_drm_outputs(rt: &mut DrmRuntime, state: &mut NeonState) {
             scale_f,
             &state.cursor_status,
         );
+        elements.extend(active.neon_renderer.dnd_icon_elements(
+            &mut rt.renderer,
+            pointer_loc,
+            output_origin,
+            scale_f,
+            state.dnd_icon.as_ref(),
+        ));
         let clear_color = if is_locked {
             let lock_surface = state.lock_state.surface_for_output(&active.output.name());
             elements.extend(active.neon_renderer.collect_locked_elements(

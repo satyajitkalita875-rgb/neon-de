@@ -1,6 +1,7 @@
 //! XDG Desktop Entry (`.desktop`) discovery, parsing, search, and safe application launching.
 
 use std::{
+    cell::RefCell,
     collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
@@ -8,7 +9,12 @@ use std::{
     sync::{Mutex, OnceLock},
 };
 
-use gtk4::{IconTheme, Image, gdk::Display};
+use gtk4::{
+    IconLookupFlags, IconTheme, Image, TextDirection, cairo,
+    gdk::{self, Display},
+    gdk_pixbuf, glib,
+    prelude::*,
+};
 use tracing::{info, warn};
 
 static LIVE_XWAYLAND_DISPLAY: OnceLock<Mutex<Option<String>>> = OnceLock::new();
@@ -683,11 +689,367 @@ fn normalize_slug(s: &str) -> String {
         .join("-")
 }
 
-/// Loads an application icon cleanly for Dock or Launchpad with zero missing-icon symbols:
+#[derive(Clone)]
+enum CachedNormalizedIcon {
+    UseThemeNative,
+    Texture(gdk::Texture),
+}
+
+thread_local! {
+    static NORMALIZED_ICON_CACHE: RefCell<HashMap<(PathBuf, i32), CachedNormalizedIcon>> =
+        RefCell::new(HashMap::new());
+}
+
+/// Clears the thread-local normalized icon texture cache (called when icons or apps refresh).
+pub fn clear_icon_cache() {
+    NORMALIZED_ICON_CACHE.with(|c| c.borrow_mut().clear());
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct OpticalTransform {
+    scale: f64,
+    core_cx: f64,
+    core_cy: f64,
+    vis_x0: f64,
+    vis_y0: f64,
+    vis_x1: f64,
+    vis_y1: f64,
+    needs_resample: bool,
+}
+
+/// Computes optical scale and centering from RGBA pixel alpha data so full-bleed (`100%`),
+/// standard macOS/WhiteSur (`88%`), undersized (`75–81%`), off-center, and non-square icons
+/// all render at the exact same perceived size and alignment.
+#[allow(clippy::too_many_arguments)]
+fn compute_optical_icon_transform(
+    src_w: i32,
+    src_h: i32,
+    pixels: &[u8],
+    rowstride: usize,
+    n_channels: usize,
+    has_alpha: bool,
+    is_theme_icon: bool,
+) -> Option<OpticalTransform> {
+    if src_w <= 0 || src_h <= 0 || n_channels < 3 {
+        return None;
+    }
+    let w = src_w as usize;
+    let h = src_h as usize;
+
+    let mut vis_x0 = w;
+    let mut vis_y0 = h;
+    let mut vis_x1 = 0usize;
+    let mut vis_y1 = 0usize;
+
+    let mut core_x0 = w;
+    let mut core_y0 = h;
+    let mut core_x1 = 0usize;
+    let mut core_y1 = 0usize;
+    let mut opaque_count = 0usize;
+
+    let mut soft_x0 = w;
+    let mut soft_y0 = h;
+    let mut soft_x1 = 0usize;
+    let mut soft_y1 = 0usize;
+    let mut soft_count = 0usize;
+
+    for y in 0..h {
+        let row_off = y * rowstride;
+        if row_off + w * n_channels > pixels.len() {
+            break;
+        }
+        for x in 0..w {
+            let a = if has_alpha && n_channels >= 4 {
+                pixels[row_off + x * n_channels + 3]
+            } else {
+                255
+            };
+            if a >= 16 {
+                vis_x0 = vis_x0.min(x);
+                vis_y0 = vis_y0.min(y);
+                vis_x1 = vis_x1.max(x);
+                vis_y1 = vis_y1.max(y);
+            }
+            if a >= 32 {
+                soft_x0 = soft_x0.min(x);
+                soft_y0 = soft_y0.min(y);
+                soft_x1 = soft_x1.max(x);
+                soft_y1 = soft_y1.max(y);
+                soft_count += 1;
+            }
+            if a >= 180 {
+                core_x0 = core_x0.min(x);
+                core_y0 = core_y0.min(y);
+                core_x1 = core_x1.max(x);
+                core_y1 = core_y1.max(y);
+                opaque_count += 1;
+            }
+        }
+    }
+
+    if vis_x0 > vis_x1 || vis_y0 > vis_y1 {
+        return None;
+    }
+
+    // Fall back to semi-transparent core bounds if the icon is mostly translucent glass/thin strokes.
+    let (cx0, cy0, cx1, cy1, count) = if opaque_count >= 16 && core_x0 <= core_x1 {
+        (core_x0, core_y0, core_x1, core_y1, opaque_count)
+    } else if soft_count > 0 && soft_x0 <= soft_x1 {
+        (soft_x0, soft_y0, soft_x1, soft_y1, soft_count)
+    } else {
+        (vis_x0, vis_y0, vis_x1, vis_y1, 1)
+    };
+
+    let src_dim = f64::from(src_w.max(src_h));
+    let cw = (cx1 - cx0 + 1) as f64;
+    let ch = (cy1 - cy0 + 1) as f64;
+    let vw = (vis_x1 - vis_x0 + 1) as f64;
+    let vh = (vis_y1 - vis_y0 + 1) as f64;
+
+    let core_frac = cw.max(ch) / src_dim;
+    let vis_frac = vw.max(vh) / src_dim;
+    let fill_density = (count as f64) / (cw * ch).max(1.0);
+    let eff_frac = (count as f64).sqrt() / src_dim;
+
+    // WhiteSur macOS squircles have an optical weight sqrt(area) = 0.854 and core span 0.88.
+    // Solid icons normalize directly to 0.854 (shrinking 100% full-bleed PNGs to 0.88 and
+    // growing 80% padded icons to 0.88 while keeping matched theme icons at 1.00).
+    // Sparse/outline/circular icons normalize core bounding box to 0.88 without clipping.
+    let desired_scale = if fill_density >= 0.72 && eff_frac > 0.15 {
+        0.854 / eff_frac
+    } else {
+        0.88 / core_frac.max(0.15)
+    };
+    let max_safe_scale = 0.96 / vis_frac.max(0.15);
+    let scale = desired_scale.min(max_safe_scale).clamp(0.55, 1.45);
+
+    let core_cx = ((cx0 + cx1 + 1) as f64) * 0.5;
+    let core_cy = ((cy0 + cy1 + 1) as f64) * 0.5;
+    let dx_frac = (core_cx / f64::from(src_w) - 0.5).abs();
+    let dy_frac = (core_cy / f64::from(src_h) - 0.5).abs();
+
+    let needs_resample = !is_theme_icon
+        || src_w != src_h
+        || (scale - 1.0).abs() >= 0.028
+        || dx_frac >= 0.03
+        || dy_frac >= 0.03;
+
+    Some(OpticalTransform {
+        scale,
+        core_cx,
+        core_cy,
+        vis_x0: vis_x0 as f64,
+        vis_y0: vis_y0 as f64,
+        vis_x1: (vis_x1 + 1) as f64,
+        vis_y1: (vis_y1 + 1) as f64,
+        needs_resample,
+    })
+}
+
+fn render_normalized_icon_texture(
+    path: &Path,
+    pixel_size: i32,
+    is_theme_icon: bool,
+) -> Option<CachedNormalizedIcon> {
+    // Fast 64px optical probe first (7x faster for theme SVGs that fast-path to UseThemeNative).
+    let probe_pb = gdk_pixbuf::Pixbuf::from_file_at_scale(path, 64, 64, true).ok()?;
+    let probe_tf = {
+        let bytes = probe_pb.read_pixel_bytes();
+        compute_optical_icon_transform(
+            probe_pb.width(),
+            probe_pb.height(),
+            bytes.as_ref(),
+            probe_pb.rowstride() as usize,
+            probe_pb.n_channels() as usize,
+            probe_pb.has_alpha(),
+            is_theme_icon,
+        )?
+    };
+
+    if !probe_tf.needs_resample {
+        return Some(CachedNormalizedIcon::UseThemeNative);
+    }
+
+    // Resample out-of-spec icons at crisp 3x supersampled resolution so dock wave
+    // magnification (up to 1.36x) stays razor-sharp on 1x and HiDPI displays.
+    let sample_px = (pixel_size * 3).clamp(96, 256);
+    let pb = if sample_px <= 64 {
+        probe_pb
+    } else {
+        gdk_pixbuf::Pixbuf::from_file_at_scale(path, sample_px, sample_px, true).ok()?
+    };
+    let src_w = pb.width();
+    let src_h = pb.height();
+    let n_ch = pb.n_channels() as usize;
+    let has_alpha = pb.has_alpha();
+    let rowstride = pb.rowstride() as usize;
+    let bytes = pb.read_pixel_bytes();
+    let pixels = bytes.as_ref();
+
+    let tf = if sample_px <= 64 {
+        probe_tf
+    } else {
+        compute_optical_icon_transform(
+            src_w,
+            src_h,
+            pixels,
+            rowstride,
+            n_ch,
+            has_alpha,
+            is_theme_icon,
+        )?
+    };
+
+    // Build premultiplied ARgb32 Cairo surface from pixbuf pixels (100% safe, zero-endianness ambiguity).
+    let mut src_surf = cairo::ImageSurface::create(cairo::Format::ARgb32, src_w, src_h).ok()?;
+    {
+        let dst_stride = src_surf.stride() as usize;
+        let mut dst_data = src_surf.data().ok()?;
+        let w = src_w as usize;
+        let h = src_h as usize;
+        for y in 0..h {
+            let s_row = y * rowstride;
+            let d_row = y * dst_stride;
+            if s_row + w * n_ch > pixels.len() || d_row + w * 4 > dst_data.len() {
+                break;
+            }
+            for x in 0..w {
+                let s_off = s_row + x * n_ch;
+                let r = u32::from(pixels[s_off]);
+                let g = u32::from(pixels[s_off + 1]);
+                let b = u32::from(pixels[s_off + 2]);
+                let a = if has_alpha && n_ch >= 4 {
+                    u32::from(pixels[s_off + 3])
+                } else {
+                    255
+                };
+                let r_pm = (r * a + 127) / 255;
+                let g_pm = (g * a + 127) / 255;
+                let b_pm = (b * a + 127) / 255;
+                let argb = (a << 24) | (r_pm << 16) | (g_pm << 8) | b_pm;
+                let d_off = d_row + x * 4;
+                dst_data[d_off..d_off + 4].copy_from_slice(&argb.to_ne_bytes());
+            }
+        }
+    }
+    src_surf.mark_dirty();
+
+    // Supersampled 3x output canvas so Gtk.Image(pixel_size) stays sharp even during dock magnification.
+    let out_px = (pixel_size * 3).clamp(64, 256);
+    let out_f = f64::from(out_px);
+    let src_dim = f64::from(src_w.max(src_h));
+    let draw_scale = tf.scale * out_f / src_dim;
+
+    let mut ox = out_f * 0.5 - tf.core_cx * draw_scale;
+    let mut oy = out_f * 0.5 - tf.core_cy * draw_scale;
+
+    // Keep visible ink (including drop shadows / protrusions) comfortably inside the output canvas.
+    let pad = (out_f * 0.02).max(1.0);
+    if ox + tf.vis_x0 * draw_scale < pad {
+        ox = pad - tf.vis_x0 * draw_scale;
+    } else if ox + tf.vis_x1 * draw_scale > out_f - pad {
+        ox = (out_f - pad) - tf.vis_x1 * draw_scale;
+    }
+    if oy + tf.vis_y0 * draw_scale < pad {
+        oy = pad - tf.vis_y0 * draw_scale;
+    } else if oy + tf.vis_y1 * draw_scale > out_f - pad {
+        oy = (out_f - pad) - tf.vis_y1 * draw_scale;
+    }
+
+    let mut dst_surf = cairo::ImageSurface::create(cairo::Format::ARgb32, out_px, out_px).ok()?;
+    {
+        let cr = cairo::Context::new(&dst_surf).ok()?;
+        cr.translate(ox, oy);
+        cr.scale(draw_scale, draw_scale);
+        let _ = cr.set_source_surface(&src_surf, 0.0, 0.0);
+        cr.source().set_filter(cairo::Filter::Best);
+        let _ = cr.paint();
+    }
+    dst_surf.flush();
+
+    let stride = dst_surf.stride() as usize;
+    let data = dst_surf.data().ok()?;
+    let gbytes = glib::Bytes::from(&*data);
+    #[cfg(target_endian = "little")]
+    let mem_fmt = gdk::MemoryFormat::B8g8r8a8Premultiplied;
+    #[cfg(target_endian = "big")]
+    let mem_fmt = gdk::MemoryFormat::A8r8g8b8Premultiplied;
+    let texture = gdk::MemoryTexture::new(out_px, out_px, mem_fmt, &gbytes, stride);
+    Some(CachedNormalizedIcon::Texture(texture.upcast()))
+}
+
+fn load_normalized_image_from_path(
+    path: &Path,
+    pixel_size: i32,
+    theme_fallback_name: Option<&str>,
+) -> Image {
+    let key = (path.to_path_buf(), pixel_size);
+    let cached = NORMALIZED_ICON_CACHE.with(|cache| cache.borrow().get(&key).cloned());
+    let outcome = match cached {
+        Some(hit) => Some(hit),
+        None => {
+            let computed =
+                render_normalized_icon_texture(path, pixel_size, theme_fallback_name.is_some());
+            if let Some(ref val) = computed {
+                NORMALIZED_ICON_CACHE.with(|cache| {
+                    let mut map = cache.borrow_mut();
+                    if map.len() >= 512 {
+                        map.clear();
+                    }
+                    map.insert(key, val.clone());
+                });
+            }
+            computed
+        }
+    };
+
+    let img = match outcome {
+        Some(CachedNormalizedIcon::Texture(tex)) => Image::from_paintable(Some(&tex)),
+        Some(CachedNormalizedIcon::UseThemeNative) => match theme_fallback_name {
+            Some(name) => Image::from_icon_name(name),
+            None => Image::from_file(path),
+        },
+        None => match theme_fallback_name {
+            Some(name) => Image::from_icon_name(name),
+            None => Image::from_file(path),
+        },
+    };
+    img.set_pixel_size(pixel_size);
+    img
+}
+
+fn load_theme_icon_normalized(theme: &IconTheme, name: &str, pixel_size: i32) -> Image {
+    // Preserve native GTK4 CSS recoloring for `-symbolic` monochrome icons.
+    if name.ends_with("-symbolic") {
+        let img = Image::from_icon_name(name);
+        img.set_pixel_size(pixel_size);
+        return img;
+    }
+    let paintable = theme.lookup_icon(
+        name,
+        &[],
+        pixel_size.max(64),
+        1,
+        TextDirection::Ltr,
+        IconLookupFlags::empty(),
+    );
+    if let Some(path) = paintable.file().and_then(|f| f.path())
+        && path.is_file()
+    {
+        return load_normalized_image_from_path(&path, pixel_size, Some(name));
+    }
+    let img = Image::from_icon_name(name);
+    img.set_pixel_size(pixel_size);
+    img
+}
+
+/// Loads an application icon cleanly for Dock or Launchpad with uniform optical sizing and
+/// zero missing-icon symbols:
 /// 1. Supports direct filesystem paths (`/snap/...`, `/opt/...`, `/usr/share/pixmaps/...`)
 /// 2. Checks the active GTK4 IconTheme (`WhiteSur-dark` / `WhiteSur-light`) + Flatpak/local roots
 /// 3. Falls back to direct hicolor/pixmap disk lookup (catches newly installed apps immediately!)
-/// 4. Falls back cleanly to `application-x-executable`.
+/// 4. Optically normalizes full-bleed / loosely padded / off-center icons to a uniform macOS squircle weight
+/// 5. Falls back cleanly to `application-x-executable`.
 pub fn load_app_icon(icon_spec: Option<&str>, app_hint: &str, pixel_size: i32) -> Image {
     let icon_theme = Display::default().map(|d| IconTheme::for_display(&d));
 
@@ -695,17 +1057,13 @@ pub fn load_app_icon(icon_spec: Option<&str>, app_hint: &str, pixel_size: i32) -
         // 1. Absolute filesystem path (e.g. Chrome PWA / DaVinci Resolve / AppImage / pixmaps)
         let as_path = Path::new(raw);
         if as_path.is_absolute() && as_path.exists() {
-            let img = Image::from_file(as_path);
-            img.set_pixel_size(pixel_size);
-            return img;
+            return load_normalized_image_from_path(as_path, pixel_size, None);
         }
 
         // 2. Direct lookup in active icon theme
         if let Some(ref theme) = icon_theme {
             if theme.has_icon(raw) {
-                let img = Image::from_icon_name(raw);
-                img.set_pixel_size(pixel_size);
-                return img;
+                return load_theme_icon_normalized(theme, raw, pixel_size);
             }
 
             // Try stripped image extension & reverse-DNS / snap stem variants
@@ -719,18 +1077,14 @@ pub fn load_app_icon(icon_spec: Option<&str>, app_hint: &str, pixel_size: i32) -
             }
             for cand in candidates {
                 if !cand.is_empty() && theme.has_icon(&cand) {
-                    let img = Image::from_icon_name(&cand);
-                    img.set_pixel_size(pixel_size);
-                    return img;
+                    return load_theme_icon_normalized(theme, &cand, pixel_size);
                 }
             }
         }
 
         // 3. Direct disk scan in hicolor / Flatpak / local icons / pixmaps (catches newly installed apps!)
         if let Some(disk_path) = find_icon_file_on_disk(raw) {
-            let img = Image::from_file(disk_path);
-            img.set_pixel_size(pixel_size);
-            return img;
+            return load_normalized_image_from_path(&disk_path, pixel_size, None);
         }
     }
 
@@ -764,22 +1118,23 @@ pub fn load_app_icon(icon_spec: Option<&str>, app_hint: &str, pixel_size: i32) -
         if let Some(ref theme) = icon_theme {
             for cand in &name_candidates {
                 if !cand.is_empty() && theme.has_icon(cand) {
-                    let img = Image::from_icon_name(cand);
-                    img.set_pixel_size(pixel_size);
-                    return img;
+                    return load_theme_icon_normalized(theme, cand, pixel_size);
                 }
             }
         }
         for cand in &name_candidates {
             if let Some(disk_path) = find_icon_file_on_disk(cand) {
-                let img = Image::from_file(disk_path);
-                img.set_pixel_size(pixel_size);
-                return img;
+                return load_normalized_image_from_path(&disk_path, pixel_size, None);
             }
         }
     }
 
     // 5. Guaranteed valid fallback icon (never shows broken missing-icon glyph)
+    if let Some(ref theme) = icon_theme
+        && theme.has_icon("application-x-executable")
+    {
+        return load_theme_icon_normalized(theme, "application-x-executable", pixel_size);
+    }
     let fallback = Image::from_icon_name("application-x-executable");
     fallback.set_pixel_size(pixel_size);
     fallback
@@ -1318,5 +1673,52 @@ Categories=System;TerminalEmulator;
         let matches = find_apps_for_file(Path::new("/tmp/photo.png"), &apps_slice);
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].id, "google-chrome");
+    }
+
+    #[test]
+    fn optical_icon_normalization_unifies_full_bleed_and_undersized_icons() {
+        let make_box = |dim: usize, x0: usize, x1: usize, y0: usize, y1: usize| -> Vec<u8> {
+            let mut px = vec![0u8; dim * dim * 4];
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    let off = (y * dim + x) * 4;
+                    px[off] = 200;
+                    px[off + 1] = 200;
+                    px[off + 2] = 200;
+                    px[off + 3] = 255;
+                }
+            }
+            px
+        };
+
+        // Full-bleed 100% square icon (e.g. brave-origin.png) scales down to ~0.854 optical weight.
+        let full = make_box(100, 0, 100, 0, 100);
+        let tf_full =
+            compute_optical_icon_transform(100, 100, &full, 400, 4, true, true).expect("full");
+        assert!(tf_full.needs_resample);
+        assert!(
+            (tf_full.scale - 0.854).abs() < 0.01,
+            "expected ~0.854 scale for full-bleed square, got {}",
+            tf_full.scale
+        );
+
+        // Undersized 78% icon (e.g. DV_Resolve.png) scales up to match ~0.854 optical weight.
+        let small = make_box(100, 11, 89, 11, 89);
+        let tf_small =
+            compute_optical_icon_transform(100, 100, &small, 400, 4, true, false).expect("small");
+        assert!(tf_small.needs_resample);
+        assert!(
+            (tf_small.scale - (0.854 / 0.78)).abs() < 0.02,
+            "expected scale-up for undersized icon, got {}",
+            tf_small.scale
+        );
+
+        // Matched WhiteSur 86% centered icon fast-paths cleanly to native theme rendering.
+        let matched = make_box(100, 7, 93, 7, 93);
+        let tf_matched =
+            compute_optical_icon_transform(100, 100, &matched, 400, 4, true, true)
+                .expect("matched");
+        assert!(!tf_matched.needs_resample);
+        assert!((tf_matched.scale - 1.0).abs() < 0.025);
     }
 }

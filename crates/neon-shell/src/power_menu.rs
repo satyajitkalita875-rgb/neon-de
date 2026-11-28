@@ -15,7 +15,7 @@ use gtk4::{
     Image, Label, Orientation, gdk, glib, prelude::*,
 };
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
-use neon_ipc::IpcRequest;
+use neon_ipc::{EffectsInfo, IpcRequest};
 use neon_system::{SystemAction, SystemActionSender};
 
 use crate::ipc_bridge::IpcCommandSender;
@@ -49,6 +49,8 @@ impl ConfirmAction {
     }
 }
 
+type VoidCallback = Rc<RefCell<Option<Box<dyn Fn()>>>>;
+
 /// Simple fullscreen centered Power Menu overlay.
 #[derive(Clone)]
 pub struct PowerMenuOverlay {
@@ -60,6 +62,9 @@ pub struct PowerMenuOverlay {
     pending_action: Rc<RefCell<Option<ConfirmAction>>>,
     is_open: Rc<Cell<bool>>,
     anim_gen: Rc<Cell<u64>>,
+    motion_enabled: Rc<Cell<bool>>,
+    speed_scale: Rc<Cell<f64>>,
+    on_before_open: VoidCallback,
 }
 
 impl PowerMenuOverlay {
@@ -98,6 +103,7 @@ impl PowerMenuOverlay {
         // Simple centered boxless container right in the middle of the full blurred screen
         let card = GtkBox::new(Orientation::Vertical, 18);
         card.add_css_class("neon-power-menu-card");
+        card.add_css_class("pm-closed");
         card.set_halign(Align::Center);
         card.set_valign(Align::Center);
         card.set_hexpand(true);
@@ -109,10 +115,15 @@ impl PowerMenuOverlay {
         btn_row.set_valign(Align::Center);
 
         let lock_btn = build_pm_button("system-lock-screen-symbolic", "Lock", false);
+        lock_btn.add_css_class("pm-btn-0");
         let sleep_btn = build_pm_button("weather-clear-night-symbolic", "Sleep", false);
+        sleep_btn.add_css_class("pm-btn-1");
         let logout_btn = build_pm_button("system-log-out-symbolic", "Log Out", false);
+        logout_btn.add_css_class("pm-btn-2");
         let restart_btn = build_pm_button("system-reboot-symbolic", "Restart", false);
+        restart_btn.add_css_class("pm-btn-3");
         let shutdown_btn = build_pm_button("system-shutdown-symbolic", "Shut Down", true);
+        shutdown_btn.add_css_class("pm-btn-4");
 
         btn_row.append(&lock_btn);
         btn_row.append(&sleep_btn);
@@ -162,6 +173,9 @@ impl PowerMenuOverlay {
             pending_action,
             is_open,
             anim_gen,
+            motion_enabled: Rc::new(Cell::new(true)),
+            speed_scale: Rc::new(Cell::new(1.0)),
+            on_before_open: Rc::new(RefCell::new(None)),
         };
 
         // Direct actions: Lock & Sleep
@@ -203,7 +217,12 @@ impl PowerMenuOverlay {
                     ok.remove_css_class("danger");
                 }
                 hint.set_visible(false);
+                cbox.add_css_class("pm-confirm-enter");
                 cbox.set_visible(true);
+                cbox.add_tick_callback(|w, _| {
+                    w.remove_css_class("pm-confirm-enter");
+                    glib::ControlFlow::Break
+                });
             });
         }
 
@@ -280,7 +299,20 @@ impl PowerMenuOverlay {
         menu
     }
 
+    pub fn set_on_before_open<F: Fn() + 'static>(&self, cb: F) {
+        *self.on_before_open.borrow_mut() = Some(Box::new(cb));
+    }
+
+    pub fn update_effects(&self, effects: &EffectsInfo) {
+        self.motion_enabled
+            .set(effects.enabled && !effects.reduced_motion);
+        self.speed_scale.set(effects.speed_scale.clamp(0.5, 2.5));
+    }
+
     pub fn open(&self) {
+        if let Some(cb) = self.on_before_open.borrow().as_ref() {
+            cb();
+        }
         let epoch = self.anim_gen.get().wrapping_add(1);
         self.anim_gen.set(epoch);
         self.is_open.set(true);
@@ -292,16 +324,48 @@ impl PowerMenuOverlay {
             self.window.set_keyboard_mode(KeyboardMode::Exclusive);
         }
 
+        self.card.remove_css_class("pm-open");
+        self.card.remove_css_class("pm-closing");
+        self.card.add_css_class("pm-closed");
+
         self.ipc.send(IpcRequest::AnimateOverlay {
             namespace: "neon-power-menu".into(),
             opening: true,
         });
         self.window.set_visible(true);
         self.window.present();
+
+        let gen_c = Rc::clone(&self.anim_gen);
+        self.card.add_tick_callback(move |w, _| {
+            if gen_c.get() == epoch {
+                w.remove_css_class("pm-closed");
+                w.add_css_class("pm-open");
+            }
+            glib::ControlFlow::Break
+        });
+    }
+
+    pub fn close_immediate(&self) {
+        let epoch = self.anim_gen.get().wrapping_add(1);
+        self.anim_gen.set(epoch);
+        self.is_open.set(false);
+        *self.pending_action.borrow_mut() = None;
+        self.confirm_box.set_visible(false);
+        if gtk4_layer_shell::is_supported() {
+            self.window.set_keyboard_mode(KeyboardMode::None);
+        }
+        self.card.remove_css_class("pm-open");
+        self.card.remove_css_class("pm-closing");
+        self.card.add_css_class("pm-closed");
+        self.window.set_visible(false);
     }
 
     pub fn close(&self) {
         if !self.is_open.get() && !self.window.is_visible() {
+            return;
+        }
+        if !self.motion_enabled.get() {
+            self.close_immediate();
             return;
         }
         let epoch = self.anim_gen.get().wrapping_add(1);
@@ -310,18 +374,27 @@ impl PowerMenuOverlay {
         *self.pending_action.borrow_mut() = None;
         self.confirm_box.set_visible(false);
 
+        self.card.remove_css_class("pm-open");
+        self.card.add_css_class("pm-closing");
+
         self.ipc.send(IpcRequest::AnimateOverlay {
             namespace: "neon-power-menu".into(),
             opening: false,
         });
 
+        let speed = self.speed_scale.get().clamp(0.5, 2.5);
+        let hide_ms = ((225.0 / speed).round() as u64).clamp(85, 480);
+
         let win = self.window.clone();
+        let card = self.card.clone();
         let gen_c = Rc::clone(&self.anim_gen);
-        glib::timeout_add_local_once(Duration::from_millis(150), move || {
+        glib::timeout_add_local_once(Duration::from_millis(hide_ms), move || {
             if gen_c.get() == epoch {
                 if gtk4_layer_shell::is_supported() {
                     win.set_keyboard_mode(KeyboardMode::None);
                 }
+                card.remove_css_class("pm-closing");
+                card.add_css_class("pm-closed");
                 win.set_visible(false);
             }
         });

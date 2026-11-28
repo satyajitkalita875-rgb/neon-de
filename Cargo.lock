@@ -1788,6 +1788,8 @@ dependencies = [
  "neon-config",
  "neon-ipc",
  "neon-system",
+ "serde",
+ "serde_json",
  "tempfile",
  "tracing",
  "tracing-subscriber",
@@ -1799,6 +1801,8 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "serde",
+ "serde_json",
+ "tempfile",
  "tracing",
  "zbus",
 ]

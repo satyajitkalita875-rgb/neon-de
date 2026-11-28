@@ -340,7 +340,7 @@ fn main() {
 
         let stack = Stack::new();
         stack.set_transition_type(StackTransitionType::Crossfade);
-        stack.set_transition_duration(90);
+        stack.set_transition_duration(210);
         stack.set_hexpand(true);
         stack.set_vexpand(true);
 
@@ -449,15 +449,24 @@ fn main() {
                     return;
                 };
                 let id = cat.id;
-                if let Some(old) = built_c.borrow_mut().remove(id) {
-                    stack_c.remove(&old);
-                }
-                let fresh = pages::build_page(id, Rc::clone(&ctrl_c));
-                stack_c.add_named(&fresh, Some(id));
-                built_c.borrow_mut().insert(id.to_string(), fresh);
-                if active_c.borrow().as_str() == id {
-                    stack_c.set_visible_child_name(id);
-                }
+                let ctrl_idle = Rc::clone(&ctrl_c);
+                let stack_idle = stack_c.clone();
+                let built_idle = Rc::clone(&built_c);
+                let active_idle = Rc::clone(&active_c);
+                glib::idle_add_local_once(move || {
+                    let prev_tr = stack_idle.transition_type();
+                    stack_idle.set_transition_type(StackTransitionType::None);
+                    if let Some(old) = built_idle.borrow_mut().remove(id) {
+                        stack_idle.remove(&old);
+                    }
+                    let fresh = pages::build_page(id, Rc::clone(&ctrl_idle));
+                    stack_idle.add_named(&fresh, Some(id));
+                    built_idle.borrow_mut().insert(id.to_string(), fresh);
+                    if active_idle.borrow().as_str() == id {
+                        stack_idle.set_visible_child_name(id);
+                    }
+                    stack_idle.set_transition_type(prev_tr);
+                });
             }));
         }
 

@@ -110,9 +110,9 @@ pub const SETTINGS_REGISTRY: &[SettingMetadata] = &[
         id: "dock.windows",
         category_id: "dock",
         category_title: "Desktop & Dock",
-        name: "Window Focus, Snap Gap & Titlebar Buttons",
-        description: "Configure focus follows mouse, snap gap, and left/right close, minimize, and maximize buttons.",
-        keywords: "window focus mouse snap gap titlebar traffic lights buttons close minimize maximize left right macos",
+        name: "Window Snapping, Hyprland Auto-Tiling & Focus",
+        description: "Configure Hyprland auto-tiling (Dwindle / Master-Stack), Windows 11 Snap Layouts bar, drag-to-edge snapping, snap gap, and titlebar buttons.",
+        keywords: "window snapping tiling hyprland auto-tiling dwindle master stack snap layouts bar drag focus mouse gap titlebar traffic lights buttons close minimize maximize",
     },
     // Displays
     SettingMetadata {

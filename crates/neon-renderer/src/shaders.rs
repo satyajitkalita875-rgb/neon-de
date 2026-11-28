@@ -240,7 +240,7 @@ void main() {
 
     // 1. Close button (red) + × glyph on hover
     float d_close = length(pos - c_close) - btn_r;
-    float m_close = 1.0 - smoothstep(-0.65, 0.65, d_close);
+    float m_close = 1.0 - smoothstep(-0.75, 0.75, d_close);
     if (m_close > 0.001) {
         vec3 bcol = col_close;
         float rim = smoothstep(-1.2, -0.2, d_close);
@@ -249,7 +249,7 @@ void main() {
             vec2 lp = pos - c_close;
             float g1 = sd_segment(lp, vec2(-2.6, -2.6), vec2(2.6, 2.6)) - 0.65;
             float g2 = sd_segment(lp, vec2(-2.6,  2.6), vec2(2.6, -2.6)) - 0.65;
-            float gm = 1.0 - smoothstep(-0.45, 0.45, min(g1, g2));
+            float gm = 1.0 - smoothstep(-0.65, 0.65, min(g1, g2));
             bcol = mix(bcol, vec3(0.30, 0.03, 0.03), gm * 0.85);
         }
         rgb = mix(rgb, bcol, m_close);
@@ -257,7 +257,7 @@ void main() {
 
     // 2. Minimize button (yellow) + − glyph on hover
     float d_min = length(pos - c_min) - btn_r;
-    float m_min = 1.0 - smoothstep(-0.65, 0.65, d_min);
+    float m_min = 1.0 - smoothstep(-0.75, 0.75, d_min);
     if (m_min > 0.001) {
         vec3 bcol = col_min;
         float rim = smoothstep(-1.2, -0.2, d_min);
@@ -265,7 +265,7 @@ void main() {
         if (u_hover_controls > 0.5) {
             vec2 lp = pos - c_min;
             float g = sd_segment(lp, vec2(-3.0, 0.0), vec2(3.0, 0.0)) - 0.68;
-            float gm = 1.0 - smoothstep(-0.45, 0.45, g);
+            float gm = 1.0 - smoothstep(-0.65, 0.65, g);
             bcol = mix(bcol, vec3(0.38, 0.22, 0.01), gm * 0.85);
         }
         rgb = mix(rgb, bcol, m_min);
@@ -273,7 +273,7 @@ void main() {
 
     // 3. Maximize button (green) + + glyph on hover
     float d_max = length(pos - c_max) - btn_r;
-    float m_max = 1.0 - smoothstep(-0.65, 0.65, d_max);
+    float m_max = 1.0 - smoothstep(-0.75, 0.75, d_max);
     if (m_max > 0.001) {
         vec3 bcol = col_max;
         float rim = smoothstep(-1.2, -0.2, d_max);
@@ -282,7 +282,7 @@ void main() {
             vec2 lp = pos - c_max;
             float g1 = sd_segment(lp, vec2(-2.9, 0.0), vec2(2.9, 0.0)) - 0.65;
             float g2 = sd_segment(lp, vec2(0.0, -2.9), vec2(0.0, 2.9)) - 0.65;
-            float gm = 1.0 - smoothstep(-0.45, 0.45, min(g1, g2));
+            float gm = 1.0 - smoothstep(-0.65, 0.65, min(g1, g2));
             bcol = mix(bcol, vec3(0.03, 0.28, 0.06), gm * 0.85);
         }
         rgb = mix(rgb, bcol, m_max);
@@ -434,6 +434,63 @@ void main() {
 }
 "#;
 
+/// Anti-aliased SDF rounded translucent glass card + crisp rim border shader
+/// (used for Windows 11 snap preview highlights, Snap Layouts drop bar, and tiling swap previews).
+pub const ROUNDED_RECT_FRAGMENT_SHADER: &str = r#"
+precision mediump float;
+
+varying vec2 v_coords;
+uniform vec2 size;
+uniform float alpha;
+
+uniform float u_corner_radius;
+uniform float u_border_width;
+uniform vec4 u_fill_color;
+uniform vec4 u_border_color;
+uniform float u_opacity;
+
+float rounded_box_sdf(vec2 p, vec2 half_size, float radius) {
+    vec2 q = abs(p) - half_size + vec2(radius);
+    return min(max(q.x, q.y), 0.0) + length(max(q, 0.0)) - radius;
+}
+
+void main() {
+    vec2 pos = v_coords * size;
+    vec2 half_size = size * 0.5;
+    float r = min(u_corner_radius, min(half_size.x, half_size.y));
+
+    float outer = rounded_box_sdf(pos - half_size, half_size, r);
+    float outer_mask = 1.0 - smoothstep(-0.75, 0.75, outer);
+    if (outer_mask <= 0.001) {
+        gl_FragColor = vec4(0.0);
+        return;
+    }
+
+    float bw = max(u_border_width, 0.0);
+    float inner_mask = 1.0;
+    if (bw > 0.01) {
+        float inner = rounded_box_sdf(
+            pos - half_size,
+            max(half_size - vec2(bw), vec2(0.5)),
+            max(r - bw, 0.0)
+        );
+        inner_mask = 1.0 - smoothstep(-0.75, 0.75, inner);
+    }
+    float border_ring = clamp(outer_mask - inner_mask, 0.0, 1.0);
+
+    // Subtle vertical glass sheen inside fill
+    float sheen = mix(0.06, 0.0, clamp(v_coords.y, 0.0, 1.0));
+    vec3 fill_rgb = clamp(u_fill_color.rgb + vec3(sheen), 0.0, 1.0);
+    float fill_a = u_fill_color.a * inner_mask;
+    float border_a = u_border_color.a * border_ring;
+
+    // Premultiplied compositing of border over fill
+    vec3 premul = fill_rgb * fill_a * (1.0 - border_a) + u_border_color.rgb * border_a;
+    float out_a = (fill_a * (1.0 - border_a) + border_a) * u_opacity * alpha;
+    gl_FragColor = vec4(premul * u_opacity * alpha, out_a);
+}
+"#;
+
 /// Compiled NEON DE custom shader suite cached for the lifetime of a `GlesRenderer`.
 #[derive(Debug, Clone)]
 pub struct NeonShaders {
@@ -442,6 +499,7 @@ pub struct NeonShaders {
     pub backdrop: GlesPixelProgram,
     pub frosted_glass: GlesPixelProgram,
     pub titlebar: GlesPixelProgram,
+    pub rounded_rect: GlesPixelProgram,
     pub rounded_window: GlesTexProgram,
     pub blur_pass: GlesTexProgram,
 }
@@ -503,6 +561,17 @@ impl NeonShaders {
             ],
         )?;
 
+        let rounded_rect = renderer.compile_custom_pixel_shader(
+            ROUNDED_RECT_FRAGMENT_SHADER,
+            &[
+                UniformName::new("u_corner_radius", UniformType::_1f),
+                UniformName::new("u_border_width", UniformType::_1f),
+                UniformName::new("u_fill_color", UniformType::_4f),
+                UniformName::new("u_border_color", UniformType::_4f),
+                UniformName::new("u_opacity", UniformType::_1f),
+            ],
+        )?;
+
         let rounded_window = renderer.compile_custom_texture_shader(
             ROUNDED_WINDOW_FRAGMENT_SHADER,
             &[
@@ -528,6 +597,7 @@ impl NeonShaders {
             backdrop,
             frosted_glass,
             titlebar,
+            rounded_rect,
             rounded_window,
             blur_pass,
         })

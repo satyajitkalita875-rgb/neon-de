@@ -136,7 +136,7 @@ pub fn run_winit(config: WinitConfig) -> Result<()> {
         "NEON-Winit-1".to_string(),
         PhysicalProperties {
             size: (0, 0).into(),
-            subpixel: Subpixel::Unknown,
+            subpixel: Subpixel::HorizontalRgb,
             make: "NEON DE".into(),
             model: "Nested Winit Display".into(),
         },
@@ -380,7 +380,10 @@ fn render_frame(
             && state.effects.config.blur_strength > 0.01,
         strength: state.effects.config.blur_strength,
         corner_radius: state.effects.config.corner_radius,
+        animations_enabled: state.effects.config.enabled && !state.effects.config.reduced_motion,
+        speed_scale: state.effects.config.speed_scale as f32,
     };
+    neon_renderer.set_motion_config(blur.animations_enabled, blur.speed_scale);
     neon_renderer.sync_cursor_config(
         &state.config.appearance.cursor_theme,
         state.config.appearance.cursor_size,

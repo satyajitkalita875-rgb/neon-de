@@ -1,6 +1,8 @@
 //! Interactive floating window move and resize pointer grabs.
 
 use bitflags::bitflags;
+use neon_window_manager::tiling::TilingDivider;
+use neon_workspaces::WorkspaceId;
 use smithay::{
     desktop::Window,
     input::pointer::{
@@ -20,7 +22,7 @@ use crate::{
     window::{to_wm_point, to_wm_size, window_id},
 };
 
-/// Interactive floating window move grab.
+/// Interactive floating & tiled window move grab.
 pub struct MoveSurfaceGrab {
     pub start_data: PointerGrabStartData<NeonState>,
     pub window: Window,
@@ -29,6 +31,12 @@ pub struct MoveSurfaceGrab {
     /// until pointer motion exceeds a small drag threshold so double-clicking to unmaximize
     /// plays the full smooth Material 3 restore animation cleanly.
     pub pending_unmaximize: bool,
+    /// When grabbing a tiled window's titlebar, wait for a small drag deadzone (`>= 6 px`)
+    /// before detaching visually so normal clicks & double-clicks never jitter the tile.
+    pub pending_tile_drag: bool,
+    /// Tracks whether `commit_drag_snap` already ran on button release so aborted grabs
+    /// safely snap tiled windows back into their layout slot.
+    pub committed: bool,
 }
 
 impl PointerGrab<NeonState> for MoveSurfaceGrab {
@@ -42,6 +50,13 @@ impl PointerGrab<NeonState> for MoveSurfaceGrab {
         handle.motion(data, None, event);
 
         let mut delta = event.location - self.start_data.location;
+        if self.pending_tile_drag {
+            if delta.x.hypot(delta.y) < 6.0 {
+                return;
+            }
+            self.pending_tile_drag = false;
+            data.cursor_status = CursorImageStatus::Named(CursorIcon::Grabbing);
+        }
         if self.pending_unmaximize {
             if delta.x.hypot(delta.y) < 6.0 {
                 return;
@@ -102,7 +117,15 @@ impl PointerGrab<NeonState> for MoveSurfaceGrab {
             if rounded.y < min_y {
                 rounded.y = min_y;
             }
-            data.wm.set_floating_location(id, to_wm_point(rounded));
+            let is_tiled = data
+                .wm
+                .get(id)
+                .map(|w| w.mode.is_tiled())
+                .unwrap_or(false);
+            if !is_tiled {
+                data.wm.set_floating_location(id, to_wm_point(rounded));
+            }
+            data.update_drag_snap(id, event.location);
         }
         data.space.map_element(self.window.clone(), rounded, true);
         if let Some(x11) = self.window.x11_surface() {
@@ -132,6 +155,14 @@ impl PointerGrab<NeonState> for MoveSurfaceGrab {
         handle.button(data, event);
 
         if !handle.current_pressed().contains(&self.start_data.button) {
+            self.committed = true;
+            if let Some(id) = window_id(&self.window) {
+                if !self.pending_tile_drag {
+                    data.commit_drag_snap(id);
+                } else {
+                    data.drag_snap.clear();
+                }
+            }
             handle.unset_grab(self, data, event.serial, event.time, true);
         }
     }
@@ -226,6 +257,22 @@ impl PointerGrab<NeonState> for MoveSurfaceGrab {
     }
 
     fn unset(&mut self, data: &mut NeonState) {
+        if data.drag_snap.is_active() {
+            data.drag_snap.clear();
+        }
+        // If a tiled window grab was cancelled without committing (e.g. Escape/focus change),
+        // snap it right back to its tile so it can never remain stranded off-grid.
+        if !self.committed
+            && !self.pending_tile_drag
+            && let Some(id) = window_id(&self.window)
+            && let Some(ws_id) = data
+                .wm
+                .get(id)
+                .filter(|w| w.mode.is_tiled())
+                .map(|w| w.workspace_id)
+        {
+            data.relayout_auto_tiling_for_workspace(ws_id);
+        }
         data.cursor_status = CursorImageStatus::Named(CursorIcon::Default);
         data.needs_redraw = true;
     }
@@ -478,6 +525,174 @@ impl PointerGrab<NeonState> for ResizeSurfaceGrab {
     }
 
     fn unset(&mut self, data: &mut NeonState) {
+        if data.drag_snap.is_active() {
+            data.drag_snap.clear();
+        }
+        data.cursor_status = CursorImageStatus::Named(CursorIcon::Default);
+        data.needs_redraw = true;
+    }
+}
+
+/// Live 60 FPS interactive split-divider resize grab for Hyprland Auto-Tiling.
+pub struct TileSplitResizeGrab {
+    start_data: PointerGrabStartData<NeonState>,
+    workspace_id: WorkspaceId,
+    divider: TilingDivider,
+    last_ratio_bps: i32,
+}
+
+impl TileSplitResizeGrab {
+    pub fn start(
+        start_data: PointerGrabStartData<NeonState>,
+        workspace_id: WorkspaceId,
+        divider: TilingDivider,
+    ) -> Self {
+        Self {
+            start_data,
+            workspace_id,
+            last_ratio_bps: divider.ratio_bps,
+            divider,
+        }
+    }
+}
+
+impl PointerGrab<NeonState> for TileSplitResizeGrab {
+    fn motion(
+        &mut self,
+        data: &mut NeonState,
+        handle: &mut PointerInnerHandle<'_, NeonState>,
+        _focus: Option<(FocusTarget, Point<f64, Logical>)>,
+        event: &MotionEvent,
+    ) {
+        handle.motion(data, None, event);
+        let ratio = self
+            .divider
+            .ratio_for_point(event.location.x, event.location.y);
+        let bps = (ratio * 10_000.0).round() as i32;
+        if (bps - self.last_ratio_bps).abs() < 15 {
+            return;
+        }
+        self.last_ratio_bps = bps;
+        let work_area = data.work_area();
+        let updates =
+            data.wm
+                .set_split_ratio(self.workspace_id, self.divider.split_index, ratio, work_area);
+        data.apply_layout_updates_batch(updates, false);
+    }
+
+    fn relative_motion(
+        &mut self,
+        data: &mut NeonState,
+        handle: &mut PointerInnerHandle<'_, NeonState>,
+        focus: Option<(FocusTarget, Point<f64, Logical>)>,
+        event: &RelativeMotionEvent,
+    ) {
+        handle.relative_motion(data, focus, event);
+    }
+
+    fn button(
+        &mut self,
+        data: &mut NeonState,
+        handle: &mut PointerInnerHandle<'_, NeonState>,
+        event: &ButtonEvent,
+    ) {
+        handle.button(data, event);
+        if !handle.current_pressed().contains(&self.start_data.button) {
+            handle.unset_grab(self, data, event.serial, event.time, true);
+        }
+    }
+
+    fn axis(
+        &mut self,
+        data: &mut NeonState,
+        handle: &mut PointerInnerHandle<'_, NeonState>,
+        details: AxisFrame,
+    ) {
+        handle.axis(data, details);
+    }
+
+    fn frame(&mut self, data: &mut NeonState, handle: &mut PointerInnerHandle<'_, NeonState>) {
+        handle.frame(data);
+    }
+
+    fn gesture_swipe_begin(
+        &mut self,
+        data: &mut NeonState,
+        handle: &mut PointerInnerHandle<'_, NeonState>,
+        event: &GestureSwipeBeginEvent,
+    ) {
+        handle.gesture_swipe_begin(data, event);
+    }
+
+    fn gesture_swipe_update(
+        &mut self,
+        data: &mut NeonState,
+        handle: &mut PointerInnerHandle<'_, NeonState>,
+        event: &GestureSwipeUpdateEvent,
+    ) {
+        handle.gesture_swipe_update(data, event);
+    }
+
+    fn gesture_swipe_end(
+        &mut self,
+        data: &mut NeonState,
+        handle: &mut PointerInnerHandle<'_, NeonState>,
+        event: &GestureSwipeEndEvent,
+    ) {
+        handle.gesture_swipe_end(data, event);
+    }
+
+    fn gesture_pinch_begin(
+        &mut self,
+        data: &mut NeonState,
+        handle: &mut PointerInnerHandle<'_, NeonState>,
+        event: &GesturePinchBeginEvent,
+    ) {
+        handle.gesture_pinch_begin(data, event);
+    }
+
+    fn gesture_pinch_update(
+        &mut self,
+        data: &mut NeonState,
+        handle: &mut PointerInnerHandle<'_, NeonState>,
+        event: &GesturePinchUpdateEvent,
+    ) {
+        handle.gesture_pinch_update(data, event);
+    }
+
+    fn gesture_pinch_end(
+        &mut self,
+        data: &mut NeonState,
+        handle: &mut PointerInnerHandle<'_, NeonState>,
+        event: &GesturePinchEndEvent,
+    ) {
+        handle.gesture_pinch_end(data, event);
+    }
+
+    fn gesture_hold_begin(
+        &mut self,
+        data: &mut NeonState,
+        handle: &mut PointerInnerHandle<'_, NeonState>,
+        event: &GestureHoldBeginEvent,
+    ) {
+        handle.gesture_hold_begin(data, event);
+    }
+
+    fn gesture_hold_end(
+        &mut self,
+        data: &mut NeonState,
+        handle: &mut PointerInnerHandle<'_, NeonState>,
+        event: &GestureHoldEndEvent,
+    ) {
+        handle.gesture_hold_end(data, event);
+    }
+
+    fn start_data(&self) -> &PointerGrabStartData<NeonState> {
+        &self.start_data
+    }
+
+    fn unset(&mut self, data: &mut NeonState) {
+        data.hovering_tile_divider = false;
         data.cursor_status = CursorImageStatus::Named(CursorIcon::Default);
         data.needs_redraw = true;
     }

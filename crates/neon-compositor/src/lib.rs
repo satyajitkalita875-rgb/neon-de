@@ -7,6 +7,7 @@ pub mod backend;
 pub mod grabs;
 pub mod input;
 pub mod ipc;
+pub mod snap_overlay;
 pub mod state;
 pub mod wayland;
 pub mod window;

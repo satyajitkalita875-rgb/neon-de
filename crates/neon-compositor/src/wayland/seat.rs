@@ -18,7 +18,10 @@ use smithay::{
         },
         touch::{DownEvent, MotionEvent as TouchMotionEvent, OrientationEvent, ShapeEvent, TouchTarget, UpEvent},
     },
-    reexports::wayland_server::{Resource, backend::ObjectId, protocol::wl_surface::WlSurface},
+    reexports::wayland_server::{
+        Resource, backend::ObjectId,
+        protocol::{wl_data_source::WlDataSource, wl_surface::WlSurface},
+    },
     utils::{IsAlive, Serial},
     wayland::{
         output::OutputHandler,
@@ -382,7 +385,24 @@ impl SelectionHandler for NeonState {
     type SelectionUserData = ();
 }
 
-impl ClientDndGrabHandler for NeonState {}
+impl ClientDndGrabHandler for NeonState {
+    fn started(
+        &mut self,
+        _source: Option<WlDataSource>,
+        icon: Option<WlSurface>,
+        _seat: Seat<Self>,
+    ) {
+        self.dnd_icon = icon;
+        self.pending_drag_state = Some(true);
+        self.needs_redraw = true;
+    }
+
+    fn dropped(&mut self, _target: Option<WlSurface>, _validated: bool, _seat: Seat<Self>) {
+        self.dnd_icon = None;
+        self.pending_drag_state = Some(false);
+        self.needs_redraw = true;
+    }
+}
 impl ServerDndGrabHandler for NeonState {}
 
 impl DataDeviceHandler for NeonState {

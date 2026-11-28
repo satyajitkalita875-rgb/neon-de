@@ -194,10 +194,13 @@ impl ClosingGhost {
             return None;
         }
         let t = (elapsed.as_secs_f64() / self.duration.as_secs_f64()).clamp(0.0, 1.0);
-        // Smooth Material 3 Expressive ease-out cubic: brisk initial release, silky fade-out.
+        // Android 16 Material 3 Expressive return-to-icon collapse:
+        // brisk smooth deceleration toward the Dock icon + container-transform corner rounding +
+        // delayed opacity dissolve so the closing window visibly zips back into its Dock icon.
         let ease = 1.0 - (1.0 - t).powi(3);
-        let scale = 1.0 - 0.22 * ease;
-        let alpha = (1.0 - ease).clamp(0.0, 1.0) as f32;
+        let scale = 1.0 - 0.64 * ease;
+        let alpha_t = ((t - 0.24) / 0.76).clamp(0.0, 1.0);
+        let alpha = (1.0 - alpha_t * alpha_t * (3.0 - 2.0 * alpha_t)).clamp(0.0, 1.0) as f32;
         if alpha <= 0.005 {
             return None;
         }
@@ -217,6 +220,11 @@ impl ClosingGhost {
             (w, h).into(),
         );
 
+        // Morph corners smoothly toward a squircle/pill as the app returns to its Dock icon.
+        let max_r = (w.min(h) as f64) * 0.42;
+        let morphed_radius =
+            (self.corner_radius_phys as f64 * (1.0 + 2.4 * ease)).min(max_r) as f32;
+
         let tex_sz = self.texture.size();
         let src_rect = Rectangle::from_size(Size::<f64, BufferCoord>::from((
             tex_sz.w as f64,
@@ -230,7 +238,7 @@ impl ClosingGhost {
             texture: self.texture.clone(),
             src_rect,
             dst_rect,
-            corner_radius_phys: (self.corner_radius_phys as f64 * scale) as f32,
+            corner_radius_phys: morphed_radius,
             rounded_program,
             alpha,
         })

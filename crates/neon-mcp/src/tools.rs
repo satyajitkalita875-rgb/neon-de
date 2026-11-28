@@ -149,14 +149,19 @@ pub fn list_tool_definitions() -> Vec<Value> {
         ),
         tool_def(
             "snap_window",
-            "Snaps a window to a screen half or corner quarter.",
+            "Snaps a window to a screen half, quarter, two-thirds, or third region.",
             json!({
                 "type": "object",
                 "properties": {
                     "window_id": { "type": "integer", "minimum": 1, "description": "Window ID from list_windows" },
                     "region": {
                         "type": "string",
-                        "enum": ["left", "right", "top_left", "top_right", "bottom_left", "bottom_right"],
+                        "enum": [
+                            "left", "right", "top", "bottom",
+                            "top_left", "top_right", "bottom_left", "bottom_right",
+                            "left_two_thirds", "right_one_third",
+                            "left_third", "center_third", "right_third"
+                        ],
                         "description": "Target snap region"
                     }
                 },
@@ -281,8 +286,11 @@ pub fn list_tool_definitions() -> Vec<Value> {
                     "cursor_theme": { "type": "string" },
                     "cursor_size": { "type": "integer", "minimum": 16, "maximum": 48 },
                     "dock_transparency": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
+                    "dock_height": { "type": "integer", "minimum": 36, "maximum": 88 },
                     "panel_transparency": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
                     "panel_visible": { "type": "boolean" },
+                    "panel_mode": { "type": "string", "enum": ["top_and_dock", "combined_bottom"] },
+                    "dynamic_island_enabled": { "type": "boolean" },
                     "show_clock": { "type": "boolean" },
                     "show_workspaces": { "type": "boolean" },
                     "high_contrast": { "type": "boolean" }
@@ -611,10 +619,13 @@ pub fn dispatch_tool(name: &str, args: &Value, bridge: &NeonBridge) -> Result<Va
                 dock_smart_hide: opt_bool(args, "dock_smart_hide"),
                 dock_position: opt_str(args, "dock_position"),
                 dock_icon_size: opt_u32(args, "dock_icon_size"),
+                dock_height: opt_u32(args, "dock_height"),
                 dock_magnification: opt_bool(args, "dock_magnification"),
                 panel_transparency: opt_f32(args, "panel_transparency"),
                 panel_visible: opt_bool(args, "panel_visible"),
                 panel_smart_hide: opt_bool(args, "panel_smart_hide"),
+                panel_mode: opt_str(args, "panel_mode"),
+                dynamic_island_enabled: opt_bool(args, "dynamic_island_enabled"),
                 show_clock: opt_bool(args, "show_clock"),
                 clock_24h: opt_bool(args, "clock_24h"),
                 show_workspaces: opt_bool(args, "show_workspaces"),
@@ -645,6 +656,13 @@ pub fn dispatch_tool(name: &str, args: &Value, bridge: &NeonBridge) -> Result<Va
                 inactive_opacity: opt_f32(args, "inactive_opacity"),
                 corner_radius: opt_f32(args, "corner_radius"),
                 speed_scale: opt_f64(args, "speed_scale"),
+                open_animation: opt_bool(args, "open_animation"),
+                close_animation: opt_bool(args, "close_animation"),
+                minimize_animation: opt_bool(args, "minimize_animation"),
+                maximize_animation: opt_bool(args, "maximize_animation"),
+                workspace_animation: opt_bool(args, "workspace_animation"),
+                overview_animation: opt_bool(args, "overview_animation"),
+                dock_animation: opt_bool(args, "dock_animation"),
             };
             match bridge.request(req)? {
                 IpcPayload::Effects { effects } => Ok(json!({ "ok": true, "effects": effects })),

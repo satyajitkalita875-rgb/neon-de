@@ -11,7 +11,9 @@ use std::{
 };
 
 use gtk4::{ApplicationWindow, Box as GtkBox, Label, glib, prelude::*};
-use neon_config::{FocusMode, NeonConfig, ThemeMode, WindowButtonLayout, save_atomic};
+use neon_config::{
+    FocusMode, NeonConfig, ThemeMode, TilingLayout, WindowButtonLayout, save_atomic,
+};
 use neon_ipc::{DiagnosticsInfo, IpcClient, IpcPayload, IpcRequest, IpcResult, OutputInfo};
 use tracing::warn;
 
@@ -80,7 +82,37 @@ impl SettingsController {
                         }
                         if let Some(request) = req {
                             if let Ok(mut client) = IpcClient::connect(&ipc_socket) {
-                                let _ = client.request(request);
+                                match client.request(request) {
+                                    Ok(IpcResult::Ok {
+                                        payload: IpcPayload::Appearance { appearance },
+                                    }) if appearance.protocol_rev
+                                        < neon_ipc::APPEARANCE_PROTOCOL_REV =>
+                                    {
+                                        // Pre-restart compositors persist their older config schema inside
+                                        // UpdateAppearance, stripping newer panel_mode/dynamic_island fields.
+                                        let _ = save_atomic(&config_path, &cfg);
+                                    }
+                                    Ok(IpcResult::Ok {
+                                        payload: IpcPayload::WindowBehavior { behavior },
+                                    }) => {
+                                        let expected_layout = match cfg.windows.tiling_layout {
+                                            TilingLayout::Dwindle => "dwindle",
+                                            TilingLayout::MasterStack => "master_stack",
+                                        };
+                                        if behavior.auto_tiling != cfg.windows.auto_tiling
+                                            || behavior.auto_snap != cfg.windows.auto_snap
+                                            || behavior.snap_layouts_bar
+                                                != cfg.windows.snap_layouts_bar
+                                            || !behavior
+                                                .tiling_layout
+                                                .eq_ignore_ascii_case(expected_layout)
+                                        {
+                                            // Pre-restart compositor ignored newer tiling/snapping fields.
+                                            let _ = save_atomic(&config_path, &cfg);
+                                        }
+                                    }
+                                    _ => {}
+                                }
                             }
                         }
                     }
@@ -281,6 +313,13 @@ pub fn build_effects_request(cfg: &NeonConfig) -> IpcRequest {
         inactive_opacity: Some(cfg.effects.inactive_opacity),
         corner_radius: Some(cfg.effects.corner_radius),
         speed_scale: Some(cfg.effects.speed_scale),
+        open_animation: Some(cfg.effects.open_animation),
+        close_animation: Some(cfg.effects.close_animation),
+        minimize_animation: Some(cfg.effects.minimize_animation),
+        maximize_animation: Some(cfg.effects.maximize_animation),
+        workspace_animation: Some(cfg.effects.workspace_animation),
+        overview_animation: Some(cfg.effects.overview_animation),
+        dock_animation: Some(cfg.effects.dock_animation),
     }
 }
 
@@ -303,12 +342,18 @@ pub fn build_appearance_request(cfg: &NeonConfig) -> IpcRequest {
         dock_smart_hide: Some(cfg.dock.intelligent_hide),
         dock_position: Some(dock_pos.into()),
         dock_icon_size: Some(cfg.dock.icon_size),
+        dock_height: Some(cfg.dock.height),
         dock_magnification: Some(cfg.dock.magnification),
         dock_pinned_apps: Some(cfg.dock.pinned_apps.clone()),
         panel_transparency: Some(cfg.panel.transparency),
-        panel_visible: Some(cfg.panel.visible),
+        panel_visible: Some(cfg.panel.visible && cfg.panel.mode == neon_config::PanelMode::TopAndDock),
         panel_smart_hide: Some(cfg.panel.smart_hide),
         show_clock: Some(cfg.panel.show_clock),
+        panel_mode: Some(match cfg.panel.mode {
+            neon_config::PanelMode::TopAndDock => "top_and_dock".to_string(),
+            neon_config::PanelMode::CombinedBottom => "combined_bottom".to_string(),
+        }),
+        dynamic_island_enabled: Some(cfg.panel.dynamic_island_enabled),
         clock_24h: Some(cfg.panel.clock_24h),
         show_workspaces: Some(cfg.panel.show_workspaces),
         show_app_title: Some(cfg.panel.show_app_title),
@@ -332,10 +377,19 @@ pub fn build_window_behavior_request(cfg: &NeonConfig) -> IpcRequest {
         WindowButtonLayout::RightStandard => "right_standard",
         WindowButtonLayout::LeftTrafficLights => "left_traffic_lights",
     };
+    let tiling_layout = match cfg.windows.tiling_layout {
+        TilingLayout::Dwindle => "dwindle",
+        TilingLayout::MasterStack => "master_stack",
+    };
     IpcRequest::UpdateWindowBehavior {
         focus_follows_mouse: Some(cfg.windows.focus_mode == FocusMode::FocusFollowsMouse),
         snap_gap: Some(cfg.windows.snap_gap),
+        tiling_gap: Some(cfg.windows.tiling_gap),
         button_layout: Some(layout.into()),
+        auto_tiling: Some(cfg.windows.auto_tiling),
+        tiling_layout: Some(tiling_layout.into()),
+        auto_snap: Some(cfg.windows.auto_snap),
+        snap_layouts_bar: Some(cfg.windows.snap_layouts_bar),
     }
 }
 

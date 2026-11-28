@@ -112,6 +112,13 @@ pub enum NodeContent {
     },
     /// Generic solid colored rectangle (used for overlays, panels, or debug elements).
     SolidRect { color: [f32; 4] },
+    /// Anti-aliased SDF rounded glass rectangle with optional border (used for Windows 11 snap
+    /// preview highlights, Snap Layouts drop bar cards, and tiling drag-swap indicators).
+    RoundedRect {
+        fill_color: [f32; 4],
+        border_color: [f32; 4],
+        border_width: f32,
+    },
 }
 
 /// A single retained visual node in [`SceneGraph`].
@@ -437,6 +444,58 @@ impl SceneGraph {
         self.dirty = true;
         self.dirty_regions.push(dmg);
         id
+    }
+
+    /// Removes all transient `RoundedRect` overlay nodes (snap previews & Snap Layouts bar).
+    pub fn clear_rounded_overlays(&mut self) {
+        let to_remove: Vec<NodeId> = self
+            .nodes
+            .iter()
+            .filter_map(|(&id, n)| {
+                matches!(n.content, NodeContent::RoundedRect { .. }).then_some(id)
+            })
+            .collect();
+        for id in to_remove {
+            if let Some(removed) = self.nodes.remove(&id) {
+                self.dirty = true;
+                self.dirty_regions.push(removed.damage_bounds());
+            }
+        }
+    }
+
+    /// Inserts a rounded glass overlay rectangle into `layer` at `z_index`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_rounded_overlay(
+        &mut self,
+        layer: SceneLayer,
+        z_index: i32,
+        bounds: Rect,
+        corner_radius: f32,
+        fill_color: [f32; 4],
+        border_color: [f32; 4],
+        border_width: f32,
+        opacity: f32,
+    ) -> NodeId {
+        self.insert_node(SceneNode {
+            id: NodeId(0),
+            layer,
+            z_index,
+            bounds,
+            visible: true,
+            opacity: opacity.clamp(0.0, 1.0),
+            offset: (0.0, 0.0),
+            scale: (1.0, 1.0),
+            clip: None,
+            shadow: None,
+            border: None,
+            titlebar: None,
+            corner_radius: corner_radius.max(0.0),
+            content: NodeContent::RoundedRect {
+                fill_color,
+                border_color,
+                border_width,
+            },
+        })
     }
 
     /// Collects all visible nodes in deterministic **front-to-back** order for composition

@@ -2,37 +2,38 @@
 //!
 //! Architecture:
 //! - Uses a dedicated tight-fitting `"neon-quick-settings"` layer surface anchored Top+Right
-//!   so `neon-renderer` renders a true real-time GPU Gaussian-blurred desktop backdrop strictly
-//!   inside Quick Settings' exact rounded bounds (auto-resizing when dropdowns expand!).
+//!   (or Bottom+Right in Combined Bottom mode) so `neon-renderer` renders a true real-time GPU
+//!   Gaussian-blurred desktop backdrop strictly inside Quick Settings' rounded bounds.
 //! - Paired with a transparent `"neon-quick-settings-backdrop"` click-catcher so clicking
 //!   anywhere outside or pressing `Esc` dismisses Quick Settings cleanly.
-//! - Clean, zero-clutter layout:
+//! - Clean, focused system control layout:
 //!   1. Header: Battery indicator (left) + Power Menu trigger (right -> fullscreen centered Power Menu)
 //!   2. Equal-length Wi-Fi & Bluetooth split pills with live expandable nearby networks / devices dropdowns
 //!   3. Unified pixel-aligned Display Brightness & Sound Volume slider stack
 //!   4. 3-button Power Mode segmented bar (`Power Saver | Balanced | Performance`)
 //!   5. Equal-length `Dark Mode` toggle + `Screenshot` trigger
-//!   6. Dynamic Notifications card (hidden when empty)
 
 use std::{
     cell::{Cell, RefCell},
     rc::Rc,
-    sync::{Arc, mpsc},
+    sync::mpsc,
     time::Duration,
 };
 
 use gtk4::{
     Align, Application, ApplicationWindow, Box as GtkBox, Button, EventControllerKey, GestureClick,
-    Image, Label, Orientation, PasswordEntry, Revealer, RevealerTransitionType, Scale,
-    ScrolledWindow, Separator, gdk, glib, prelude::*,
+    Image, Label, Orientation, PasswordEntry, Revealer, RevealerTransitionType, Scale, Separator,
+    gdk, glib, prelude::*,
 };
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
-use neon_ipc::{AppearanceInfo, IpcRequest};
+use neon_ipc::{AppearanceInfo, EffectsInfo, IpcRequest, WindowBehaviorInfo};
 use neon_system::{
     SystemAction, SystemActionSender, SystemSnapshot,
-    bluetooth::{BluetoothDevice, list_all_bluetooth_devices, pair_device, set_bluetooth_discovery, set_device_connected},
+    bluetooth::{
+        BluetoothDevice, list_all_bluetooth_devices, pair_device, set_bluetooth_discovery,
+        set_device_connected,
+    },
     network::{WifiAccessPoint, connect_wifi, list_wifi_networks},
-    notifications::NotificationStore,
     power::{BatteryState, read_backlight_percent},
 };
 
@@ -44,7 +45,8 @@ use crate::{
 
 const QS_WIDTH: i32 = 348;
 
-type StateChangeCallback = Rc<RefCell<Option<Box<dyn Fn(bool)>>>>;
+type StateChangeListeners = Rc<RefCell<Vec<Box<dyn Fn(bool)>>>>;
+type VoidCallback = Rc<RefCell<Option<Box<dyn Fn()>>>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ActiveDropdown {
@@ -75,7 +77,10 @@ pub struct QuickSettingsPanel {
     ipc: IpcCommandSender,
     is_open: Rc<Cell<bool>>,
     anim_gen: Rc<Cell<u64>>,
-    on_state_change: StateChangeCallback,
+    motion_enabled: Rc<Cell<bool>>,
+    speed_scale: Rc<Cell<f64>>,
+    on_before_open: VoidCallback,
+    on_state_listeners: StateChangeListeners,
     syncing: Rc<Cell<bool>>,
     // Header
     header_battery_box: GtkBox,
@@ -118,14 +123,18 @@ pub struct QuickSettingsPanel {
     pm_saver_btn: Button,
     pm_balanced_btn: Button,
     pm_perf_btn: Button,
-    // Row 4: Dark Mode + Screenshot
+    // Row 4: Hyprland Auto-Tiling split pill (toggle + Dwindle/Master switcher)
+    tiling_pill: GtkBox,
+    tiling_sub: Label,
+    tiling_layout_lbl: Label,
+    auto_tiling_enabled: Rc<Cell<bool>>,
+    tiling_layout_name: Rc<RefCell<String>>,
+    // Row 5: Dark Mode + Screenshot
     dark_mode_btn: Button,
     dark_mode_icon: Image,
     is_light_theme: Rc<Cell<bool>>,
-    // Optional Notifications (auto-hidden when empty)
-    notif_card: GtkBox,
-    notif_list_box: GtkBox,
-    store: Arc<NotificationStore>,
+    anchor_bottom: Rc<Cell<bool>>,
+    bottom_margin: Rc<Cell<i32>>,
     sys_tx: SystemActionSender,
     toast_overlay: NotificationOverlay,
 }
@@ -135,7 +144,6 @@ impl QuickSettingsPanel {
         app: &Application,
         ipc: IpcCommandSender,
         sys_tx: SystemActionSender,
-        store: Arc<NotificationStore>,
         toast_overlay: NotificationOverlay,
         power_menu: PowerMenuOverlay,
     ) -> Self {
@@ -191,7 +199,7 @@ impl QuickSettingsPanel {
         let is_light_theme = Rc::new(Cell::new(false));
         let is_open = Rc::new(Cell::new(false));
         let anim_gen = Rc::new(Cell::new(0u64));
-        let on_state_change: StateChangeCallback = Rc::new(RefCell::new(None));
+        let on_state_listeners: StateChangeListeners = Rc::new(RefCell::new(Vec::new()));
         let active_dropdown = Rc::new(Cell::new(ActiveDropdown::None));
         let wifi_pw_ssid: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
         let (bg_tx, bg_rx) = mpsc::channel::<DropdownBgEvent>();
@@ -331,7 +339,7 @@ impl QuickSettingsPanel {
         wifi_pw_revealer.set_child(Some(&wifi_pw_box));
         dropdown_box.append(&wifi_pw_revealer);
 
-        let dd_scroller = ScrolledWindow::builder()
+        let dd_scroller = gtk4::ScrolledWindow::builder()
             .max_content_height(192)
             .propagate_natural_height(true)
             .hscrollbar_policy(gtk4::PolicyType::Never)
@@ -513,7 +521,66 @@ impl QuickSettingsPanel {
         card.append(&pm_section);
 
         // =========================================================================
-        // ROW 4: Equal-Length Dark Mode Toggle + Screenshot Pill
+        // ROW 4: Hyprland Auto-Tiling Split Pill (Global Toggle + Layout Switcher)
+        // =========================================================================
+        let auto_tiling_enabled = Rc::new(Cell::new(false));
+        let tiling_layout_name = Rc::new(RefCell::new("dwindle".to_string()));
+        let (tiling_pill, tiling_main_btn, tiling_sub, tiling_layout_btn, tiling_layout_lbl) =
+            build_split_tiling_pill();
+        {
+            let ipc_t = ipc.clone();
+            let enabled_c = Rc::clone(&auto_tiling_enabled);
+            let layout_c = Rc::clone(&tiling_layout_name);
+            let pill_c = tiling_pill.clone();
+            let sub_c = tiling_sub.clone();
+            let lbl_c = tiling_layout_lbl.clone();
+            tiling_main_btn.connect_clicked(move |_| {
+                let next = !enabled_c.get();
+                enabled_c.set(next);
+                sync_tiling_pill_ui(&pill_c, &sub_c, &lbl_c, next, &layout_c.borrow());
+                ipc_t.send(IpcRequest::UpdateWindowBehavior {
+                    focus_follows_mouse: None,
+                    snap_gap: None,
+                    tiling_gap: None,
+                    button_layout: None,
+                    auto_tiling: Some(next),
+                    tiling_layout: None,
+                    auto_snap: None,
+                    snap_layouts_bar: None,
+                });
+            });
+        }
+        {
+            let ipc_t = ipc.clone();
+            let enabled_c = Rc::clone(&auto_tiling_enabled);
+            let layout_c = Rc::clone(&tiling_layout_name);
+            let pill_c = tiling_pill.clone();
+            let sub_c = tiling_sub.clone();
+            let lbl_c = tiling_layout_lbl.clone();
+            tiling_layout_btn.connect_clicked(move |_| {
+                let next_layout = if layout_c.borrow().eq_ignore_ascii_case("master_stack") {
+                    "dwindle"
+                } else {
+                    "master_stack"
+                };
+                *layout_c.borrow_mut() = next_layout.to_string();
+                sync_tiling_pill_ui(&pill_c, &sub_c, &lbl_c, enabled_c.get(), next_layout);
+                ipc_t.send(IpcRequest::UpdateWindowBehavior {
+                    focus_follows_mouse: None,
+                    snap_gap: None,
+                    tiling_gap: None,
+                    button_layout: None,
+                    auto_tiling: None,
+                    tiling_layout: Some(next_layout.to_string()),
+                    auto_snap: None,
+                    snap_layouts_bar: None,
+                });
+            });
+        }
+        card.append(&tiling_pill);
+
+        // =========================================================================
+        // ROW 5: Equal-Length Dark Mode Toggle + Screenshot Pill
         // =========================================================================
         let actions_row = GtkBox::new(Orientation::Horizontal, 10);
         actions_row.set_homogeneous(true);
@@ -545,41 +612,6 @@ impl QuickSettingsPanel {
         actions_row.append(&shot_btn);
         card.append(&actions_row);
 
-        // =========================================================================
-        // Dynamic Notifications Card (auto-hidden when empty)
-        // =========================================================================
-        let notif_card = GtkBox::new(Orientation::Vertical, 6);
-        notif_card.add_css_class("neon-qs-inner-card");
-        notif_card.set_visible(false);
-
-        let notif_head = GtkBox::new(Orientation::Horizontal, 6);
-        let notif_title = Label::new(Some("Notifications"));
-        notif_title.add_css_class("neon-cc-title");
-        notif_title.set_hexpand(true);
-        notif_title.set_halign(Align::Start);
-
-        let clear_btn = Button::with_label("Clear");
-        clear_btn.add_css_class("neon-cc-small-btn");
-        {
-            let store_c = Arc::clone(&store);
-            clear_btn.connect_clicked(move |_| {
-                store_c.clear_all();
-            });
-        }
-
-        notif_head.append(&notif_title);
-        notif_head.append(&clear_btn);
-        notif_card.append(&notif_head);
-
-        let notif_scroller = ScrolledWindow::builder()
-            .max_content_height(110)
-            .propagate_natural_height(true)
-            .build();
-        let notif_list_box = GtkBox::new(Orientation::Vertical, 6);
-        notif_scroller.set_child(Some(&notif_list_box));
-        notif_card.append(&notif_scroller);
-        card.append(&notif_card);
-
         window.set_child(Some(&card));
         window.set_visible(false);
 
@@ -589,7 +621,10 @@ impl QuickSettingsPanel {
             ipc: ipc.clone(),
             is_open,
             anim_gen,
-            on_state_change,
+            motion_enabled: Rc::new(Cell::new(true)),
+            speed_scale: Rc::new(Cell::new(1.0)),
+            on_before_open: Rc::new(RefCell::new(None)),
+            on_state_listeners,
             syncing,
             header_battery_box,
             header_battery_icon,
@@ -627,39 +662,37 @@ impl QuickSettingsPanel {
             pm_saver_btn,
             pm_balanced_btn,
             pm_perf_btn,
+            tiling_pill,
+            tiling_sub,
+            tiling_layout_lbl,
+            auto_tiling_enabled,
+            tiling_layout_name,
             dark_mode_btn,
             dark_mode_icon,
             is_light_theme,
-            notif_card,
-            notif_list_box,
-            store,
+            anchor_bottom: Rc::new(Cell::new(false)),
+            bottom_margin: Rc::new(Cell::new(82)),
             sys_tx,
             toast_overlay,
         };
 
-        // Wire Power Menu button -> closes Quick Settings and opens Fullscreen Centered Power Menu
+        // Wire Power Menu button -> closes Quick Settings cleanly and opens Power Menu
         {
             let p = panel.clone();
             let pm = power_menu;
             power_menu_btn.connect_clicked(move |_| {
-                p.close();
-                let pm_c = pm.clone();
-                glib::timeout_add_local_once(Duration::from_millis(80), move || {
-                    pm_c.open();
-                });
+                p.close_immediate();
+                pm.open();
             });
         }
 
-        // Wire Screenshot button -> closes Quick Settings and opens Screenshot & Screen Record UI
+        // Wire Screenshot button -> closes Quick Settings cleanly and opens Screenshot UI
         {
             let p = panel.clone();
             let ipc_s = ipc;
             shot_btn.connect_clicked(move |_| {
-                p.close();
-                let ipc_c = ipc_s.clone();
-                glib::timeout_add_local_once(Duration::from_millis(160), move || {
-                    ipc_c.send(IpcRequest::OpenScreenshotUi);
-                });
+                p.close_immediate();
+                ipc_s.send(IpcRequest::OpenScreenshotUi);
             });
         }
 
@@ -738,12 +771,44 @@ impl QuickSettingsPanel {
             });
         }
 
-        panel.refresh_notifications();
         panel
     }
 
-    pub fn set_on_state_change<F: Fn(bool) + 'static>(&self, cb: F) {
-        *self.on_state_change.borrow_mut() = Some(Box::new(cb));
+    pub fn set_on_before_open<F: Fn() + 'static>(&self, cb: F) {
+        *self.on_before_open.borrow_mut() = Some(Box::new(cb));
+    }
+
+    pub fn add_on_state_change<F: Fn(bool) + 'static>(&self, cb: F) {
+        self.on_state_listeners.borrow_mut().push(Box::new(cb));
+    }
+
+    pub fn update_effects(&self, effects: &EffectsInfo) {
+        self.motion_enabled
+            .set(effects.enabled && !effects.reduced_motion);
+        self.speed_scale.set(effects.speed_scale.clamp(0.5, 2.5));
+    }
+
+    /// Switches Quick Settings anchor between Top-Right and Bottom-Right (Combined Taskbar mode).
+    pub fn set_anchor_bottom(&self, bottom: bool, bottom_margin: i32) {
+        let m = bottom_margin.clamp(48, 160);
+        if self.anchor_bottom.get() == bottom && (!bottom || self.bottom_margin.get() == m) {
+            return;
+        }
+        self.anchor_bottom.set(bottom);
+        self.bottom_margin.set(m);
+        if gtk4_layer_shell::is_supported() {
+            if bottom {
+                self.window.set_anchor(Edge::Top, false);
+                self.window.set_anchor(Edge::Bottom, true);
+                self.window.set_margin(Edge::Bottom, m);
+            } else {
+                self.window.set_anchor(Edge::Bottom, false);
+                self.window.set_anchor(Edge::Top, true);
+                self.window.set_margin(Edge::Top, 38);
+            }
+            self.window.set_anchor(Edge::Right, true);
+            self.window.set_margin(Edge::Right, 12);
+        }
     }
 
     pub fn toggle(&self) {
@@ -755,6 +820,9 @@ impl QuickSettingsPanel {
     }
 
     pub fn open(&self) {
+        if let Some(cb) = self.on_before_open.borrow().as_ref() {
+            cb();
+        }
         let epoch = self.anim_gen.get().wrapping_add(1);
         self.anim_gen.set(epoch);
         self.is_open.set(true);
@@ -766,7 +834,6 @@ impl QuickSettingsPanel {
 
         self.toast_overlay.set_suppressed(true);
         self.sys_tx.send(SystemAction::RefreshNow);
-        self.refresh_notifications();
         self.refresh_brightness();
 
         // Trigger compositor-driven 60 FPS GPU Material 3 Expressive entrance spring.
@@ -783,8 +850,31 @@ impl QuickSettingsPanel {
         self.window.present();
     }
 
+    /// Immediately closes Quick Settings with zero delayed hide timers (used when handing off
+    /// directly to another overlay or when animations are disabled).
+    pub fn close_immediate(&self) {
+        let was_active = self.is_open.get() || self.window.is_visible();
+        let epoch = self.anim_gen.get().wrapping_add(1);
+        self.anim_gen.set(epoch);
+        self.is_open.set(false);
+        self.collapse_dropdown_immediate();
+        if gtk4_layer_shell::is_supported() {
+            self.window.set_keyboard_mode(KeyboardMode::None);
+        }
+        self.backdrop_window.set_visible(false);
+        self.window.set_visible(false);
+        self.toast_overlay.set_suppressed(false);
+        if was_active {
+            self.notify_state_change(false);
+        }
+    }
+
     pub fn close(&self) {
         if !self.is_open.get() && !self.window.is_visible() {
+            return;
+        }
+        if !self.motion_enabled.get() {
+            self.close_immediate();
             return;
         }
         let epoch = self.anim_gen.get().wrapping_add(1);
@@ -793,18 +883,21 @@ impl QuickSettingsPanel {
         self.notify_state_change(false);
 
         // Immediately release the fullscreen click-catcher backdrop so desktop/app clicks
-        // aren't blocked while the Quick Settings card finishes its 155ms exit glide.
+        // aren't blocked while the Quick Settings card finishes its exit glide.
         self.backdrop_window.set_visible(false);
 
-        // Trigger smooth 60 FPS GPU glide + fade exit in neon-renderer (155ms).
+        // Trigger smooth 60 FPS GPU glide + fade exit in neon-renderer.
         self.ipc.send(IpcRequest::AnimateOverlay {
             namespace: "neon-quick-settings".into(),
             opening: false,
         });
 
+        let speed = self.speed_scale.get().clamp(0.5, 2.5);
+        let hide_ms = ((235.0 / speed).round() as u64).clamp(90, 500);
+
         let this = self.clone();
         let gen_c = Rc::clone(&self.anim_gen);
-        glib::timeout_add_local_once(Duration::from_millis(175), move || {
+        glib::timeout_add_local_once(Duration::from_millis(hide_ms), move || {
             if gen_c.get() == epoch {
                 this.collapse_dropdown_immediate();
                 if gtk4_layer_shell::is_supported() {
@@ -1205,7 +1298,7 @@ impl QuickSettingsPanel {
     }
 
     fn notify_state_change(&self, open: bool) {
-        if let Some(cb) = self.on_state_change.borrow().as_ref() {
+        for cb in self.on_state_listeners.borrow().iter() {
             cb(open);
         }
     }
@@ -1237,6 +1330,24 @@ impl QuickSettingsPanel {
                 .set_icon_name(Some("weather-clear-night-symbolic"));
         }
         self.dark_mode_btn.set_tooltip_text(Some("Dark Mode"));
+    }
+
+    /// Syncs the Hyprland Auto-Tiling Quick Settings split pill with live compositor state.
+    pub fn update_window_behavior(&self, wb: &WindowBehaviorInfo) {
+        let layout = if wb.tiling_layout.eq_ignore_ascii_case("master_stack") {
+            "master_stack"
+        } else {
+            "dwindle"
+        };
+        self.auto_tiling_enabled.set(wb.auto_tiling);
+        *self.tiling_layout_name.borrow_mut() = layout.to_string();
+        sync_tiling_pill_ui(
+            &self.tiling_pill,
+            &self.tiling_sub,
+            &self.tiling_layout_lbl,
+            wb.auto_tiling,
+            layout,
+        );
     }
 
     pub fn update_system(&self, snap: &SystemSnapshot) {
@@ -1344,39 +1455,6 @@ impl QuickSettingsPanel {
 
         self.syncing.set(false);
     }
-
-    pub fn refresh_notifications(&self) {
-        while let Some(child) = self.notif_list_box.first_child() {
-            self.notif_list_box.remove(&child);
-        }
-
-        let history = self.store.history();
-        if history.is_empty() {
-            self.notif_card.set_visible(false);
-            return;
-        }
-
-        self.notif_card.set_visible(true);
-        for item in history.iter().take(4) {
-            let row = GtkBox::new(Orientation::Vertical, 2);
-            row.add_css_class("neon-cc-notif-item");
-            let title = Label::new(Some(&format!("{} · {}", item.app_name, item.summary)));
-            title.add_css_class("neon-cc-title");
-            title.set_halign(Align::Start);
-            title.set_ellipsize(gtk4::pango::EllipsizeMode::End);
-            row.append(&title);
-
-            if !item.body.is_empty() {
-                let body = Label::new(Some(&item.body));
-                body.add_css_class("neon-cc-sub");
-                body.set_halign(Align::Start);
-                body.set_wrap(true);
-                body.set_max_width_chars(36);
-                row.append(&body);
-            }
-            self.notif_list_box.append(&row);
-        }
-    }
 }
 
 /// Builds an equal-width split connectivity pill (left toggle + divider + right dropdown arrow).
@@ -1437,6 +1515,90 @@ fn build_split_connectivity_pill(
     pill.append(&arrow_btn);
 
     (pill, main_btn, sub_lbl, arrow_btn, arrow_icon)
+}
+
+/// Builds the full-width Hyprland Auto-Tiling split pill (left global toggle + right layout switcher).
+fn build_split_tiling_pill() -> (GtkBox, Button, Label, Button, Label) {
+    let pill = GtkBox::new(Orientation::Horizontal, 0);
+    pill.add_css_class("neon-qs-split-pill");
+    pill.add_css_class("neon-qs-tiling-pill");
+    pill.set_hexpand(true);
+
+    let main_btn = Button::new();
+    main_btn.add_css_class("neon-qs-split-main");
+    main_btn.set_hexpand(true);
+    main_btn.set_tooltip_text(Some("Toggle Hyprland Auto-Tiling globally (Super+T)"));
+
+    let main_row = GtkBox::new(Orientation::Horizontal, 10);
+    main_row.set_valign(Align::Center);
+
+    let icon = Image::from_icon_name("view-grid-symbolic");
+    icon.set_pixel_size(18);
+    icon.add_css_class("neon-qs-split-icon");
+
+    let text = GtkBox::new(Orientation::Vertical, 1);
+    text.set_hexpand(true);
+    text.set_valign(Align::Center);
+
+    let title_lbl = Label::new(Some("Auto-Tiling"));
+    title_lbl.add_css_class("neon-qs-pill-title");
+    title_lbl.set_halign(Align::Start);
+
+    let sub_lbl = Label::new(Some("Off · Drag Snap Active"));
+    sub_lbl.add_css_class("neon-qs-pill-sub");
+    sub_lbl.set_halign(Align::Start);
+    sub_lbl.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+
+    text.append(&title_lbl);
+    text.append(&sub_lbl);
+
+    main_row.append(&icon);
+    main_row.append(&text);
+    main_btn.set_child(Some(&main_row));
+
+    let sep = Separator::new(Orientation::Vertical);
+    sep.add_css_class("neon-qs-split-sep");
+
+    let layout_btn = Button::new();
+    layout_btn.add_css_class("neon-qs-split-layout-btn");
+    layout_btn.set_tooltip_text(Some("Switch tiling layout (Dwindle ↔ Master–Stack)"));
+    let layout_row = GtkBox::new(Orientation::Horizontal, 5);
+    layout_row.set_valign(Align::Center);
+    layout_row.set_halign(Align::Center);
+    let layout_lbl = Label::new(Some("Dwindle"));
+    layout_lbl.add_css_class("neon-qs-tiling-layout-lbl");
+    let cycle_icon = Image::from_icon_name("object-flip-horizontal-symbolic");
+    cycle_icon.set_pixel_size(13);
+    cycle_icon.add_css_class("neon-qs-split-icon");
+    layout_row.append(&layout_lbl);
+    layout_row.append(&cycle_icon);
+    layout_btn.set_child(Some(&layout_row));
+
+    pill.append(&main_btn);
+    pill.append(&sep);
+    pill.append(&layout_btn);
+
+    (pill, main_btn, sub_lbl, layout_btn, layout_lbl)
+}
+
+fn sync_tiling_pill_ui(
+    pill: &GtkBox,
+    sub_lbl: &Label,
+    layout_lbl: &Label,
+    enabled: bool,
+    layout: &str,
+) {
+    let is_master = layout.eq_ignore_ascii_case("master_stack");
+    let short_name = if is_master { "Master" } else { "Dwindle" };
+    let full_name = if is_master { "Master–Stack" } else { "Dwindle" };
+    layout_lbl.set_text(short_name);
+    if enabled {
+        pill.add_css_class("active");
+        sub_lbl.set_text(&format!("On · {full_name} · Super+T"));
+    } else {
+        pill.remove_css_class("active");
+        sub_lbl.set_text("Off · Drag Snap Active");
+    }
 }
 
 fn build_action_pill(icon_name: &str, label: &str) -> (Button, Image) {

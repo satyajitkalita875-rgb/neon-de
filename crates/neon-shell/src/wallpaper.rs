@@ -16,13 +16,14 @@ use gtk4::{
     Label, Orientation, Overlay, Picture, gdk, gdk_pixbuf, gio, glib, prelude::*,
 };
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
-use neon_ipc::AppearanceInfo;
+use neon_ipc::{AppearanceInfo, IpcRequest};
 use tracing::info;
 
 use crate::{
     context_menu::ContextMenuOverlay,
     desktop_apps::{load_app_icon, parse_desktop_file},
     file_ops::{desktop_dir, icon_for_path, open_path},
+    ipc_bridge::IpcCommandSender,
 };
 
 /// Decodes an image file scaled down to fit within `max_w × max_h` before GPU upload,
@@ -176,10 +177,15 @@ pub struct WallpaperLayer {
     last_dir_sig: Rc<Cell<u64>>,
     selected_tile: Rc<RefCell<Option<Button>>>,
     context_menu: ContextMenuOverlay,
+    ipc: IpcCommandSender,
 }
 
 impl WallpaperLayer {
-    pub fn build(app: &Application, context_menu: ContextMenuOverlay) -> Self {
+    pub fn build(
+        app: &Application,
+        context_menu: ContextMenuOverlay,
+        ipc: IpcCommandSender,
+    ) -> Self {
         let window = ApplicationWindow::builder()
             .application(app)
             .title("NEON DE Wallpaper")
@@ -259,6 +265,7 @@ impl WallpaperLayer {
             last_dir_sig: Rc::new(Cell::new(0)),
             selected_tile,
             context_menu,
+            ipc,
         };
         if let Some(default_wp) = resolve_wallpaper_path(None, false) {
             layer.apply_path(&default_wp);
@@ -452,12 +459,14 @@ impl WallpaperLayer {
 
             tile.set_child(Some(&vbox));
 
-            // Single-click selects; double-click launches/opens.
+            // Single-click selects; double-click launches/opens with Android launch-origin tracking.
             {
                 let click = GestureClick::new();
                 click.set_button(1);
                 let sel = Rc::clone(&self.selected_tile);
                 let tile_c = tile.clone();
+                let win_c = self.window.clone();
+                let ipc_c = self.ipc.clone();
                 let p = item.path.clone();
                 click.connect_pressed(move |gesture, n_press, _, _| {
                     gesture.set_state(gtk4::EventSequenceState::Claimed);
@@ -466,6 +475,11 @@ impl WallpaperLayer {
                     }
                     tile_c.add_css_class("selected");
                     if n_press >= 2 {
+                        if let Some(bounds) = tile_c.compute_bounds(&win_c) {
+                            let cx = (bounds.x() + bounds.width() * 0.5).round() as i32;
+                            let cy = (bounds.y() + bounds.height() * 0.5).round() as i32;
+                            ipc_c.send(IpcRequest::SetLaunchOrigin { x: cx, y: cy });
+                        }
                         open_path(&p);
                     }
                 });

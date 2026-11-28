@@ -10,10 +10,16 @@ use std::{
     time::Duration,
 };
 
-use neon_config::{DockPosition, FocusMode, NeonConfig, ThemeMode, WindowButtonLayout};
+use neon_config::{
+    DockPosition, FocusMode, NeonConfig, ThemeMode, TilingLayout as ConfigTilingLayout,
+    WindowButtonLayout,
+};
 use neon_effects::{EffectsConfig, EffectsManager};
 use neon_output::{DisplayMode, OutputConfigPatch, OutputId, OutputManager, OutputTransform};
-use neon_scene::{BorderStyle, MACOS_TITLEBAR_HEIGHT, SceneGraph, ShadowStyle, TitlebarStyle};
+use neon_scene::{
+    BorderStyle, MACOS_TITLEBAR_HEIGHT, SceneGraph, SceneLayer, ShadowStyle, TitlebarStyle,
+};
+use neon_window_manager::tiling::TilingLayout as WmTilingLayout;
 use neon_workspaces::{WorkspaceId, WorkspacePolicy};
 use smithay::{
     backend::allocator::{Format, dmabuf::Dmabuf},
@@ -64,6 +70,7 @@ use smithay::{
 use tracing::{debug, info, warn};
 
 use crate::{
+    snap_overlay::{DragSnapOverlayState, DragSnapTarget},
     wayland::{seat::FocusTarget, session_lock::SessionLockState},
     window::{
         SnapRegion, WindowId, WindowLayoutUpdate, WindowManager, WindowMode, WmRect, from_wm_point,
@@ -199,6 +206,9 @@ pub struct NeonState {
     pub last_titlebar_click: Option<(WindowId, std::time::Instant, Point<f64, Logical>)>,
     /// Exact Dock icon screen center per running window (reported by `neon-shell` for minimize/close).
     pub window_dock_anchors: HashMap<WindowId, Point<i32, Logical>>,
+    /// Screen center of the most recently clicked Dock/Drawer/Desktop app icon for Android-style
+    /// container-transform window launch animations.
+    pub recent_launch_origin: Option<(Point<i32, Logical>, std::time::Instant)>,
     /// Client-initiated window closes queued for GPU offscreen texture capture + fade animation.
     pub pending_close_ghosts: Vec<neon_renderer::PendingCloseGhost>,
     /// Windows currently playing their dock-swoop minimize animation (`id -> unmap_at`).
@@ -251,6 +261,14 @@ pub struct NeonState {
     pub pending_screencast_previews: Vec<PendingPreviewCapture>,
     /// Signals `neon-shell` to open the GNOME-style interactive screenshot overlay.
     pub pending_screenshot_ui: bool,
+    /// Signals `neon-shell` to open or close Clipboard History inside the Dynamic Island.
+    pub pending_clipboard_toggle: bool,
+    /// Signals `neon-shell` to open or close the Dynamic Island hub (`Super+N`).
+    pub pending_island_toggle: bool,
+    /// Active Wayland Drag-and-Drop icon surface (`wl_data_device.start_drag`), if any.
+    pub dnd_icon: Option<WlSurface>,
+    /// Signals `neon-shell` when a desktop Drag-and-Drop session begins or ends.
+    pub pending_drag_state: Option<bool>,
     /// Signals `neon-shell` to open the OS-level right-click context menu at `(x, y)`.
     pub pending_context_menu: Option<(i32, i32, neon_ipc::ContextMenuTarget)>,
     /// Last committed logical height of `neon-panel` (0 until a top panel has mapped).
@@ -259,6 +277,10 @@ pub struct NeonState {
     pub last_dock_exclusive: i32,
     /// Queued compositor-driven GPU open/close animation triggers `(namespace, opening)`.
     pub pending_overlay_anims: Vec<(String, bool)>,
+    /// Active drag-to-snap glass preview & Windows 11 Snap Layouts drop bar state.
+    pub drag_snap: DragSnapOverlayState,
+    /// `true` while the pointer is hovering an interactive Auto-Tiling split divider.
+    pub hovering_tile_divider: bool,
 }
 
 impl NeonState {
@@ -338,6 +360,7 @@ impl NeonState {
             pending_geometry_anims: HashMap::new(),
             last_titlebar_click: None,
             window_dock_anchors: HashMap::new(),
+            recent_launch_origin: None,
             pending_close_ghosts: Vec::new(),
             minimizing_windows: HashMap::new(),
             closing_windows: HashMap::new(),
@@ -368,10 +391,16 @@ impl NeonState {
             screencast_target: neon_ipc::ScreencastTarget::default(),
             pending_screencast_previews: Vec::new(),
             pending_screenshot_ui: false,
+            pending_clipboard_toggle: false,
+            pending_island_toggle: false,
+            dnd_icon: None,
+            pending_drag_state: None,
             pending_context_menu: None,
             last_panel_height: 0,
             last_dock_exclusive: 0,
             pending_overlay_anims: Vec::new(),
+            drag_snap: DragSnapOverlayState::default(),
+            hovering_tile_divider: false,
         }
     }
 
@@ -387,6 +416,13 @@ impl NeonState {
         self.effects.config.inactive_opacity = cfg.effects.inactive_opacity;
         self.effects.config.corner_radius = cfg.effects.corner_radius;
         self.effects.config.speed_scale = cfg.effects.speed_scale;
+        self.effects.config.open_animation = cfg.effects.open_animation;
+        self.effects.config.close_animation = cfg.effects.close_animation;
+        self.effects.config.minimize_animation = cfg.effects.minimize_animation;
+        self.effects.config.maximize_animation = cfg.effects.maximize_animation;
+        self.effects.config.workspace_animation = cfg.effects.workspace_animation;
+        self.effects.config.overview_animation = cfg.effects.overview_animation;
+        self.effects.config.dock_animation = cfg.effects.dock_animation;
 
         let policy = match cfg.windows.focus_mode {
             FocusMode::ClickToFocus => crate::window::FocusPolicy::ClickToFocus,
@@ -394,7 +430,17 @@ impl NeonState {
         };
         self.wm.set_focus_policy(policy);
         self.wm.set_snap_gap(cfg.windows.snap_gap);
+        self.wm.set_tiling_gap(cfg.windows.tiling_gap);
+        let wm_layout = match cfg.windows.tiling_layout {
+            ConfigTilingLayout::Dwindle => WmTilingLayout::Dwindle,
+            ConfigTilingLayout::MasterStack => WmTilingLayout::MasterStack,
+        };
+        let auto_tiling = cfg.windows.auto_tiling;
         self.config = cfg;
+        let wa = self.work_area();
+        let _ = self.wm.set_tiling_layout(wm_layout, wa);
+        let tile_updates = self.wm.set_auto_tiling(auto_tiling, wa);
+        self.apply_layout_updates_batch(tile_updates, false);
         self.relayout_non_floating_windows();
     }
 
@@ -763,6 +809,125 @@ impl NeonState {
         self.pending_geometry_anims
             .retain(|id, _| active_space_ids.contains(id));
         self.scene.retain_windows(|id| visible_ids.contains(&id));
+
+        // 3. Emit GPU-native Windows 11 Snap Preview highlight & top-center Snap Layouts drop bar.
+        if self.backend_name != "drm"
+            && !self.drag_snap.is_active()
+            && let Ok(spec) = std::env::var("NEON_TEST_SNAP_BAR_PREVIEW")
+            && let Some(fid) = self.wm.focused_id()
+        {
+            let wa = self.work_area();
+            let cx = (wa.loc.x + wa.size.w / 2) as f64;
+            // First reveal the top-center Snap Layouts bar, then hover requested card:zone.
+            self.update_drag_snap(fid, (cx, (wa.loc.y + 4) as f64).into());
+            let mut parts = spec.split(':');
+            let ci = parts.next().and_then(|s| s.parse::<usize>().ok()).unwrap_or(1);
+            let zi = parts.next().and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
+            let geo = crate::snap_overlay::compute_snap_bar_geometry(wa, 1.0);
+            if let Some(&(_, _, _, zr)) = geo.zones.iter().find(|z| z.0 == ci && z.1 == zi) {
+                let zx = (zr.loc.x + zr.size.w / 2) as f64;
+                let zy = (zr.loc.y + zr.size.h / 2) as f64;
+                self.update_drag_snap(fid, (zx, zy).into());
+            }
+        }
+        self.scene.clear_rounded_overlays();
+        if self.drag_snap.is_active() {
+            let anim_on = fx_cfg.enabled && !fx_cfg.reduced_motion;
+            let [ar, ag, ab] =
+                parse_hex_rgb(&self.config.appearance.accent_color).unwrap_or([0.22, 0.74, 0.97]);
+            let light_theme = self.config.appearance.theme == ThemeMode::NeonLight;
+
+            if let Some((preview_rect, alpha, p_anim)) = self.drag_snap.current_preview(anim_on) {
+                animating |= p_anim;
+                // Place right under the dragged window (which is raised to top of Windows layer)
+                // and above all other desktop windows, mirroring Windows 11 Snap Assist.
+                let preview_z = if self.drag_snap.dragged_window.is_some() {
+                    let count = self.space.elements().count() as i32;
+                    (count - 1).max(0) * 10 - 1
+                } else {
+                    500
+                };
+                self.scene.insert_rounded_overlay(
+                    SceneLayer::Windows,
+                    preview_z,
+                    preview_rect,
+                    fx_cfg.corner_radius.max(12.0),
+                    [ar, ag, ab, 0.22],
+                    [ar, ag, ab, 0.90],
+                    2.0,
+                    alpha,
+                );
+            }
+
+            let work_area = self.work_area();
+            if let Some((bar_geo, bar_alpha, b_anim)) =
+                self.drag_snap.current_bar(work_area, anim_on)
+            {
+                animating |= b_anim;
+                let (bar_fill, bar_border, card_fill, card_border, zone_idle, zone_idle_border) =
+                    if light_theme {
+                        (
+                            [0.95, 0.96, 0.99, 0.90],
+                            [0.10, 0.14, 0.24, 0.16],
+                            [0.86, 0.89, 0.95, 0.65],
+                            [0.10, 0.14, 0.24, 0.12],
+                            [0.72, 0.77, 0.86, 0.82],
+                            [0.10, 0.14, 0.24, 0.20],
+                        )
+                    } else {
+                        (
+                            [0.07, 0.09, 0.14, 0.92],
+                            [1.0, 1.0, 1.0, 0.20],
+                            [0.13, 0.16, 0.24, 0.72],
+                            [1.0, 1.0, 1.0, 0.12],
+                            [0.24, 0.29, 0.40, 0.78],
+                            [1.0, 1.0, 1.0, 0.18],
+                        )
+                    };
+
+                // Top-center floating Liquid Glass Snap Layouts tray
+                self.scene.insert_rounded_overlay(
+                    SceneLayer::Overview,
+                    10,
+                    bar_geo.bar_rect,
+                    16.0,
+                    bar_fill,
+                    bar_border,
+                    1.2,
+                    bar_alpha,
+                );
+                for crect in &bar_geo.cards {
+                    self.scene.insert_rounded_overlay(
+                        SceneLayer::Overview,
+                        20,
+                        *crect,
+                        9.0,
+                        card_fill,
+                        card_border,
+                        1.0,
+                        bar_alpha,
+                    );
+                }
+                for &(ci, zi, _region, zrect) in &bar_geo.zones {
+                    let hovered = self.drag_snap.hovered_bar_zone == Some((ci, zi));
+                    let (zf, zb, zw) = if hovered {
+                        ([ar, ag, ab, 0.94], [1.0, 1.0, 1.0, 0.90], 1.4)
+                    } else {
+                        (zone_idle, zone_idle_border, 0.9)
+                    };
+                    self.scene.insert_rounded_overlay(
+                        SceneLayer::Overview,
+                        30,
+                        zrect,
+                        5.0,
+                        zf,
+                        zb,
+                        zw,
+                        bar_alpha,
+                    );
+                }
+            }
+        }
         animating
     }
 
@@ -934,7 +1099,10 @@ impl NeonState {
             self.output_full_rect()
         };
 
-        if self.config.panel.visible && !self.config.panel.smart_hide {
+        if self.config.panel.visible
+            && self.config.panel.mode == neon_config::PanelMode::TopAndDock
+            && !self.config.panel.smart_hide
+        {
             let panel_h = self
                 .primary_output
                 .as_ref()
@@ -955,9 +1123,10 @@ impl NeonState {
             }
         }
 
-        // Also protect the bottom dock zone whenever dock is Always Visible so maximized apps
-        // never overlap the floating dock.
-        if !self.config.dock.auto_hide
+        // Also protect the bottom dock zone whenever a bottom dock is Always Visible so maximized
+        // and tiled apps never overlap the floating dock or combined taskbar.
+        if self.config.dock.position == DockPosition::Bottom
+            && !self.config.dock.auto_hide
             && !self.config.dock.intelligent_hide
             && self.last_dock_exclusive > 0
         {
@@ -1079,7 +1248,7 @@ impl NeonState {
         &self,
         pos: Point<f64, Logical>,
     ) -> Option<(WlSurface, Point<f64, Logical>, KeyboardInteractivity)> {
-        if self.has_visible_fullscreen_window() {
+        if self.has_visible_fullscreen_window() && !self.overview_open {
             self.layer_surface_under(pos, &[WlrLayer::Overlay])
         } else {
             self.layer_surface_under(pos, &[WlrLayer::Overlay, WlrLayer::Top])
@@ -1102,19 +1271,26 @@ impl NeonState {
                 let mut top_fg = Vec::new();
                 let mut fg = Vec::new();
                 let mut bg = Vec::new();
+                let mut chrome_bg = Vec::new();
                 for layer in map.layers_on(wlr_layer).rev() {
                     match layer.namespace() {
                         "neon-context-submenu" => top_fg.push(layer.clone()),
                         "neon-context-menu" => fg.insert(0, layer.clone()),
                         "neon-quick-settings-backdrop"
+                        | "neon-notification-center-backdrop"
                         | "neon-workspaces-backdrop"
                         | "neon-screencast-picker-backdrop"
-                        | "neon-context-menu-backdrop" => bg.push(layer.clone()),
+                        | "neon-context-menu-backdrop"
+                        | "neon-screenshot-ui" => bg.push(layer.clone()),
+                        "neon-panel" | "neon-dock" if wlr_layer == WlrLayer::Overlay => {
+                            chrome_bg.push(layer.clone());
+                        }
                         _ => fg.push(layer.clone()),
                     }
                 }
                 top_fg.extend(fg);
                 top_fg.extend(bg);
+                top_fg.extend(chrome_bg);
                 top_fg
             };
             for layer in ordered_layers {
@@ -1249,16 +1425,43 @@ impl NeonState {
                         state.states.set(xdg_toplevel::State::Fullscreen);
                         state.size = update.configure_size.map(from_wm_size);
                     }
+                    WindowMode::Tiled => {
+                        state.states.set(xdg_toplevel::State::TiledLeft);
+                        state.states.set(xdg_toplevel::State::TiledRight);
+                        state.states.set(xdg_toplevel::State::TiledTop);
+                        state.states.set(xdg_toplevel::State::TiledBottom);
+                        state.size = update.configure_size.map(from_wm_size);
+                    }
                     WindowMode::Snapped(region) => {
                         match region {
-                            SnapRegion::LeftHalf => {
+                            SnapRegion::LeftHalf
+                            | SnapRegion::LeftTwoThirds
+                            | SnapRegion::LeftThird => {
                                 state.states.set(xdg_toplevel::State::TiledLeft);
                                 state.states.set(xdg_toplevel::State::TiledTop);
                                 state.states.set(xdg_toplevel::State::TiledBottom);
                             }
-                            SnapRegion::RightHalf => {
+                            SnapRegion::RightHalf
+                            | SnapRegion::RightOneThird
+                            | SnapRegion::RightThird => {
                                 state.states.set(xdg_toplevel::State::TiledRight);
                                 state.states.set(xdg_toplevel::State::TiledTop);
+                                state.states.set(xdg_toplevel::State::TiledBottom);
+                            }
+                            SnapRegion::CenterThird => {
+                                state.states.set(xdg_toplevel::State::TiledLeft);
+                                state.states.set(xdg_toplevel::State::TiledRight);
+                                state.states.set(xdg_toplevel::State::TiledTop);
+                                state.states.set(xdg_toplevel::State::TiledBottom);
+                            }
+                            SnapRegion::TopHalf => {
+                                state.states.set(xdg_toplevel::State::TiledLeft);
+                                state.states.set(xdg_toplevel::State::TiledRight);
+                                state.states.set(xdg_toplevel::State::TiledTop);
+                            }
+                            SnapRegion::BottomHalf => {
+                                state.states.set(xdg_toplevel::State::TiledLeft);
+                                state.states.set(xdg_toplevel::State::TiledRight);
                                 state.states.set(xdg_toplevel::State::TiledBottom);
                             }
                             SnapRegion::TopLeft => {
@@ -1404,8 +1607,23 @@ impl NeonState {
                     }
                 }
             }
-            // Keep any visible `always_on_top` windows stacked above regular windows.
+            // Keep floating windows (e.g. Settings, dialogs, Super+V floated apps) stacked above
+            // tiled windows when focusing a tiled window in Auto-Tiling mode.
             let active_ws = self.wm.active_workspace_id();
+            let target_is_tiled = target_id
+                .and_then(|tid| self.wm.get(tid))
+                .map(|w| w.mode.is_tiled())
+                .unwrap_or(false);
+            if self.wm.is_auto_tiling() && target_is_tiled {
+                for float_id in self.wm.visible_floating_above_tiled_windows(active_ws) {
+                    if Some(float_id) != target_id
+                        && let Some(float_win) = self.find_window_by_id(float_id)
+                    {
+                        self.space.raise_element(&float_win, false);
+                    }
+                }
+            }
+            // Keep any visible `always_on_top` windows stacked above regular windows.
             let target_is_aot = target_id
                 .and_then(|tid| self.wm.get(tid))
                 .map(|w| w.always_on_top)
@@ -1514,18 +1732,51 @@ impl NeonState {
         }
     }
 
+    /// Starts an Android-style Material 3 Expressive window open animation springing directly out
+    /// of the most recently clicked Dock, App Drawer, or Desktop icon (when within 4 seconds).
+    pub fn animate_window_open_android(&mut self, id: WindowId, window: &Window) {
+        let now = self.now_duration();
+        let origin = self
+            .recent_launch_origin
+            .take()
+            .filter(|(_, at)| at.elapsed() < Duration::from_secs(4))
+            .map(|(pt, _)| pt);
+
+        if let Some(origin) = origin {
+            let rect = self
+                .space
+                .element_location(window)
+                .map(|loc| Rectangle::new(loc, window.geometry().size))
+                .or_else(|| {
+                    self.wm
+                        .get(id)
+                        .map(|r| Rectangle::new(from_wm_point(r.current_geometry.loc), from_wm_size(r.current_geometry.size)))
+                });
+            if let Some(rect) = rect {
+                let win_cx = rect.loc.x as f64 + rect.size.w.max(120) as f64 * 0.5;
+                let win_cy = rect.loc.y as f64 + rect.size.h.max(90) as f64 * 0.5;
+                let dx = (origin.x as f64 - win_cx).clamp(-640.0, 640.0);
+                let dy = (origin.y as f64 - win_cy).clamp(-480.0, 480.0);
+                self.effects.animate_window_open_from(id, dx, dy, 0.26, now);
+                return;
+            }
+        }
+        self.effects.animate_window_open(id, now);
+    }
+
     /// Queues a one-shot GPU closing ghost for a client-initiated window close (`×` button,
     /// `Ctrl+Q`, etc.) whenever the window was visible on the active workspace and not already
     /// playing a compositor-driven close or minimize animation.
     pub fn queue_close_ghost_if_visible(&mut self, id: WindowId, window: &Window) {
         if self.backend_name == "headless"
+            || !self.effects.config.close_animation
             || self.closing_windows.contains_key(&id)
             || self.minimizing_windows.contains_key(&id)
             || is_window_frameless_special(window)
         {
             return;
         }
-        let dur = self.effects.scaled_duration(220);
+        let dur = self.effects.scaled_duration(290);
         if dur.is_zero() {
             return;
         }
@@ -1692,23 +1943,58 @@ impl NeonState {
         None
     }
 
+    /// Explicitly sets maximize state for any window ID (Wayland or XWayland), cleanly
+    /// reflowing Hyprland Auto-Tiling workspaces both on enter and on exit.
+    pub fn set_window_maximized(&mut self, id: WindowId, maximize: bool) -> bool {
+        let ws_id = self.wm.get(id).map(|w| w.workspace_id);
+        let work_area = self.effective_work_area_for(id);
+        let Some(update) = self.wm.set_maximized(id, maximize, work_area) else {
+            return false;
+        };
+        info!(?id, mode = ?update.mode, "Updated maximize state on window");
+        if update.mode.is_tiled() && self.wm.is_auto_tiling() {
+            // Returning directly to Auto-Tiling: let workspace relayout issue one single
+            // authoritative configure + M3 morph back into the window's preserved tile slot.
+            if let Some(ws) = ws_id {
+                self.relayout_auto_tiling_for_workspace(ws);
+            }
+            self.needs_redraw = true;
+            return true;
+        }
+        self.begin_geometry_transition(id, update.configure_size);
+        if let Some(window) = self.find_window_by_id(id)
+            && let Some(x11) = window.x11_surface()
+        {
+            let _ = x11.set_maximized(update.mode.is_maximized());
+            if let (Some(loc), Some(sz)) = (update.target_location, update.configure_size) {
+                let _ = x11.configure(Rectangle::new(from_wm_point(loc), from_wm_size(sz)));
+            }
+        }
+        self.apply_layout_update(&update);
+        if self.wm.is_auto_tiling()
+            && let Some(ws) = ws_id
+        {
+            self.relayout_auto_tiling_for_workspace(ws);
+            // Keep the newly maximized window raised cleanly above the reflowed tiles behind it.
+            if update.mode.is_maximized()
+                && let Some(window) = self.find_window_by_id(id)
+            {
+                self.space.raise_element(&window, false);
+                self.sync_x11_stacking_order();
+            }
+        }
+        self.needs_redraw = true;
+        true
+    }
+
     /// Toggles maximize state for any window ID (supports both Wayland and XWayland windows).
     pub fn toggle_maximize_window(&mut self, id: WindowId) {
-        let work_area = self.effective_work_area_for(id);
-        if let Some(update) = self.wm.toggle_maximized(id, work_area) {
-            self.begin_geometry_transition(id, update.configure_size);
-            info!(?id, mode = ?update.mode, "Toggled maximize on window");
-            if let Some(window) = self.find_window_by_id(id)
-                && let Some(x11) = window.x11_surface()
-            {
-                let _ = x11.set_maximized(update.mode.is_maximized());
-                if let (Some(loc), Some(sz)) = (update.target_location, update.configure_size) {
-                    let _ = x11.configure(Rectangle::new(from_wm_point(loc), from_wm_size(sz)));
-                }
-            }
-            self.apply_layout_update(&update);
-            self.needs_redraw = true;
-        }
+        let next = !self
+            .wm
+            .get(id)
+            .map(|r| r.mode.is_maximized())
+            .unwrap_or(false);
+        self.set_window_maximized(id, next);
     }
 
     // --- Window Management & Dynamic Workspace Actions ---
@@ -1727,14 +2013,8 @@ impl NeonState {
         self.toggle_fullscreen_window(id);
     }
 
-    pub fn toggle_fullscreen_window(&mut self, id: WindowId) {
-        let currently_fs = self
-            .wm
-            .get(id)
-            .map(|r| r.mode.is_fullscreen())
-            .unwrap_or(false);
-        let entering_fs = !currently_fs;
-
+    pub fn set_window_fullscreen(&mut self, id: WindowId, entering_fs: bool) -> bool {
+        let ws_id = self.wm.get(id).map(|w| w.workspace_id);
         if let Some(window) = self.find_window_by_id(id)
             && let Some(x11) = window.x11_surface()
         {
@@ -1750,20 +2030,49 @@ impl NeonState {
         } else {
             self.effective_work_area_for(id)
         };
-        if let Some(update) = self.wm.set_fullscreen(id, entering_fs, target_rect) {
-            self.begin_geometry_transition(id, update.configure_size);
-            info!(?id, mode = ?update.mode, "Toggled fullscreen on focused window");
-            if let Some(window) = self.find_window_by_id(id)
-                && let Some(x11) = window.x11_surface()
-            {
-                let _ = x11.set_fullscreen(update.mode.is_fullscreen());
-                if let (Some(loc), Some(sz)) = (update.target_location, update.configure_size) {
-                    let _ = x11.configure(Rectangle::new(from_wm_point(loc), from_wm_size(sz)));
-                }
+        let Some(update) = self.wm.set_fullscreen(id, entering_fs, target_rect) else {
+            return false;
+        };
+        info!(?id, mode = ?update.mode, "Updated fullscreen state on window");
+        if update.mode.is_tiled() && self.wm.is_auto_tiling() {
+            if let Some(ws) = ws_id {
+                self.relayout_auto_tiling_for_workspace(ws);
             }
-            self.apply_layout_update(&update);
             self.needs_redraw = true;
+            return true;
         }
+        self.begin_geometry_transition(id, update.configure_size);
+        if let Some(window) = self.find_window_by_id(id)
+            && let Some(x11) = window.x11_surface()
+        {
+            let _ = x11.set_fullscreen(update.mode.is_fullscreen());
+            if let (Some(loc), Some(sz)) = (update.target_location, update.configure_size) {
+                let _ = x11.configure(Rectangle::new(from_wm_point(loc), from_wm_size(sz)));
+            }
+        }
+        self.apply_layout_update(&update);
+        if self.wm.is_auto_tiling()
+            && let Some(ws) = ws_id
+        {
+            self.relayout_auto_tiling_for_workspace(ws);
+            if update.mode.is_fullscreen()
+                && let Some(window) = self.find_window_by_id(id)
+            {
+                self.space.raise_element(&window, false);
+                self.sync_x11_stacking_order();
+            }
+        }
+        self.needs_redraw = true;
+        true
+    }
+
+    pub fn toggle_fullscreen_window(&mut self, id: WindowId) {
+        let currently_fs = self
+            .wm
+            .get(id)
+            .map(|r| r.mode.is_fullscreen())
+            .unwrap_or(false);
+        self.set_window_fullscreen(id, !currently_fs);
     }
 
     pub fn snap_window_by_id(&mut self, id: WindowId, region: SnapRegion) {
@@ -1782,11 +2091,355 @@ impl NeonState {
         }
     }
 
+    pub fn snap_window_explicit(&mut self, id: WindowId, region: SnapRegion) {
+        let work_area = self.effective_work_area_for(id);
+        if let Some(update) = self.wm.snap_to_region(id, region, work_area) {
+            self.begin_geometry_transition(id, update.configure_size);
+            info!(?id, mode = ?update.mode, "Snapped window via drag/layout bar");
+            if let Some(window) = self.find_window_by_id(id)
+                && let Some(x11) = window.x11_surface()
+                && let (Some(loc), Some(sz)) = (update.target_location, update.configure_size)
+            {
+                let _ = x11.configure(Rectangle::new(from_wm_point(loc), from_wm_size(sz)));
+            }
+            self.apply_layout_update(&update);
+            self.needs_redraw = true;
+        }
+    }
+
     pub fn snap_focused(&mut self, region: SnapRegion) {
         let Some(id) = self.wm.focused_id() else {
             return;
         };
         self.snap_window_by_id(id, region);
+    }
+
+    /// Applies a batch of layout updates (such as Hyprland Auto-Tiling reflow) with optional
+    /// Material 3 Expressive geometry morphs.
+    ///
+    /// - Reserves `MACOS_TITLEBAR_HEIGHT` inside tiled rects for SSD windows so their titlebars
+    ///   never protrude above the tile or overlap the Top Bar / sibling panes.
+    /// - Skips redundant configures and animations for windows whose geometry and state did not change.
+    pub fn apply_layout_updates_batch(
+        &mut self,
+        updates: Vec<WindowLayoutUpdate>,
+        animate: bool,
+    ) {
+        let mut any_applied = false;
+        for mut update in updates {
+            if update.mode.is_tiled() && self.ssd_windows.contains(&update.id) {
+                if let Some(loc) = &mut update.target_location {
+                    loc.y += MACOS_TITLEBAR_HEIGHT;
+                }
+                if let Some(sz) = &mut update.configure_size {
+                    sz.h = (sz.h - MACOS_TITLEBAR_HEIGHT).max(100);
+                }
+            }
+
+            let unchanged = if let Some(window) = self.find_window_by_id(update.id) {
+                let needs_initial = window
+                    .toplevel()
+                    .map(|t| !t.is_initial_configure_sent())
+                    .unwrap_or(false);
+                let cur_loc = self.space.element_location(&window);
+                let cur_size = window.geometry().size;
+                let loc_same = match (update.visible_on_active_workspace, update.target_location) {
+                    (true, Some(loc)) => cur_loc == Some(from_wm_point(loc)),
+                    (false, _) => cur_loc.is_none(),
+                    _ => false,
+                };
+                let size_same = update
+                    .configure_size
+                    .is_none_or(|sz| cur_size == from_wm_size(sz));
+                let state_same = window
+                    .toplevel()
+                    .map(|t| {
+                        let st = t.current_state().states;
+                        match &update.mode {
+                            WindowMode::Tiled => {
+                                st.contains(xdg_toplevel::State::TiledLeft)
+                                    && st.contains(xdg_toplevel::State::TiledRight)
+                                    && st.contains(xdg_toplevel::State::TiledTop)
+                                    && st.contains(xdg_toplevel::State::TiledBottom)
+                                    && !st.contains(xdg_toplevel::State::Maximized)
+                                    && !st.contains(xdg_toplevel::State::Fullscreen)
+                            }
+                            WindowMode::Floating => {
+                                !st.contains(xdg_toplevel::State::TiledLeft)
+                                    && !st.contains(xdg_toplevel::State::TiledRight)
+                                    && !st.contains(xdg_toplevel::State::Maximized)
+                                    && !st.contains(xdg_toplevel::State::Fullscreen)
+                            }
+                            _ => false,
+                        }
+                    })
+                    .unwrap_or(false);
+                !needs_initial && loc_same && size_same && state_same
+            } else {
+                false
+            };
+
+            if unchanged {
+                continue;
+            }
+            any_applied = true;
+
+            if animate {
+                self.begin_geometry_transition(update.id, update.configure_size);
+            }
+            if let Some(window) = self.find_window_by_id(update.id)
+                && let Some(x11) = window.x11_surface()
+            {
+                let _ = x11.set_maximized(update.mode.is_maximized());
+                let _ = x11.set_fullscreen(update.mode.is_fullscreen());
+                if let (Some(loc), Some(sz)) = (update.target_location, update.configure_size) {
+                    let _ = x11.configure(Rectangle::new(from_wm_point(loc), from_wm_size(sz)));
+                }
+            }
+            self.apply_layout_update(&update);
+        }
+        if any_applied {
+            self.needs_redraw = true;
+        }
+    }
+
+    pub fn relayout_auto_tiling_for_workspace(&mut self, ws_id: WorkspaceId) {
+        if !self.wm.is_auto_tiling() {
+            return;
+        }
+        let work_area = self.work_area();
+        let updates = self.wm.relayout_workspace_tiles(ws_id, work_area);
+        self.apply_layout_updates_batch(updates, true);
+    }
+
+    /// Enables or disables global Hyprland Auto-Tiling, reflowing all workspaces and persisting config.
+    pub fn set_auto_tiling(&mut self, enabled: bool, persist: bool) {
+        self.config.windows.auto_tiling = enabled;
+        let work_area = self.work_area();
+        let updates = self.wm.set_auto_tiling(enabled, work_area);
+        self.apply_layout_updates_batch(updates, true);
+        info!(enabled, layout = ?self.wm.tiling_layout(), "Updated Hyprland Auto-Tiling");
+        if persist && self.backend_name != "headless" {
+            let cfg_path = neon_config::default_config_path();
+            if let Err(err) = neon_config::save_atomic(&cfg_path, &self.config) {
+                warn!(?err, "Failed to persist auto-tiling toggle");
+            }
+        }
+    }
+
+    pub fn toggle_auto_tiling(&mut self) {
+        let next = !self.wm.is_auto_tiling();
+        self.set_auto_tiling(next, true);
+    }
+
+    pub fn cycle_tiling_layout(&mut self) {
+        let next = match self.config.windows.tiling_layout {
+            ConfigTilingLayout::Dwindle => ConfigTilingLayout::MasterStack,
+            ConfigTilingLayout::MasterStack => ConfigTilingLayout::Dwindle,
+        };
+        self.set_tiling_layout(next, true);
+    }
+
+    pub fn set_tiling_layout(&mut self, layout: ConfigTilingLayout, persist: bool) {
+        self.config.windows.tiling_layout = layout;
+        let wm_layout = match layout {
+            ConfigTilingLayout::Dwindle => WmTilingLayout::Dwindle,
+            ConfigTilingLayout::MasterStack => WmTilingLayout::MasterStack,
+        };
+        let work_area = self.work_area();
+        let updates = self.wm.set_tiling_layout(wm_layout, work_area);
+        self.apply_layout_updates_batch(updates, true);
+        info!(?layout, "Updated Hyprland Auto-Tiling layout");
+        if persist && self.backend_name != "headless" {
+            let cfg_path = neon_config::default_config_path();
+            if let Err(err) = neon_config::save_atomic(&cfg_path, &self.config) {
+                warn!(?err, "Failed to persist tiling layout");
+            }
+        }
+    }
+
+    pub fn toggle_window_float(&mut self, target_id: Option<WindowId>) {
+        let Some(id) = target_id.or_else(|| self.wm.focused_id()) else {
+            return;
+        };
+        let work_area = self.effective_work_area_for(id);
+        let updates = self.wm.toggle_window_float(id, work_area);
+        info!(?id, count = updates.len(), "Toggled window floating override");
+        self.apply_layout_updates_batch(updates, true);
+        // Ensure a newly floated window rises cleanly above the tiled layer.
+        if self.wm.is_auto_tiling()
+            && self.wm.get(id).is_some_and(|w| w.mode.is_floating())
+            && let Some(window) = self.find_window_by_id(id)
+        {
+            self.space.raise_element(&window, false);
+            self.sync_x11_stacking_order();
+        }
+    }
+
+    pub fn focus_tiled_in_direction(&mut self, dx: i32, dy: i32, serial: Serial) {
+        if !self.wm.is_auto_tiling() {
+            return;
+        }
+        let Some(cur_id) = self.wm.focused_id() else {
+            self.focus_topmost_window(serial);
+            return;
+        };
+        if let Some(target_id) = self.wm.focus_tiled_in_direction(cur_id, dx, dy)
+            && let Some(window) = self.find_window_by_id(target_id)
+        {
+            self.focus_window(Some(&window), serial);
+            self.needs_redraw = true;
+        }
+    }
+
+    pub fn swap_focused_tile_in_direction(&mut self, dx: i32, dy: i32) {
+        if !self.wm.is_auto_tiling() {
+            return;
+        }
+        let Some(id) = self.wm.focused_id() else {
+            return;
+        };
+        let work_area = self.work_area();
+        let updates = self.wm.swap_tiled_in_direction(id, dx, dy, work_area);
+        if !updates.is_empty() {
+            self.apply_layout_updates_batch(updates, true);
+        }
+    }
+
+    pub fn resize_focused_tile(&mut self, dx: f32, dy: f32) {
+        if !self.wm.is_auto_tiling() {
+            return;
+        }
+        let Some(id) = self.wm.focused_id() else {
+            return;
+        };
+        let work_area = self.work_area();
+        let updates = self.wm.resize_tiled_window(id, dx, dy, work_area);
+        if !updates.is_empty() {
+            self.apply_layout_updates_batch(updates, true);
+        }
+    }
+
+    pub fn reset_active_workspace_tile_ratios(&mut self) {
+        if !self.wm.is_auto_tiling() {
+            return;
+        }
+        let ws = self.wm.active_workspace_id();
+        let work_area = self.work_area();
+        let updates = self.wm.reset_workspace_split_ratios(ws, work_area);
+        if !updates.is_empty() {
+            self.apply_layout_updates_batch(updates, true);
+        }
+    }
+
+    pub fn toggle_focused_split_orientation(&mut self) {
+        if !self.wm.is_auto_tiling() {
+            return;
+        }
+        let Some(id) = self.wm.focused_id() else {
+            return;
+        };
+        let work_area = self.work_area();
+        let updates = self.wm.toggle_split_orientation(id, work_area);
+        if !updates.is_empty() {
+            self.apply_layout_updates_batch(updates, true);
+        }
+    }
+
+    pub fn promote_focused_to_master(&mut self) {
+        if !self.wm.is_auto_tiling() {
+            return;
+        }
+        let Some(id) = self.wm.focused_id() else {
+            return;
+        };
+        let work_area = self.work_area();
+        let updates = self.wm.promote_to_master(id, work_area);
+        if !updates.is_empty() {
+            self.apply_layout_updates_batch(updates, true);
+        }
+    }
+
+    /// Updates live drag-to-edge / Windows 11 Snap Layouts bar / Auto-Tiling drag-swap preview.
+    pub fn update_drag_snap(&mut self, dragged_id: WindowId, pointer: Point<f64, Logical>) {
+        let anim_on = self.effects.config.enabled && !self.effects.config.reduced_motion;
+        let is_tiled = self
+            .wm
+            .get(dragged_id)
+            .map(|w| w.mode.is_tiled())
+            .unwrap_or(false);
+        if self.wm.is_auto_tiling() && is_tiled {
+            let ws_id = self
+                .wm
+                .get(dragged_id)
+                .map(|w| w.workspace_id)
+                .unwrap_or_else(|| self.wm.active_workspace_id());
+            let target = self.wm.tiled_window_at_point(
+                ws_id,
+                pointer.x.round() as i32,
+                pointer.y.round() as i32,
+                dragged_id,
+            );
+            self.drag_snap
+                .update_tiling_swap(dragged_id, target, anim_on);
+        } else {
+            let work_area = self.effective_work_area_for(dragged_id);
+            self.drag_snap.update_floating_drag(
+                dragged_id,
+                pointer.x,
+                pointer.y,
+                work_area,
+                self.wm.snap_gap(),
+                self.config.windows.auto_snap,
+                self.config.windows.snap_layouts_bar,
+                anim_on,
+            );
+        }
+        self.needs_redraw = true;
+    }
+
+    /// Commits the active drag snap/maximize/tile-swap target on pointer release and clears overlay.
+    pub fn commit_drag_snap(&mut self, dragged_id: WindowId) {
+        let target = self.drag_snap.target;
+        self.drag_snap.clear();
+
+        let is_tiled = self
+            .wm
+            .get(dragged_id)
+            .map(|w| w.mode.is_tiled())
+            .unwrap_or(false);
+
+        match target {
+            Some(DragSnapTarget::Region(region)) => {
+                self.snap_window_explicit(dragged_id, region);
+            }
+            Some(DragSnapTarget::Maximize) => {
+                let is_max = self
+                    .wm
+                    .get(dragged_id)
+                    .map(|w| w.mode.is_maximized())
+                    .unwrap_or(false);
+                if !is_max {
+                    self.toggle_maximize_window(dragged_id);
+                }
+            }
+            Some(DragSnapTarget::SwapTile { target_id, .. }) => {
+                let work_area = self.work_area();
+                let updates = self
+                    .wm
+                    .swap_tiled_windows(dragged_id, target_id, work_area);
+                self.apply_layout_updates_batch(updates, true);
+            }
+            None => {
+                // If dragging a tiled window and released without swapping, snap smoothly back to its tile.
+                if is_tiled
+                    && let Some(ws_id) = self.wm.get(dragged_id).map(|w| w.workspace_id)
+                {
+                    self.relayout_auto_tiling_for_workspace(ws_id);
+                }
+            }
+        }
+        self.needs_redraw = true;
     }
 
     pub fn toggle_always_on_top_by_id(&mut self, id: WindowId, serial: Serial) -> Option<bool> {
@@ -1798,6 +2451,8 @@ impl NeonState {
     }
 
     pub fn center_window_by_id(&mut self, id: WindowId) -> bool {
+        let ws_id = self.wm.get(id).map(|w| w.workspace_id);
+        let was_tiled = self.wm.get(id).is_some_and(|w| w.mode.is_tiled());
         let work_area = self.effective_work_area_for(id);
         let Some(update) = self.wm.center_window(id, work_area) else {
             return false;
@@ -1813,11 +2468,26 @@ impl NeonState {
             }
         }
         self.apply_layout_update(&update);
+        if was_tiled
+            && self.wm.is_auto_tiling()
+            && let Some(ws) = ws_id
+        {
+            self.relayout_auto_tiling_for_workspace(ws);
+            if let Some(window) = self.find_window_by_id(id) {
+                self.space.raise_element(&window, false);
+                self.sync_x11_stacking_order();
+            }
+        }
         self.needs_redraw = true;
         true
     }
 
     pub fn set_floating_window_by_id(&mut self, id: WindowId) -> bool {
+        let ws_id = self.wm.get(id).map(|w| w.workspace_id);
+        let was_tiled = self.wm.get(id).is_some_and(|w| w.mode.is_tiled());
+        if self.wm.is_auto_tiling() {
+            self.wm.set_float_override(id, true);
+        }
         let work_area = self.effective_work_area_for(id);
         let Some(update) = self.wm.set_floating(id, work_area) else {
             return false;
@@ -1833,6 +2503,16 @@ impl NeonState {
             }
         }
         self.apply_layout_update(&update);
+        if was_tiled
+            && self.wm.is_auto_tiling()
+            && let Some(ws) = ws_id
+        {
+            self.relayout_auto_tiling_for_workspace(ws);
+            if let Some(window) = self.find_window_by_id(id) {
+                self.space.raise_element(&window, false);
+                self.sync_x11_stacking_order();
+            }
+        }
         self.needs_redraw = true;
         true
     }
@@ -1880,12 +2560,26 @@ impl NeonState {
         let Some(id) = self.wm.focused_id() else {
             return;
         };
-        let is_floating = self
+        let mode = self
             .wm
             .get(id)
-            .map(|w| w.mode.is_floating())
-            .unwrap_or(false);
-        if is_floating {
+            .map(|w| w.mode.clone())
+            .unwrap_or(WindowMode::Floating);
+        if self.wm.is_auto_tiling() {
+            match mode {
+                WindowMode::Maximized => {
+                    self.set_window_maximized(id, false);
+                }
+                WindowMode::Fullscreen => {
+                    self.set_window_fullscreen(id, false);
+                }
+                _ => {
+                    self.minimize_window(id, serial);
+                }
+            }
+            return;
+        }
+        if mode.is_floating() {
             self.minimize_window(id, serial);
         } else {
             let work_area = self.effective_work_area_for(id);
@@ -1927,20 +2621,20 @@ impl NeonState {
         }
     }
 
-    /// Subtle directional pull toward the window's Dock icon for closing animations so closing
-    /// feels anchored to the Dock without mimicking a full minimize swoop.
+    /// Android-style return-to-icon directional glide toward the window's Dock icon on close.
     fn close_swoop_delta_for(&self, id: WindowId) -> (f64, f64) {
         let (dx, dy) = self.dock_swoop_delta_for(id);
-        let pull_x = (dx * 0.16).clamp(-56.0, 56.0);
+        let pull_x = (dx * 0.56).clamp(-300.0, 300.0);
         let pull_y = match self.config.dock.position {
-            DockPosition::Bottom => (dy * 0.16).clamp(16.0, 52.0),
-            DockPosition::Left | DockPosition::Right => (dy * 0.16).clamp(-36.0, 36.0),
+            DockPosition::Bottom => (dy * 0.56).clamp(64.0, 260.0),
+            DockPosition::Left | DockPosition::Right => (dy * 0.56).clamp(-220.0, 220.0),
         };
         (pull_x, pull_y)
     }
 
     pub fn minimize_window(&mut self, id: WindowId, serial: Serial) {
         let (dx, dy) = self.dock_swoop_delta_for(id);
+        let ws_id = self.wm.get(id).map(|w| w.workspace_id);
         let work_area = self.work_area();
         if let Some(update) = self.wm.minimize(id, work_area) {
             info!(?id, "Minimized window");
@@ -1953,6 +2647,9 @@ impl NeonState {
                 // Keep window visible in Space while it swoops smoothly into its Dock icon.
                 self.minimizing_windows.insert(id, now + dur);
                 self.needs_redraw = true;
+            }
+            if let Some(ws) = ws_id {
+                self.relayout_auto_tiling_for_workspace(ws);
             }
             self.focus_topmost_window(serial);
         }
@@ -1987,7 +2684,17 @@ impl NeonState {
         self.minimizing_windows.remove(&id);
         self.pending_geometry_anims.remove(&id);
         self.last_rendered_rects.remove(&id);
-        self.apply_layout_update(&update);
+        let tile_on_restore = self.wm.is_auto_tiling() && self.wm.is_tile_eligible(id);
+        if tile_on_restore {
+            if let Some(ws) = self.wm.get(id).map(|w| w.workspace_id) {
+                self.relayout_auto_tiling_for_workspace(ws);
+            }
+        } else {
+            self.apply_layout_update(&update);
+            if let Some(ws) = self.wm.get(id).map(|w| w.workspace_id) {
+                self.relayout_auto_tiling_for_workspace(ws);
+            }
+        }
         let (dx, dy) = self.dock_swoop_delta_for(id);
         let now = self.now_duration();
         self.effects.animate_window_restore(id, dx, dy, now);
@@ -2011,7 +2718,17 @@ impl NeonState {
             self.minimizing_windows.remove(&update.id);
             self.pending_geometry_anims.remove(&update.id);
             self.last_rendered_rects.remove(&update.id);
-            self.apply_layout_update(&update);
+            let tile_on_restore = self.wm.is_auto_tiling() && self.wm.is_tile_eligible(update.id);
+            if tile_on_restore {
+                if let Some(ws) = self.wm.get(update.id).map(|w| w.workspace_id) {
+                    self.relayout_auto_tiling_for_workspace(ws);
+                }
+            } else {
+                self.apply_layout_update(&update);
+                if let Some(ws) = self.wm.get(update.id).map(|w| w.workspace_id) {
+                    self.relayout_auto_tiling_for_workspace(ws);
+                }
+            }
             let (dx, dy) = self.dock_swoop_delta_for(update.id);
             let now = self.now_duration();
             self.effects.animate_window_restore(update.id, dx, dy, now);
@@ -2143,6 +2860,11 @@ impl NeonState {
             return false;
         }
         self.outgoing_workspace_windows.clear();
+        if self.wm.is_auto_tiling() {
+            let wa = self.work_area();
+            let updates = self.wm.relayout_all_tiles(wa);
+            self.apply_layout_updates_batch(updates, true);
+        }
         self.sync_active_workspace_space(serial);
         self.needs_redraw = true;
         info!(
@@ -2174,22 +2896,26 @@ impl NeonState {
     ) -> Option<WorkspaceId> {
         let id = self.wm.focused_id()?;
         let old_ws = self.wm.active_workspace_id();
-        let new_ws = self.wm.move_window_to_next_workspace(id, follow)?;
-        if follow && new_ws != old_ws {
-            self.begin_workspace_transition(1, Some(id));
+        if let Some(new_ws) = self.wm.move_window_to_next_workspace(id, follow) {
+            if follow && new_ws != old_ws {
+                self.begin_workspace_transition(1, Some(id));
+            }
+            self.relayout_auto_tiling_for_workspace(old_ws);
+            self.relayout_auto_tiling_for_workspace(new_ws);
+            info!(
+                ?id,
+                workspace = ?new_ws,
+                follow,
+                total = self.wm.workspaces().len(),
+                "Moved focused window to next workspace"
+            );
+            self.sync_active_workspace_space(serial);
+            if follow && let Some(window) = self.find_window_by_id(id) {
+                self.focus_window(Some(&window), serial);
+            }
+            return Some(new_ws);
         }
-        info!(
-            ?id,
-            workspace = ?new_ws,
-            follow,
-            total = self.wm.workspaces().len(),
-            "Moved focused window to next workspace"
-        );
-        self.sync_active_workspace_space(serial);
-        if follow && let Some(window) = self.find_window_by_id(id) {
-            self.focus_window(Some(&window), serial);
-        }
-        Some(new_ws)
+        None
     }
 
     pub fn move_focused_to_prev_workspace(
@@ -2203,6 +2929,8 @@ impl NeonState {
         if follow && new_ws != old_ws {
             self.begin_workspace_transition(-1, Some(id));
         }
+        self.relayout_auto_tiling_for_workspace(old_ws);
+        self.relayout_auto_tiling_for_workspace(new_ws);
         info!(
             ?id,
             workspace = ?new_ws,
@@ -2217,9 +2945,14 @@ impl NeonState {
         Some(new_ws)
     }
 
-    /// Re-lays out maximized/fullscreen/snapped windows when the output or exclusive zone changes,
+    /// Re-lays out maximized/fullscreen/snapped/tiled windows when the output or exclusive zone changes,
     /// strictly preserving existing window Z-order.
     pub fn relayout_non_floating_windows(&mut self) {
+        if self.wm.is_auto_tiling() {
+            let wa = self.work_area();
+            let updates = self.wm.relayout_all_tiles(wa);
+            self.apply_layout_updates_batch(updates, false);
+        }
         let full_rect = self.output_full_rect();
         let ids: Vec<(WindowId, WindowMode)> = self
             .wm
@@ -2227,7 +2960,8 @@ impl NeonState {
             .into_iter()
             .filter_map(|id| {
                 let mode = self.wm.get(id)?.mode.clone();
-                (!mode.is_floating() && !mode.is_minimized()).then_some((id, mode))
+                (!mode.is_floating() && !mode.is_minimized() && !mode.is_tiled())
+                    .then_some((id, mode))
             })
             .collect();
 
@@ -2424,7 +3158,11 @@ impl NeonState {
             .collect();
 
         let mut lost_focus = false;
+        let mut affected_workspaces: HashSet<WorkspaceId> = HashSet::new();
         for id in dead_ids {
+            if let Some(ws_id) = self.wm.get(id).map(|w| w.workspace_id) {
+                affected_workspaces.insert(ws_id);
+            }
             if let Some(window) = self.managed_windows.remove(&id) {
                 self.queue_close_ghost_if_visible(id, &window);
                 self.space.unmap_elem(&window);
@@ -2438,6 +3176,9 @@ impl NeonState {
             if self.hovered_titlebar_window == Some(id) {
                 self.hovered_titlebar_window = None;
             }
+            if self.drag_snap.dragged_window == Some(id) {
+                self.drag_snap.clear();
+            }
             if self.wm.focused_id() == Some(id) {
                 lost_focus = true;
             }
@@ -2446,6 +3187,12 @@ impl NeonState {
             self.scene.remove_window(id);
             self.outgoing_workspace_windows.retain(|w| w.id != id);
             debug!(?id, "Cleaned up dead window");
+        }
+
+        if self.wm.is_auto_tiling() {
+            for ws_id in affected_workspaces {
+                self.relayout_auto_tiling_for_workspace(ws_id);
+            }
         }
 
         self.override_redirect_windows.retain(|w| {
