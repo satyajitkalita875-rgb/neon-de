@@ -4120,19 +4120,17 @@ button.neon-island-icon-pill {{
     background-color: #1C1C1E;
     border: 1px solid rgba(255, 255, 255, 0.08);
     box-shadow: none;
-    border-radius: 13px;
-    min-width: 26px;
-    min-height: 26px;
+    border-radius: 15px;
+    min-width: 28px;
+    min-height: 28px;
     padding: 0;
     color: #E5E5EA;
-    transition: background-color {d_fast_fx}ms {m3_fast_fx},
-                transform {d_fast_sp}ms {m3_fast_sp};
+    transition: background-color {d_fast_fx}ms {m3_fast_fx};
 }}
 
 button.neon-island-icon-pill:hover {{
     background-color: #2C2C2E;
     color: #FFFFFF;
-    transform: scale(1.06);
 }}
 
 button.neon-island-icon-pill.active {{
@@ -4442,9 +4440,9 @@ button.neon-notch-dock-btn {{
     background-color: transparent;
     border: none;
     box-shadow: none;
-    border-radius: 13px;
-    min-width: 30px;
-    min-height: 26px;
+    border-radius: 14px;
+    min-width: 34px;
+    min-height: 28px;
     padding: 0;
     color: #98989F;
     transition: background-color {d_fast_fx}ms {m3_fast_fx};
@@ -4809,11 +4807,15 @@ button.neon-notch-tool-tile:hover {{
     border-color: rgba(255, 255, 255, 0.16);
 }}
 
-.neon-island-calc-box {{
+.neon-island-calc-input-box {{
     background-color: #1C1C1E;
     border: 1px solid rgba(255, 255, 255, 0.08);
-    border-radius: 12px;
-    padding: 4px 6px;
+    border-radius: 14px;
+    padding: 8px 14px;
+}}
+
+.neon-island-calc-input-box:focus-within {{
+    border-color: alpha({accent}, 0.58);
 }}
 
 entry.neon-island-calc-entry {{
@@ -4821,35 +4823,53 @@ entry.neon-island-calc-entry {{
     background-color: transparent;
     border: none;
     box-shadow: none;
-    font-family: "JetBrains Mono", monospace;
-    font-size: 13px;
+    outline: none;
+    padding: 0;
+    min-height: 28px;
+    font-family: "JetBrains Mono", "Fira Code", monospace;
+    font-size: 16px;
+    font-weight: 500;
     color: #FFFFFF;
+    caret-color: {accent};
 }}
 
-button.neon-island-calc-res {{
-    background-image: none;
-    background-color: rgba(48, 209, 88, 0.20);
-    border: 1px solid rgba(48, 209, 88, 0.50);
-    box-shadow: none;
-    border-radius: 9px;
-    padding: 3px 10px;
-    font-family: "JetBrains Mono", monospace;
-    font-size: 13px;
-    font-weight: 700;
-    color: #30D158;
+entry.neon-island-calc-entry text placeholder {{
+    color: rgba(255, 255, 255, 0.22);
 }}
 
-button.neon-notch-color-chip {{
+button.neon-island-calc-ans-box {{
     background-image: none;
     background-color: #1C1C1E;
     border: 1px solid rgba(255, 255, 255, 0.08);
     box-shadow: none;
-    border-radius: 10px;
-    padding: 4px 8px;
+    border-radius: 14px;
+    padding: 8px 14px;
+    transition: background-color {d_fast_fx}ms {m3_fast_fx},
+                border-color {d_fast_fx}ms {m3_fast_fx};
 }}
 
-button.neon-notch-color-chip:hover {{
+button.neon-island-calc-ans-box:hover {{
     background-color: #2C2C2E;
+    border-color: rgba(255, 255, 255, 0.16);
+}}
+
+.neon-island-calc-eq {{
+    font-family: "JetBrains Mono", "Fira Code", monospace;
+    font-size: 20px;
+    font-weight: 700;
+    color: #8E8E93;
+}}
+
+.neon-island-calc-hero {{
+    font-family: "JetBrains Mono", "Fira Code", monospace;
+    font-size: 24px;
+    font-weight: 700;
+    color: #30D158;
+    font-feature-settings: "tnum";
+}}
+
+.neon-island-calc-hero.empty {{
+    color: #48484A;
 }}
 
 .neon-island-stat-val {{
@@ -4904,23 +4924,43 @@ button.neon-island-awake-btn.active {{
     color: #000000;
 }}
 
-scale.neon-island-slider trough {{
+scale.neon-island-slider {{
+    padding: 8px 0;
+    margin: 0;
+}}
+
+scale.neon-island-slider > trough {{
+    background-image: none;
     background-color: #3A3A3C;
-    border-radius: 5px;
+    border: none;
+    box-shadow: none;
+    outline: none;
+    border-radius: 999px;
     min-height: 6px;
 }}
 
-scale.neon-island-slider trough highlight {{
+scale.neon-island-slider > trough > highlight {{
+    background-image: none;
     background-color: #FFFFFF;
-    border-radius: 5px;
+    border: none;
+    box-shadow: none;
+    margin: 0;
+    border-radius: 999px;
 }}
 
-scale.neon-island-slider slider {{
+scale.neon-island-slider > trough > slider,
+scale.neon-island-slider > trough > slider:hover,
+scale.neon-island-slider > trough > slider:active {{
+    background-image: none;
     background-color: #FFFFFF;
-    border-radius: 8px;
-    min-width: 14px;
-    min-height: 14px;
-    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.45);
+    border: none;
+    outline: none;
+    border-radius: 999px;
+    min-width: 16px;
+    min-height: 16px;
+    margin: -5px 0;
+    padding: 0;
+    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.52);
 }}
 
 .neon-island-store-pad {{

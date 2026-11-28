@@ -464,7 +464,8 @@ pub fn draw_notch_backdrop(
         }
     }
 
-    // 2. Smooth multi-step Gaussian outer aura for File Dock drag-hover or active album-art neon.
+    // 2. Smooth multi-step Gaussian outer aura ONLY for File Dock drag-hover or active Recording
+    //    (media playback uses an interior dark-AMOLED animated gradient instead of an outer border glow).
     let neon = neon_intensity.clamp(0.0, 1.0);
     if drag_hover {
         for i in (1..=12).rev() {
@@ -480,25 +481,6 @@ pub fn draw_notch_backdrop(
                 r + expand * 0.5,
             );
             cr.set_source_rgba(0.04, 0.52, 1.0, alpha);
-            cr.set_line_width(2.2);
-            let _ = cr.stroke();
-        }
-    } else if neon > 0.01 {
-        let pulse = 0.90 + 0.10 * (neon_phase * 1.4).sin();
-        for i in (1..=12).rev() {
-            let t = f64::from(i) / 12.0;
-            let expand = 0.8 + 11.0 * t * t;
-            let a = (0.044 * (-2.3 * t * t).exp() * neon * pulse).clamp(0.0, 0.12);
-            let grad = rotating_neon_gradient(x, y, w, h, neon_phase, palette, a);
-            trace_rim(
-                cr,
-                x - expand * 0.5,
-                y - expand * 0.5,
-                w + expand,
-                h + expand,
-                r + expand * 0.5,
-            );
-            let _ = cr.set_source(&grad);
             cr.set_line_width(2.2);
             let _ = cr.stroke();
         }
@@ -521,7 +503,7 @@ pub fn draw_notch_backdrop(
         }
     }
 
-    // 3. Pure `#000000` Apple OLED fill (high-contrast, pixel-snapped edges).
+    // 3. Pure `#000000` Apple OLED fill + subtle dark-AMOLED left-to-right song-color gradient inside.
     let _ = cr.save();
     trace_closed(cr, x, y, w, h, r);
     cr.clip();
@@ -541,9 +523,13 @@ pub fn draw_notch_backdrop(
             let _ = cr.fill();
         }
     }
+
+    if neon > 0.01 {
+        draw_amoled_media_sweep(cr, x, y, w, h, er, neon_phase, palette, neon);
+    }
     let _ = cr.restore();
 
-    // 4. Crisp 1px pixel-centered border (`x + 0.5`, `y + 0.5`).
+    // 4. Crisp 1px pixel-centered neutral hairline border (`x + 0.5`, `y + 0.5` — no colored media border).
     trace_rim(
         cr,
         x + 0.5,
@@ -554,11 +540,6 @@ pub fn draw_notch_backdrop(
     );
     if drag_hover {
         cr.set_source_rgba(0.04, 0.52, 1.0, 0.95);
-        cr.set_line_width(1.5);
-        let _ = cr.stroke();
-    } else if neon > 0.01 {
-        let border_grad = rotating_neon_gradient(x, y, w, h, neon_phase, palette, 0.90 * neon);
-        let _ = cr.set_source(&border_grad);
         cr.set_line_width(1.5);
         let _ = cr.stroke();
     } else if aura_kind == IslandAuraKind::Recording {
@@ -1291,41 +1272,73 @@ pub fn draw_hud_bar(
     }
 }
 
-fn rotating_neon_gradient(
+/// Draws a subtle, organic dark-AMOLED ambient gradient tinted by the active song's album-art
+/// palette directly inside the clipped black notch surface, drifting along non-repeating 2D paths.
+#[allow(clippy::too_many_arguments)]
+fn draw_amoled_media_sweep(
+    cr: &cairo::Context,
     x: f64,
     y: f64,
     w: f64,
     h: f64,
-    angle: f64,
+    er: f64,
+    neon_phase: f64,
     palette: NeonPalette,
-    alpha: f64,
-) -> cairo::LinearGradient {
-    let cx = x + w * 0.5;
-    let cy = y + h * 0.5;
-    let rx = w * 0.56;
-    let ry = h * 0.62;
-    let dx = angle.cos() * rx;
-    let dy = angle.sin() * ry;
+    neon: f64,
+) {
+    let intensity = neon.clamp(0.0, 1.0);
+    if intensity <= 0.005 {
+        return;
+    }
 
-    let grad = cairo::LinearGradient::new(cx - dx, cy - dy, cx + dx, cy + dy);
-    let a = alpha.clamp(0.0, 1.0);
-    grad.add_color_stop_rgba(0.0, palette.primary.r, palette.primary.g, palette.primary.b, a);
-    grad.add_color_stop_rgba(
-        0.36,
-        palette.secondary.r,
-        palette.secondary.g,
-        palette.secondary.b,
-        a,
-    );
-    grad.add_color_stop_rgba(
-        0.72,
-        palette.tertiary.r,
-        palette.tertiary.g,
-        palette.tertiary.b,
-        a,
-    );
-    grad.add_color_stop_rgba(1.0, palette.primary.r, palette.primary.g, palette.primary.b, a);
-    grad
+    let t = neon_phase;
+    let span = w.max(h).max(160.0);
+
+    // Three softly breathing radial color clouds wandering along mutually-prime harmonic 2D paths
+    // (organic, random-feeling AMOLED mesh motion with zero linear sweep or obvious loop).
+    let blobs = [
+        (
+            palette.primary,
+            x + w * (0.50 + 0.36 * (t * 0.41 + 0.3).sin() * (t * 0.17 + 1.1).cos() + 0.12 * (t * 0.73).cos()),
+            y + h * (0.48 + 0.34 * (t * 0.33 + 1.7).cos() + 0.14 * (t * 0.67 + 0.5).sin()),
+            span * (0.52 + 0.09 * (t * 0.53 + 0.8).sin()),
+            (0.34 + 0.07 * (t * 0.47).sin()) * intensity,
+        ),
+        (
+            palette.secondary,
+            x + w * (0.50 + 0.38 * (t * 0.29 + 2.4).cos() + 0.14 * (t * 0.61 + 0.9).sin()),
+            y + h * (0.52 + 0.32 * (t * 0.47 + 0.4).sin() * (t * 0.23 + 2.0).cos()),
+            span * (0.48 + 0.08 * (t * 0.39 + 2.1).cos()),
+            (0.27 + 0.06 * (t * 0.59 + 1.4).cos()) * intensity,
+        ),
+        (
+            palette.tertiary,
+            x + w * (0.50 + 0.34 * (t * 0.53 + 4.1).sin() + 0.15 * (t * 0.23 + 1.5).cos()),
+            y + h * (0.46 + 0.34 * (t * 0.37 + 3.0).cos() + 0.12 * (t * 0.71 + 0.2).sin()),
+            span * (0.44 + 0.07 * (t * 0.43 + 3.2).sin()),
+            (0.21 + 0.05 * (t * 0.31 + 2.6).sin()) * intensity,
+        ),
+    ];
+
+    for (rgb, cx, cy, rad, alpha) in blobs {
+        let g = cairo::RadialGradient::new(cx, cy, 0.0, cx, cy, rad.max(48.0));
+        g.add_color_stop_rgba(0.00, rgb.r, rgb.g, rgb.b, alpha);
+        g.add_color_stop_rgba(0.48, rgb.r, rgb.g, rgb.b, alpha * 0.52);
+        g.add_color_stop_rgba(1.00, rgb.r, rgb.g, rgb.b, 0.0);
+        let _ = cr.set_source(&g);
+        cr.rectangle(x - er - 2.0, y - 2.0, w + er * 2.0 + 4.0, h + 4.0);
+        let _ = cr.fill();
+    }
+
+    // Gentle AMOLED depth vignette so the glow dissolves cleanly into pure black near the edges.
+    let vig = cairo::LinearGradient::new(x, y, x, y + h);
+    vig.add_color_stop_rgba(0.0, 0.0, 0.0, 0.0, 0.10);
+    vig.add_color_stop_rgba(0.35, 0.0, 0.0, 0.0, 0.0);
+    vig.add_color_stop_rgba(0.78, 0.0, 0.0, 0.0, 0.08);
+    vig.add_color_stop_rgba(1.0, 0.0, 0.0, 0.0, 0.22);
+    let _ = cr.set_source(&vig);
+    cr.rectangle(x - er - 2.0, y - 2.0, w + er * 2.0 + 4.0, h + 4.0);
+    let _ = cr.fill();
 }
 
 pub fn rounded_rect_path(cr: &cairo::Context, x: f64, y: f64, w: f64, h: f64, r: f64) {
@@ -1461,7 +1474,13 @@ pub fn draw_module_badge_tile(cr: &cairo::Context, w: f64, h: f64, module: Notch
     cr.set_line_width(1.0);
     let _ = cr.stroke();
 
-    draw_module_vector_icon(cr, w, h, module, (1.0, 1.0, 1.0, 0.98));
+    let inner = (w.min(h) * 0.64).round();
+    let ox = ((w - inner) * 0.5).round();
+    let oy = ((h - inner) * 0.5).round();
+    let _ = cr.save();
+    cr.translate(ox, oy);
+    draw_module_vector_icon(cr, inner, inner, module, (1.0, 1.0, 1.0, 0.98));
+    let _ = cr.restore();
 }
 
 /// Draws a crisp circular Pin / Unpin toggle button (`Antialias::Best`).
@@ -1506,7 +1525,13 @@ pub fn draw_round_pin_button(
     } else {
         (0.72, 0.72, 0.75, 0.95)
     };
-    draw_ui_vector_icon(cr, w, h, UiVectorIcon::Pin { pinned }, fg);
+    let inner = (w.min(h) * 0.64).round();
+    let ox = ((w - inner) * 0.5).round();
+    let oy = ((h - inner) * 0.5).round();
+    let _ = cr.save();
+    cr.translate(ox, oy);
+    draw_ui_vector_icon(cr, inner, inner, UiVectorIcon::Pin { pinned }, fg);
+    let _ = cr.restore();
 }
 
 /// Draws a crisp circular icon button (e.g. Close `×`, Check `✓`, Remove badge).
@@ -1528,10 +1553,17 @@ pub fn draw_round_circle_button(
     cr.set_source_rgba(bg.0, bg.1, bg.2, bg.3);
     let _ = cr.fill();
 
-    draw_ui_vector_icon(cr, w, h, icon, fg);
+    let inner = (w.min(h) * 0.62).round();
+    let ox = ((w - inner) * 0.5).round();
+    let oy = ((h - inner) * 0.5).round();
+    let _ = cr.save();
+    cr.translate(ox, oy);
+    draw_ui_vector_icon(cr, inner, inner, icon, fg);
+    let _ = cr.restore();
 }
 
-/// Draws razor-sharp anti-aliased vector glyphs for all 13 `NotchModule`s.
+/// Draws razor-sharp anti-aliased SF-style vector glyphs for all 13 `NotchModule`s.
+/// Engineered for 1× (`1920×1080`) clarity: fills ~80% of the canvas with bold silhouettes & clean gaps.
 pub fn draw_module_vector_icon(
     cr: &cairo::Context,
     w: f64,
@@ -1546,192 +1578,198 @@ pub fn draw_module_vector_icon(
 
     let cx = w * 0.5;
     let cy = h * 0.5;
-    // Normalize onto a 16x16 coordinate space scaled smoothly to `w.min(h)`.
-    let s = (w.min(h) / 24.0).clamp(0.55, 1.8);
-    let lw = (1.65 * s).max(1.3);
+    // Scale onto a 16-unit icon grid so coordinates in [-6.5, +6.5] fill ~81% of `w × h`!
+    let s = (w.min(h) / 16.0).clamp(0.75, 2.5);
+    let lw = (1.55 * s).clamp(1.4, 2.8);
     cr.set_line_width(lw);
 
     match module {
         NotchModule::Home => {
-            // Smooth roof + house walls + door
+            // Bold SF-style filled house with crisp arched roof & bottom cutout door
             cr.new_sub_path();
-            cr.move_to(cx - 6.8 * s, cy - 0.4 * s);
-            cr.line_to(cx, cy - 6.4 * s);
-            cr.line_to(cx + 6.8 * s, cy - 0.4 * s);
-            let _ = cr.stroke();
-
-            cr.new_sub_path();
-            cr.move_to(cx - 4.8 * s, cy - 1.6 * s);
-            cr.line_to(cx - 4.8 * s, cy + 5.8 * s);
-            cr.line_to(cx + 4.8 * s, cy + 5.8 * s);
-            cr.line_to(cx + 4.8 * s, cy - 1.6 * s);
-            let _ = cr.stroke();
-
-            rounded_rect_path(cr, cx - 1.5 * s, cy + 1.5 * s, 3.0 * s, 4.3 * s, 1.0 * s);
+            cr.move_to(cx, cy - 6.2 * s);
+            cr.line_to(cx + 6.4 * s, cy - 0.4 * s);
+            cr.line_to(cx + 4.8 * s, cy - 0.4 * s);
+            cr.line_to(cx + 4.8 * s, cy + 5.6 * s);
+            cr.line_to(cx + 1.5 * s, cy + 5.6 * s);
+            cr.line_to(cx + 1.5 * s, cy + 1.6 * s);
+            cr.line_to(cx - 1.5 * s, cy + 1.6 * s);
+            cr.line_to(cx - 1.5 * s, cy + 5.6 * s);
+            cr.line_to(cx - 4.8 * s, cy + 5.6 * s);
+            cr.line_to(cx - 4.8 * s, cy - 0.4 * s);
+            cr.line_to(cx - 6.4 * s, cy - 0.4 * s);
+            cr.close_path();
             let _ = cr.fill();
         }
         NotchModule::Media => {
-            // Beamed eighth notes
+            // Bold Apple Music double eighth-note silhouette
             cr.new_sub_path();
-            cr.move_to(cx - 2.8 * s, cy - 5.2 * s);
-            cr.line_to(cx + 5.4 * s, cy - 6.8 * s);
-            cr.line_to(cx + 5.4 * s, cy - 4.0 * s);
-            cr.line_to(cx - 2.8 * s, cy - 2.4 * s);
+            cr.move_to(cx - 2.4 * s, cy - 4.8 * s);
+            cr.line_to(cx + 5.4 * s, cy - 6.4 * s);
+            cr.line_to(cx + 5.4 * s, cy - 3.6 * s);
+            cr.line_to(cx - 2.4 * s, cy - 2.0 * s);
             cr.close_path();
             let _ = cr.fill();
 
-            cr.move_to(cx - 2.1 * s, cy - 4.2 * s);
-            cr.line_to(cx - 2.1 * s, cy + 4.4 * s);
-            cr.move_to(cx + 4.7 * s, cy - 5.6 * s);
-            cr.line_to(cx + 4.7 * s, cy + 3.0 * s);
+            cr.set_line_width((1.7 * s).max(1.6));
+            cr.move_to(cx - 1.6 * s, cy - 3.6 * s);
+            cr.line_to(cx - 1.6 * s, cy + 4.2 * s);
+            cr.move_to(cx + 4.6 * s, cy - 5.0 * s);
+            cr.line_to(cx + 4.6 * s, cy + 2.8 * s);
             let _ = cr.stroke();
 
             cr.new_sub_path();
-            cr.arc(cx - 4.2 * s, cy + 4.6 * s, 2.3 * s, 0.0, TAU);
+            cr.arc(cx - 3.6 * s, cy + 4.4 * s, 2.2 * s, 0.0, TAU);
             let _ = cr.fill();
             cr.new_sub_path();
-            cr.arc(cx + 2.6 * s, cy + 3.2 * s, 2.3 * s, 0.0, TAU);
+            cr.arc(cx + 2.6 * s, cy + 3.0 * s, 2.2 * s, 0.0, TAU);
             let _ = cr.fill();
         }
         NotchModule::Timer => {
-            // Stopwatch circle + top crown + hand
+            // Crisp stopwatch ring + top crown + bold dial hands
+            cr.set_line_width((1.65 * s).max(1.55));
             cr.new_sub_path();
-            cr.arc(cx, cy + 1.0 * s, 5.6 * s, 0.0, TAU);
+            cr.arc(cx, cy + 1.0 * s, 5.2 * s, 0.0, TAU);
             let _ = cr.stroke();
-            cr.move_to(cx - 2.0 * s, cy - 6.6 * s);
-            cr.line_to(cx + 2.0 * s, cy - 6.6 * s);
-            cr.move_to(cx, cy - 6.6 * s);
-            cr.line_to(cx, cy - 4.8 * s);
+            rounded_rect_path(cr, cx - 2.2 * s, cy - 6.6 * s, 4.4 * s, 1.7 * s, 0.85 * s);
+            let _ = cr.fill();
             cr.move_to(cx, cy + 1.0 * s);
-            cr.line_to(cx + 2.8 * s, cy - 1.6 * s);
+            cr.line_to(cx, cy - 1.8 * s);
+            cr.move_to(cx, cy + 1.0 * s);
+            cr.line_to(cx + 2.4 * s, cy + 1.0 * s);
             let _ = cr.stroke();
         }
         NotchModule::Clipboard => {
-            // Rounded board + top clip pill
-            rounded_rect_path(cr, cx - 5.0 * s, cy - 4.8 * s, 10.0 * s, 11.2 * s, 2.0 * s);
+            // Crisp rounded clipboard with bold top clasp & two clean lines
+            rounded_rect_path(cr, cx - 4.8 * s, cy - 4.4 * s, 9.6 * s, 10.6 * s, 2.0 * s);
             let _ = cr.stroke();
-            rounded_rect_path(cr, cx - 2.6 * s, cy - 6.4 * s, 5.2 * s, 2.8 * s, 1.2 * s);
+            rounded_rect_path(cr, cx - 2.6 * s, cy - 6.3 * s, 5.2 * s, 3.0 * s, 1.3 * s);
             let _ = cr.fill();
-            cr.move_to(cx - 2.6 * s, cy + 0.0 * s);
-            cr.line_to(cx + 2.6 * s, cy + 0.0 * s);
-            cr.move_to(cx - 2.6 * s, cy + 3.0 * s);
-            cr.line_to(cx + 1.6 * s, cy + 3.0 * s);
+            cr.set_line_width((1.45 * s).max(1.4));
+            cr.move_to(cx - 2.2 * s, cy + 0.2 * s);
+            cr.line_to(cx + 2.2 * s, cy + 0.2 * s);
+            cr.move_to(cx - 2.2 * s, cy + 3.2 * s);
+            cr.line_to(cx + 1.2 * s, cy + 3.2 * s);
             let _ = cr.stroke();
         }
         NotchModule::Files => {
-            // Smooth macOS/OnePlus File Dock folder
+            // Bold SF-style filled rounded folder silhouette (razor sharp at 16px!)
+            let r = 1.6 * s;
+            let left = cx - 6.2 * s;
+            let right = cx + 6.2 * s;
+            let top = cy - 4.8 * s;
+            let tab_y = cy - 2.4 * s;
+            let bot = cy + 5.0 * s;
             cr.new_sub_path();
-            cr.move_to(cx - 6.2 * s, cy - 3.6 * s);
-            cr.line_to(cx - 6.2 * s, cy + 4.8 * s);
-            cr.line_to(cx + 6.2 * s, cy + 4.8 * s);
-            cr.line_to(cx + 6.2 * s, cy - 2.2 * s);
-            cr.line_to(cx + 0.4 * s, cy - 2.2 * s);
-            cr.line_to(cx - 1.4 * s, cy - 4.4 * s);
-            cr.line_to(cx - 5.4 * s, cy - 4.4 * s);
+            cr.move_to(left, top + r);
+            cr.arc(left + r, top + r, r, PI, 1.5 * PI);
+            cr.line_to(cx - 1.5 * s, top);
+            cr.line_to(cx + 0.4 * s, tab_y);
+            cr.line_to(right - r, tab_y);
+            cr.arc(right - r, tab_y + r, r, -0.5 * PI, 0.0);
+            cr.line_to(right, bot - r);
+            cr.arc(right - r, bot - r, r, 0.0, 0.5 * PI);
+            cr.line_to(left + r, bot);
+            cr.arc(left + r, bot - r, r, 0.5 * PI, PI);
             cr.close_path();
-            let _ = cr.stroke();
+            let _ = cr.fill();
         }
         NotchModule::Notes => {
-            // Rounded square + diagonal pencil
-            rounded_rect_path(cr, cx - 5.6 * s, cy - 5.2 * s, 10.4 * s, 10.8 * s, 2.2 * s);
+            // Crisp rounded notepad + bold diagonal pencil
+            rounded_rect_path(cr, cx - 5.4 * s, cy - 4.8 * s, 9.8 * s, 10.4 * s, 2.0 * s);
             let _ = cr.stroke();
-            cr.move_to(cx - 1.2 * s, cy + 1.8 * s);
-            cr.line_to(cx + 5.6 * s, cy - 5.0 * s);
-            let _ = cr.stroke();
-            cr.move_to(cx - 2.8 * s, cy - 1.4 * s);
-            cr.line_to(cx + 0.8 * s, cy - 1.4 * s);
+            cr.set_line_width((1.8 * s).max(1.7));
+            cr.move_to(cx - 1.0 * s, cy + 1.6 * s);
+            cr.line_to(cx + 5.4 * s, cy - 4.8 * s);
             let _ = cr.stroke();
         }
         NotchModule::Calendar => {
-            rounded_rect_path(cr, cx - 5.6 * s, cy - 4.8 * s, 11.2 * s, 10.8 * s, 2.2 * s);
+            // Crisp calendar frame + solid top bar + date dots
+            rounded_rect_path(cr, cx - 5.4 * s, cy - 4.6 * s, 10.8 * s, 10.4 * s, 2.0 * s);
             let _ = cr.stroke();
-            cr.move_to(cx - 5.4 * s, cy - 1.4 * s);
-            cr.line_to(cx + 5.4 * s, cy - 1.4 * s);
-            cr.move_to(cx - 2.8 * s, cy - 6.4 * s);
-            cr.line_to(cx - 2.8 * s, cy - 3.8 * s);
-            cr.move_to(cx + 2.8 * s, cy - 6.4 * s);
-            cr.line_to(cx + 2.8 * s, cy - 3.8 * s);
+            rounded_rect_path(cr, cx - 5.2 * s, cy - 4.4 * s, 10.4 * s, 3.4 * s, 1.4 * s);
+            let _ = cr.fill();
+            cr.move_to(cx - 2.6 * s, cy - 6.2 * s);
+            cr.line_to(cx - 2.6 * s, cy - 3.6 * s);
+            cr.move_to(cx + 2.6 * s, cy - 6.2 * s);
+            cr.line_to(cx + 2.6 * s, cy - 3.6 * s);
             let _ = cr.stroke();
             cr.new_sub_path();
-            cr.arc(cx - 2.2 * s, cy + 2.2 * s, 1.1 * s, 0.0, TAU);
+            cr.arc(cx - 2.1 * s, cy + 2.2 * s, 1.15 * s, 0.0, TAU);
             let _ = cr.fill();
             cr.new_sub_path();
-            cr.arc(cx + 2.2 * s, cy + 2.2 * s, 1.1 * s, 0.0, TAU);
+            cr.arc(cx + 2.1 * s, cy + 2.2 * s, 1.15 * s, 0.0, TAU);
             let _ = cr.fill();
         }
         NotchModule::Tools => {
-            // Sleek sliders / control toggles
-            cr.move_to(cx - 5.6 * s, cy - 3.0 * s);
-            cr.line_to(cx + 5.6 * s, cy - 3.0 * s);
-            cr.move_to(cx - 5.6 * s, cy + 3.0 * s);
-            cr.line_to(cx + 5.6 * s, cy + 3.0 * s);
+            // Well-separated sleek horizontal control sliders with bold filled knobs
+            cr.set_line_width((1.6 * s).max(1.5));
+            cr.move_to(cx - 5.6 * s, cy - 3.2 * s);
+            cr.line_to(cx + 5.6 * s, cy - 3.2 * s);
+            cr.move_to(cx - 5.6 * s, cy + 3.2 * s);
+            cr.line_to(cx + 5.6 * s, cy + 3.2 * s);
             let _ = cr.stroke();
             cr.new_sub_path();
-            cr.arc(cx - 1.8 * s, cy - 3.0 * s, 2.1 * s, 0.0, TAU);
+            cr.arc(cx - 1.8 * s, cy - 3.2 * s, 2.2 * s, 0.0, TAU);
             let _ = cr.fill();
             cr.new_sub_path();
-            cr.arc(cx + 2.0 * s, cy + 3.0 * s, 2.1 * s, 0.0, TAU);
+            cr.arc(cx + 2.0 * s, cy + 3.2 * s, 2.2 * s, 0.0, TAU);
             let _ = cr.fill();
         }
         NotchModule::Stats => {
-            // Smooth activity waveform pulse
+            // Bold activity waveform pulse
+            cr.set_line_width((1.75 * s).max(1.65));
             cr.new_sub_path();
             cr.move_to(cx - 6.4 * s, cy + 0.6 * s);
-            cr.line_to(cx - 3.2 * s, cy + 0.6 * s);
-            cr.line_to(cx - 1.2 * s, cy - 4.8 * s);
-            cr.line_to(cx + 1.4 * s, cy + 4.8 * s);
-            cr.line_to(cx + 3.4 * s, cy + 0.6 * s);
+            cr.line_to(cx - 3.0 * s, cy + 0.6 * s);
+            cr.line_to(cx - 1.1 * s, cy - 4.8 * s);
+            cr.line_to(cx + 1.3 * s, cy + 4.8 * s);
+            cr.line_to(cx + 3.2 * s, cy + 0.6 * s);
             cr.line_to(cx + 6.4 * s, cy + 0.6 * s);
             let _ = cr.stroke();
         }
         NotchModule::Battery => {
-            rounded_rect_path(cr, cx - 6.4 * s, cy - 3.8 * s, 11.2 * s, 7.6 * s, 2.0 * s);
+            // Bold rounded battery + terminal nub + charge bar
+            rounded_rect_path(cr, cx - 6.2 * s, cy - 3.8 * s, 10.8 * s, 7.6 * s, 2.0 * s);
             let _ = cr.stroke();
-            rounded_rect_path(cr, cx + 5.6 * s, cy - 1.6 * s, 1.6 * s, 3.2 * s, 0.8 * s);
+            rounded_rect_path(cr, cx + 5.4 * s, cy - 1.7 * s, 1.8 * s, 3.4 * s, 0.9 * s);
             let _ = cr.fill();
-            // Lightning bolt inside
-            cr.new_sub_path();
-            cr.move_to(cx - 0.2 * s, cy - 2.6 * s);
-            cr.line_to(cx - 2.2 * s, cy + 0.4 * s);
-            cr.line_to(cx + 0.2 * s, cy + 0.4 * s);
-            cr.line_to(cx - 1.2 * s, cy + 2.6 * s);
-            cr.line_to(cx + 1.6 * s, cy - 0.4 * s);
-            cr.line_to(cx - 0.6 * s, cy - 0.4 * s);
-            cr.close_path();
+            rounded_rect_path(cr, cx - 4.2 * s, cy - 1.8 * s, 6.6 * s, 3.6 * s, 1.0 * s);
             let _ = cr.fill();
         }
         NotchModule::Awake => {
-            // Crisp crescent moon
+            // Bold smooth crescent moon
             cr.new_sub_path();
-            cr.arc(cx + 0.4 * s, cy, 5.4 * s, 0.22 * PI, 1.62 * PI);
-            cr.arc_negative(cx + 3.2 * s, cy - 1.8 * s, 4.4 * s, 1.48 * PI, 0.36 * PI);
+            cr.arc(cx + 0.3 * s, cy, 5.4 * s, 0.22 * PI, 1.62 * PI);
+            cr.arc_negative(cx + 3.1 * s, cy - 1.8 * s, 4.4 * s, 1.48 * PI, 0.36 * PI);
             cr.close_path();
             let _ = cr.fill();
         }
         NotchModule::Hud => {
-            // Speaker + 2 smooth sound waves
+            // Bold SF speaker cone + two well-spaced crisp sound waves
             cr.new_sub_path();
-            cr.move_to(cx - 5.8 * s, cy - 2.0 * s);
-            cr.line_to(cx - 3.2 * s, cy - 2.0 * s);
-            cr.line_to(cx - 0.2 * s, cy - 4.8 * s);
-            cr.line_to(cx - 0.2 * s, cy + 4.8 * s);
-            cr.line_to(cx - 3.2 * s, cy + 2.0 * s);
-            cr.line_to(cx - 5.8 * s, cy + 2.0 * s);
+            cr.move_to(cx - 6.0 * s, cy - 2.2 * s);
+            cr.line_to(cx - 3.4 * s, cy - 2.2 * s);
+            cr.line_to(cx - 0.4 * s, cy - 5.0 * s);
+            cr.line_to(cx - 0.4 * s, cy + 5.0 * s);
+            cr.line_to(cx - 3.4 * s, cy + 2.2 * s);
+            cr.line_to(cx - 6.0 * s, cy + 2.2 * s);
             cr.close_path();
             let _ = cr.fill();
 
+            cr.set_line_width((1.55 * s).max(1.5));
             cr.new_sub_path();
-            cr.arc(cx + 0.2 * s, cy, 3.2 * s, -0.32 * PI, 0.32 * PI);
+            cr.arc(cx + 0.2 * s, cy, 3.1 * s, -0.32 * PI, 0.32 * PI);
             let _ = cr.stroke();
             cr.new_sub_path();
-            cr.arc(cx + 0.2 * s, cy, 5.8 * s, -0.34 * PI, 0.34 * PI);
+            cr.arc(cx + 0.2 * s, cy, 5.7 * s, -0.34 * PI, 0.34 * PI);
             let _ = cr.stroke();
         }
         NotchModule::Store => {
-            // 2x2 rounded squircle grid (`⊞`)
+            // Bold 2×2 filled rounded squircle grid (crystal clear at 16px—zero 1px holes!)
             let box_s = 4.6 * s;
-            let gap = 2.0 * s;
-            let r = 1.3 * s;
+            let gap = 2.2 * s;
+            let r = 1.4 * s;
             for (dx, dy) in [
                 (-gap * 0.5 - box_s, -gap * 0.5 - box_s),
                 (gap * 0.5, -gap * 0.5 - box_s),
@@ -1739,7 +1777,7 @@ pub fn draw_module_vector_icon(
                 (gap * 0.5, gap * 0.5),
             ] {
                 rounded_rect_path(cr, cx + dx, cy + dy, box_s, box_s, r);
-                let _ = cr.stroke();
+                let _ = cr.fill();
             }
         }
     }
@@ -1760,8 +1798,8 @@ pub fn draw_ui_vector_icon(
 
     let cx = w * 0.5;
     let cy = h * 0.5;
-    let s = (w.min(h) / 24.0).clamp(0.50, 2.0);
-    let lw = (1.75 * s).max(1.35);
+    let s = (w.min(h) / 16.0).clamp(0.70, 2.6);
+    let lw = (1.65 * s).clamp(1.45, 3.0);
     cr.set_line_width(lw);
 
     match kind {
@@ -1770,14 +1808,12 @@ pub fn draw_ui_vector_icon(
             let _ = cr.save();
             cr.translate(cx, cy);
             cr.rotate(PI * 0.22);
-            // Top cap
             rounded_rect_path(cr, -3.2 * s, -5.6 * s, 6.4 * s, 2.2 * s, 1.0 * s);
             if pinned {
                 let _ = cr.fill();
             } else {
                 let _ = cr.stroke();
             }
-            // Flared body
             cr.new_sub_path();
             cr.move_to(-2.1 * s, -3.4 * s);
             cr.line_to(-3.6 * s, 1.0 * s);
@@ -1789,7 +1825,6 @@ pub fn draw_ui_vector_icon(
             } else {
                 let _ = cr.stroke();
             }
-            // Needle
             cr.move_to(0.0, 1.2 * s);
             cr.line_to(0.0, 5.8 * s);
             let _ = cr.stroke();
@@ -1804,11 +1839,11 @@ pub fn draw_ui_vector_icon(
             let _ = cr.stroke();
         }
         UiVectorIcon::Check => {
-            cr.set_line_width((2.1 * s).max(1.6));
+            cr.set_line_width((2.0 * s).max(1.8));
             cr.new_sub_path();
-            cr.move_to(cx - 4.6 * s, cy + 0.2 * s);
-            cr.line_to(cx - 1.2 * s, cy + 3.6 * s);
-            cr.line_to(cx + 4.8 * s, cy - 3.2 * s);
+            cr.move_to(cx - 4.4 * s, cy + 0.2 * s);
+            cr.line_to(cx - 1.1 * s, cy + 3.6 * s);
+            cr.line_to(cx + 4.6 * s, cy - 3.2 * s);
             let _ = cr.stroke();
         }
         UiVectorIcon::Plus => {
@@ -1821,7 +1856,7 @@ pub fn draw_ui_vector_icon(
         }
         UiVectorIcon::Refresh => {
             cr.new_sub_path();
-            cr.arc(cx, cy, 4.8 * s, -0.35 * PI, 1.35 * PI);
+            cr.arc(cx, cy, 4.6 * s, -0.35 * PI, 1.35 * PI);
             let _ = cr.stroke();
             cr.new_sub_path();
             cr.move_to(cx + 1.8 * s, cy - 5.2 * s);
@@ -1832,36 +1867,38 @@ pub fn draw_ui_vector_icon(
         UiVectorIcon::Volume { muted } => {
             draw_module_vector_icon(cr, w, h, NotchModule::Hud, rgba);
             if muted {
-                cr.set_line_width((1.9 * s).max(1.5));
-                cr.move_to(cx - 5.0 * s, cy - 5.0 * s);
-                cr.line_to(cx + 5.0 * s, cy + 5.0 * s);
+                cr.set_line_width((1.8 * s).max(1.6));
+                cr.move_to(cx - 5.2 * s, cy - 5.2 * s);
+                cr.line_to(cx + 5.2 * s, cy + 5.2 * s);
                 let _ = cr.stroke();
             }
         }
         UiVectorIcon::Brightness => {
+            // Bold Apple SF sun: solid center + 8 cleanly separated tapered rays
             cr.new_sub_path();
             cr.arc(cx, cy, 3.0 * s, 0.0, TAU);
             let _ = cr.fill();
+            cr.set_line_width((1.55 * s).max(1.5));
             for k in 0..8 {
                 let a = (k as f64) * (TAU / 8.0);
                 cr.move_to(cx + a.cos() * 4.8 * s, cy + a.sin() * 4.8 * s);
-                cr.line_to(cx + a.cos() * 6.6 * s, cy + a.sin() * 6.6 * s);
+                cr.line_to(cx + a.cos() * 6.5 * s, cy + a.sin() * 6.5 * s);
             }
             let _ = cr.stroke();
         }
         UiVectorIcon::Screenshot => {
-            rounded_rect_path(cr, cx - 6.2 * s, cy - 3.8 * s, 12.4 * s, 8.8 * s, 2.2 * s);
+            rounded_rect_path(cr, cx - 5.8 * s, cy - 3.6 * s, 11.6 * s, 8.4 * s, 2.2 * s);
             let _ = cr.stroke();
             cr.new_sub_path();
-            cr.arc(cx, cy + 0.6 * s, 2.4 * s, 0.0, TAU);
-            let _ = cr.stroke();
-            cr.move_to(cx - 2.4 * s, cy - 5.2 * s);
-            cr.line_to(cx + 2.4 * s, cy - 5.2 * s);
+            cr.arc(cx, cy + 0.6 * s, 2.2 * s, 0.0, TAU);
+            let _ = cr.fill();
+            cr.move_to(cx - 2.2 * s, cy - 5.0 * s);
+            cr.line_to(cx + 2.2 * s, cy - 5.0 * s);
             let _ = cr.stroke();
         }
         UiVectorIcon::Record => {
             cr.new_sub_path();
-            cr.arc(cx, cy, 5.6 * s, 0.0, TAU);
+            cr.arc(cx, cy, 5.4 * s, 0.0, TAU);
             let _ = cr.stroke();
             cr.set_source_rgba(1.0, 0.23, 0.19, 0.98);
             cr.new_sub_path();
@@ -1872,21 +1909,21 @@ pub fn draw_ui_vector_icon(
             draw_module_vector_icon(cr, w, h, NotchModule::Files, rgba);
         }
         UiVectorIcon::ImageFile => {
-            rounded_rect_path(cr, cx - 5.8 * s, cy - 5.2 * s, 11.6 * s, 10.4 * s, 2.2 * s);
+            rounded_rect_path(cr, cx - 5.6 * s, cy - 5.0 * s, 11.2 * s, 10.0 * s, 2.0 * s);
             let _ = cr.stroke();
             cr.new_sub_path();
-            cr.arc(cx - 2.4 * s, cy - 1.8 * s, 1.3 * s, 0.0, TAU);
+            cr.arc(cx - 2.2 * s, cy - 1.6 * s, 1.3 * s, 0.0, TAU);
             let _ = cr.fill();
             cr.new_sub_path();
-            cr.move_to(cx - 4.8 * s, cy + 3.8 * s);
+            cr.move_to(cx - 4.4 * s, cy + 3.6 * s);
             cr.line_to(cx - 1.0 * s, cy + 0.2 * s);
-            cr.line_to(cx + 1.6 * s, cy + 2.4 * s);
-            cr.line_to(cx + 3.4 * s, cy + 0.6 * s);
-            cr.line_to(cx + 5.0 * s, cy + 3.8 * s);
+            cr.line_to(cx + 1.5 * s, cy + 2.4 * s);
+            cr.line_to(cx + 3.2 * s, cy + 0.6 * s);
+            cr.line_to(cx + 4.8 * s, cy + 3.6 * s);
             let _ = cr.stroke();
         }
         UiVectorIcon::ArchiveFile => {
-            rounded_rect_path(cr, cx - 5.2 * s, cy - 6.0 * s, 10.4 * s, 12.0 * s, 2.0 * s);
+            rounded_rect_path(cr, cx - 5.0 * s, cy - 5.6 * s, 10.0 * s, 11.2 * s, 2.0 * s);
             let _ = cr.stroke();
             for k in -2..=2 {
                 let yy = cy + f64::from(k) * 1.8 * s;
@@ -1896,13 +1933,13 @@ pub fn draw_ui_vector_icon(
             let _ = cr.stroke();
         }
         UiVectorIcon::DocFile => {
-            rounded_rect_path(cr, cx - 5.0 * s, cy - 6.0 * s, 10.0 * s, 12.0 * s, 2.0 * s);
+            rounded_rect_path(cr, cx - 4.8 * s, cy - 5.6 * s, 9.6 * s, 11.2 * s, 2.0 * s);
             let _ = cr.stroke();
-            cr.move_to(cx - 2.6 * s, cy - 2.0 * s);
-            cr.line_to(cx + 2.6 * s, cy - 2.0 * s);
-            cr.move_to(cx - 2.6 * s, cy + 0.8 * s);
-            cr.line_to(cx + 2.6 * s, cy + 0.8 * s);
-            cr.move_to(cx - 2.6 * s, cy + 3.4 * s);
+            cr.move_to(cx - 2.4 * s, cy - 1.8 * s);
+            cr.line_to(cx + 2.4 * s, cy - 1.8 * s);
+            cr.move_to(cx - 2.4 * s, cy + 0.8 * s);
+            cr.line_to(cx + 2.4 * s, cy + 0.8 * s);
+            cr.move_to(cx - 2.4 * s, cy + 3.4 * s);
             cr.line_to(cx + 0.8 * s, cy + 3.4 * s);
             let _ = cr.stroke();
         }

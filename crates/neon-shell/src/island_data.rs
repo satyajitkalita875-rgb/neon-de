@@ -100,7 +100,7 @@ impl NotchModule {
             Self::Files => "Drop, zip & drag out",
             Self::Notes => "Markdown scratchpad",
             Self::Calendar => "7-day agenda & events",
-            Self::Tools => "Calc, capture & colors",
+            Self::Tools => "Capture & quick calc",
             Self::Stats => "CPU, RAM, Net & Disk",
             Self::Battery => "Power & Bluetooth",
             Self::Awake => "Prevent system sleep",

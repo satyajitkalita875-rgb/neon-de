@@ -78,7 +78,7 @@ const EXPANDED_EAR_R: f64 = 16.0;
 const COMPACT_BOTTOM_R: f64 = 18.0;
 const EXPANDED_BOTTOM_R: f64 = 36.0;
 const DOCK_GAP: i32 = 4;
-const DOCK_H: i32 = 50;
+const DOCK_H: i32 = 54;
 
 type VoidCallback = Rc<RefCell<Option<Box<dyn Fn()>>>>;
 type BoolCallback = Rc<RefCell<Option<Box<dyn Fn(bool)>>>>;
@@ -319,7 +319,8 @@ impl IslandState {
         }
     }
 
-    fn is_stealth_sensor(&self) -> bool {
+    /// True when the island's target state is the invisible `260×5px` top-edge sensor over an app.
+    fn wants_stealth_sensor(&self) -> bool {
         self.combined_mode
             && self.island_enabled
             && !self.locked
@@ -337,6 +338,15 @@ impl IslandState {
             && !self.drag_hover
             && !self.outgoing_drag
             && !self.test_force_expand
+    }
+
+    /// True only once the island has finished its closing spring and settled into stealth mode.
+    fn is_stealth_sensor(&self) -> bool {
+        self.wants_stealth_sensor()
+            && !self.morph.target_expanded
+            && self.morph.alpha.value <= 0.02
+            && (self.morph.w.value - self.morph.w.target).abs() <= 2.0
+            && (self.morph.h.value - self.morph.h.target).abs() <= 2.0
     }
 }
 
@@ -430,10 +440,10 @@ pub struct DynamicIsland {
     cal_month_lbl: Label,
     cal_days_strip: GtkBox,
     cal_agenda_box: GtkBox,
-    // Quick Tools page widgets
+    // Quick Tools (Keyboard Quick Calculator) widgets
+    tools_calc_entry: Entry,
     tools_calc_result_btn: Button,
     tools_calc_result_lbl: Label,
-    tools_colors_box: GtkBox,
     // System Stats page widgets
     stats_cpu_lbl: Label,
     stats_cpu_sub: Label,
@@ -1309,14 +1319,15 @@ impl DynamicIsland {
         drawer_stack.add_named(&cal_page, Some("calendar"));
 
         // ---------------------------------------------------------------------
-        // MODULE 8: QUICK TOOLS (Exact Little Notch Tiles + Live Calc + Recent Colors!)
+        // MODULE 8: QUICK TOOLS (2×2 Quick Tiles + Keyboard-First Quick Calculator)
         // ---------------------------------------------------------------------
         let tools_page = GtkBox::new(Orientation::Horizontal, 14);
         tools_page.add_css_class("neon-island-page-pad");
-        tools_page.set_size_request(534, 206);
+        tools_page.set_size_request(534, 184);
 
         let tools_grid = GtkBox::new(Orientation::Vertical, 8);
         tools_grid.set_width_request(208);
+        tools_grid.set_valign(Align::Center);
         let tg_r1 = GtkBox::new(Orientation::Horizontal, 8);
         tg_r1.set_homogeneous(true);
         let tg_r2 = GtkBox::new(Orientation::Horizontal, 8);
@@ -1333,31 +1344,48 @@ impl DynamicIsland {
         tools_grid.append(&tg_r1);
         tools_grid.append(&tg_r2);
 
-        let tools_right = GtkBox::new(Orientation::Vertical, 10);
+        let tools_right = GtkBox::new(Orientation::Vertical, 8);
         tools_right.set_hexpand(true);
-        let calc_row = GtkBox::new(Orientation::Horizontal, 8);
-        calc_row.add_css_class("neon-island-calc-box");
+        tools_right.set_vexpand(true);
+        tools_right.set_homogeneous(true);
+
+        // Upper box: expression input with subtle low-opacity +/- example placeholder
+        let calc_in_box = GtkBox::new(Orientation::Horizontal, 0);
+        calc_in_box.add_css_class("neon-island-calc-input-box");
+        calc_in_box.set_hexpand(true);
+        calc_in_box.set_vexpand(true);
         let tools_calc_entry = Entry::new();
+        tools_calc_entry.set_placeholder_text(Some("24 + 16 - 5"));
         tools_calc_entry.add_css_class("neon-island-calc-entry");
-        tools_calc_entry.set_placeholder_text(Some("12 * 4.5 + 8%"));
         tools_calc_entry.set_hexpand(true);
+        tools_calc_entry.set_valign(Align::Center);
+        calc_in_box.append(&tools_calc_entry);
+
+        // Lower box: `=` mark on left + live answer on right (click or Enter copies)
         let tools_calc_result_btn = Button::new();
-        tools_calc_result_btn.add_css_class("neon-island-calc-res");
-        tools_calc_result_btn.set_tooltip_text(Some("Click to copy result"));
-        let tools_calc_result_lbl = Label::new(Some("= —"));
-        tools_calc_result_btn.set_child(Some(&tools_calc_result_lbl));
-        calc_row.append(&tools_calc_entry);
-        calc_row.append(&tools_calc_result_btn);
+        tools_calc_result_btn.add_css_class("neon-island-calc-ans-box");
+        tools_calc_result_btn.set_hexpand(true);
+        tools_calc_result_btn.set_vexpand(true);
+        tools_calc_result_btn.set_tooltip_text(Some("Press Enter or click to copy"));
+        let ans_row = GtkBox::new(Orientation::Horizontal, 10);
+        ans_row.set_valign(Align::Center);
+        ans_row.set_hexpand(true);
+        let eq_lbl = Label::new(Some("="));
+        eq_lbl.add_css_class("neon-island-calc-eq");
+        eq_lbl.set_halign(Align::Start);
+        let tools_calc_result_lbl = Label::new(Some("0"));
+        tools_calc_result_lbl.add_css_class("neon-island-calc-hero");
+        tools_calc_result_lbl.add_css_class("empty");
+        tools_calc_result_lbl.set_hexpand(true);
+        tools_calc_result_lbl.set_halign(Align::End);
+        tools_calc_result_lbl.set_xalign(1.0);
+        tools_calc_result_lbl.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+        ans_row.append(&eq_lbl);
+        ans_row.append(&tools_calc_result_lbl);
+        tools_calc_result_btn.set_child(Some(&ans_row));
 
-        let colors_head = Label::new(Some("Recent colors (from Clipboard)"));
-        colors_head.add_css_class("neon-island-eyebrow");
-        colors_head.set_halign(Align::Start);
-        let tools_colors_box = GtkBox::new(Orientation::Horizontal, 8);
-        tools_colors_box.set_hexpand(true);
-
-        tools_right.append(&calc_row);
-        tools_right.append(&colors_head);
-        tools_right.append(&tools_colors_box);
+        tools_right.append(&calc_in_box);
+        tools_right.append(&tools_calc_result_btn);
         tools_page.append(&tools_grid);
         tools_page.append(&tools_right);
         drawer_stack.add_named(&tools_page, Some("tools"));
@@ -1561,12 +1589,15 @@ impl DynamicIsland {
         vol_head.append(&hud_vol_sink);
         vol_head.append(&hud_vol_pct);
 
-        let vol_row = GtkBox::new(Orientation::Horizontal, 8);
+        let vol_row = GtkBox::new(Orientation::Horizontal, 10);
         vol_row.set_valign(Align::Center);
         let hud_mute_btn = Button::new();
         hud_mute_btn.add_css_class("neon-island-icon-pill");
+        hud_mute_btn.set_size_request(30, 30);
+        hud_mute_btn.set_halign(Align::Center);
+        hud_mute_btn.set_valign(Align::Center);
         let hud_mute_canvas = DrawingArea::new();
-        hud_mute_canvas.set_size_request(16, 16);
+        hud_mute_canvas.set_size_request(18, 18);
         hud_mute_canvas.set_halign(Align::Center);
         hud_mute_canvas.set_valign(Align::Center);
         hud_mute_canvas.set_can_target(false);
@@ -1588,14 +1619,22 @@ impl DynamicIsland {
         br_head.append(&br_title);
         br_head.append(&hud_bright_pct);
 
-        let br_row = GtkBox::new(Orientation::Horizontal, 8);
+        let br_row = GtkBox::new(Orientation::Horizontal, 10);
         br_row.set_valign(Align::Center);
-        let br_ic = build_vector_ui_canvas(UiVectorIcon::Brightness, 18, (1.0, 0.84, 0.24, 0.98));
+        let br_badge = GtkBox::new(Orientation::Horizontal, 0);
+        br_badge.set_size_request(30, 30);
+        br_badge.set_hexpand(false);
+        br_badge.set_halign(Align::Center);
+        br_badge.set_valign(Align::Center);
+        let br_ic = build_vector_ui_canvas(UiVectorIcon::Brightness, 20, (1.0, 0.84, 0.24, 0.98));
+        br_ic.set_margin_start(5);
+        br_ic.set_margin_end(5);
+        br_badge.append(&br_ic);
         let hud_bright_scale = Scale::with_range(Orientation::Horizontal, 5.0, 100.0, 1.0);
         hud_bright_scale.add_css_class("neon-island-slider");
         hud_bright_scale.set_draw_value(false);
         hud_bright_scale.set_hexpand(true);
-        br_row.append(&br_ic);
+        br_row.append(&br_badge);
         br_row.append(&hud_bright_scale);
 
         hud_page.append(&vol_head);
@@ -1804,7 +1843,7 @@ impl DynamicIsland {
         dock_store_btn.add_css_class("neon-notch-dock-btn");
         dock_store_btn.set_tooltip_text(Some("All Modules & Style"));
         let dock_store_canvas = DrawingArea::new();
-        dock_store_canvas.set_size_request(18, 18);
+        dock_store_canvas.set_size_request(20, 20);
         dock_store_canvas.set_halign(Align::Center);
         dock_store_canvas.set_valign(Align::Center);
         dock_store_canvas.set_can_target(false);
@@ -1905,9 +1944,9 @@ impl DynamicIsland {
             cal_month_lbl,
             cal_days_strip,
             cal_agenda_box,
+            tools_calc_entry,
             tools_calc_result_btn,
             tools_calc_result_lbl,
-            tools_colors_box,
             stats_cpu_lbl,
             stats_cpu_sub,
             stats_cpu_canvas,
@@ -1983,6 +2022,17 @@ impl DynamicIsland {
                     }
                     return;
                 }
+                let close_fade = if st.wants_stealth_sensor() {
+                    smoothstep((st.morph.alpha.value / 0.55).clamp(0.0, 1.0))
+                } else {
+                    1.0
+                };
+                if close_fade <= 0.004 {
+                    return;
+                }
+                if close_fade < 0.996 {
+                    cr.push_group();
+                }
                 draw_notch_backdrop(
                     cr,
                     f64::from(w),
@@ -2000,6 +2050,10 @@ impl DynamicIsland {
                     st.accent,
                     st.drag_hover || st.desktop_drag_active,
                 );
+                if close_fade < 0.996 {
+                    let _ = cr.pop_group_to_source();
+                    let _ = cr.paint_with_alpha(close_fade);
+                }
             });
         }
         {
@@ -2760,7 +2814,6 @@ impl DynamicIsland {
             island.clip_clear_btn.clone().connect_clicked(move |_| {
                 if di.clipboard_store.clear_unpinned_or_all() {
                     di.refresh_clipboard_ui();
-                    di.refresh_quick_tools_colors();
                 }
             });
         }
@@ -2913,36 +2966,54 @@ impl DynamicIsland {
             let di = island.clone();
             tool_files_btn.connect_clicked(move |_| di.switch_module(NotchModule::Files, true));
 
-            let click_pin = GestureClick::new();
-            let di_p = island.clone();
-            click_pin.connect_pressed(move |_, _, _, _| di_p.promote_to_pinned());
-            tools_calc_entry.add_controller(click_pin);
+            let click_focus = GestureClick::new();
+            let di_f = island.clone();
+            click_focus.connect_pressed(move |_, _, _, _| {
+                di_f.focus_tools_calculator();
+            });
+            island.tools_calc_entry.add_controller(click_focus);
 
             let di = island.clone();
-            tools_calc_entry.connect_changed(move |entry| {
+            island.tools_calc_entry.connect_changed(move |entry| {
                 let txt = entry.text().to_string();
                 if let Some(val) = eval_quick_math(&txt) {
                     let formatted = if (val - val.round()).abs() < 1e-6 && val.abs() < 1e12 {
                         format!("{}", val.round() as i64)
                     } else {
-                        format!("{val:.2}")
+                        let s = format!("{val:.6}");
+                        s.trim_end_matches('0').trim_end_matches('.').to_string()
                     };
-                    di.tools_calc_result_lbl.set_text(&format!("= {formatted}"));
+                    di.tools_calc_result_lbl.set_text(&formatted);
+                    di.tools_calc_result_lbl.remove_css_class("empty");
                     di.state.borrow_mut().calc_last_result = Some(formatted);
                 } else {
-                    di.tools_calc_result_lbl.set_text("= —");
+                    di.tools_calc_result_lbl.set_text("0");
+                    di.tools_calc_result_lbl.add_css_class("empty");
                     di.state.borrow_mut().calc_last_result = None;
+                }
+            });
+            let di = island.clone();
+            island.tools_calc_entry.connect_activate(move |entry| {
+                if let Some(res) = di.state.borrow().calc_last_result.clone() {
+                    di.copy_plain_text_to_clipboard(&res);
+                    entry.select_region(0, -1);
+                    di.tools_calc_result_lbl.set_text("Copied");
+                    let lbl = di.tools_calc_result_lbl.clone();
+                    let res_c = res;
+                    glib::timeout_add_local_once(Duration::from_millis(850), move || {
+                        lbl.set_text(&res_c);
+                    });
                 }
             });
             let di = island.clone();
             island.tools_calc_result_btn.clone().connect_clicked(move |_| {
                 if let Some(res) = di.state.borrow().calc_last_result.clone() {
                     di.copy_plain_text_to_clipboard(&res);
-                    di.tools_calc_result_lbl.set_text("Copied!");
+                    di.tools_calc_result_lbl.set_text("Copied");
                     let lbl = di.tools_calc_result_lbl.clone();
                     let res_c = res;
-                    glib::timeout_add_local_once(Duration::from_millis(900), move || {
-                        lbl.set_text(&format!("= {res_c}"));
+                    glib::timeout_add_local_once(Duration::from_millis(850), move || {
+                        lbl.set_text(&res_c);
                     });
                 }
             });
@@ -3057,7 +3128,6 @@ impl DynamicIsland {
         island.refresh_file_shelf_ui();
         island.refresh_notes_ui();
         island.refresh_calendar_ui();
-        island.refresh_quick_tools_colors();
         island.rebuild_awake_presets();
         island.refresh_awake_ui();
         island.refresh_timer_ui();
@@ -3166,11 +3236,24 @@ impl DynamicIsland {
         self.open_pinned_module(module);
     }
 
-    /// Closes pinned interactive mode and cleanly returns keyboard focus to the active app.
+    /// Grants keyboard focus to the Quick Calculator without pinning the island, so hovering out
+    /// still collapses cleanly and returns keyboard focus to the active app.
+    fn focus_tools_calculator(&self) {
+        if gtk4_layer_shell::is_supported() {
+            self.window.set_keyboard_mode(KeyboardMode::Exclusive);
+        }
+        let entry = self.tools_calc_entry.clone();
+        glib::idle_add_local_once(move || {
+            entry.grab_focus();
+            entry.set_position(-1);
+        });
+    }
+
+    /// Closes pinned or hover-expanded mode and cleanly returns keyboard focus to the active app.
     pub fn close_pinned(&self) {
-        let was_open = {
+        let was_active = {
             let mut st = self.state.borrow_mut();
-            let prev = st.pinned_open;
+            let prev = st.pinned_open || st.hovered || st.peek_over_obscured;
             st.pinned_open = false;
             st.hovered = false;
             st.peek_over_obscured = false;
@@ -3178,7 +3261,7 @@ impl DynamicIsland {
             st.hover_gen = st.hover_gen.wrapping_add(1);
             prev
         };
-        if was_open {
+        if was_active {
             if gtk4_layer_shell::is_supported() {
                 self.window.set_keyboard_mode(KeyboardMode::None);
             }
@@ -3194,7 +3277,6 @@ impl DynamicIsland {
 
     pub fn on_clipboard_updated(&self) {
         self.refresh_clipboard_ui();
-        self.refresh_quick_tools_colors();
     }
 
     pub fn set_workspaces_open(&self, open: bool) {
@@ -3612,7 +3694,15 @@ impl DynamicIsland {
         }
         self.prepare_module_data(module);
         self.rebuild_dock_bar();
-        self.sync_ui();
+        if module == NotchModule::Tools {
+            self.sync_ui();
+            self.focus_tools_calculator();
+        } else {
+            if !self.state.borrow().pinned_open && gtk4_layer_shell::is_supported() {
+                self.window.set_keyboard_mode(KeyboardMode::None);
+            }
+            self.sync_ui();
+        }
     }
 
     fn prepare_module_data(&self, module: NotchModule) {
@@ -3624,7 +3714,13 @@ impl DynamicIsland {
             NotchModule::Files => self.refresh_file_shelf_ui(),
             NotchModule::Notes => self.refresh_notes_ui(),
             NotchModule::Calendar => self.refresh_calendar_ui(),
-            NotchModule::Tools => self.refresh_quick_tools_colors(),
+            NotchModule::Tools => {
+                let entry = self.tools_calc_entry.clone();
+                glib::idle_add_local_once(move || {
+                    entry.grab_focus();
+                    entry.set_position(-1);
+                });
+            }
             NotchModule::Stats => self.sample_and_refresh_stats(),
             NotchModule::Battery => self.refresh_battery_ui(),
             NotchModule::Awake => self.refresh_awake_ui(),
@@ -3652,7 +3748,7 @@ impl DynamicIsland {
 
             let hovered = Rc::new(Cell::new(false));
             let canvas = DrawingArea::new();
-            canvas.set_size_request(18, 18);
+            canvas.set_size_request(20, 20);
             canvas.set_halign(Align::Center);
             canvas.set_valign(Align::Center);
             canvas.set_can_target(false);
@@ -4281,7 +4377,6 @@ impl DynamicIsland {
                 del_btn.connect_clicked(move |_| {
                     if di.clipboard_store.remove(id) {
                         di.refresh_clipboard_ui();
-                        di.refresh_quick_tools_colors();
                     }
                 });
             }
@@ -4804,58 +4899,6 @@ impl DynamicIsland {
         }
     }
 
-    // ---- Quick Tools Recent Colors ----
-
-    fn refresh_quick_tools_colors(&self) {
-        while let Some(c) = self.tools_colors_box.first_child() {
-            self.tools_colors_box.remove(&c);
-        }
-        let mut colors: Vec<String> = self
-            .clipboard_store
-            .entries()
-            .into_iter()
-            .filter_map(|e| match classify_clipboard_text(&e.text) {
-                ClipboardItemKind::Color(h) => Some(h),
-                _ => None,
-            })
-            .take(5)
-            .collect();
-        if colors.is_empty() {
-            let hint = Label::new(Some("Copy any #hex color to collect swatches here"));
-            hint.add_css_class("neon-island-muted-xs");
-            self.tools_colors_box.append(&hint);
-            return;
-        }
-        colors.dedup();
-        for hex in colors {
-            let btn = Button::new();
-            btn.add_css_class("neon-notch-color-chip");
-            let row = GtkBox::new(Orientation::Horizontal, 5);
-            row.set_valign(Align::Center);
-            let dot = DrawingArea::new();
-            dot.set_size_request(14, 14);
-            let rgb = Rgb::from_hex(&hex);
-            dot.set_draw_func(move |_, cr, w, h| {
-                cr.set_antialias(cairo::Antialias::Best);
-                cr.arc(f64::from(w) * 0.5, f64::from(h) * 0.5, 6.0, 0.0, std::f64::consts::TAU);
-                cr.set_source_rgba(rgb.r, rgb.g, rgb.b, 1.0);
-                let _ = cr.fill();
-            });
-            let lbl = Label::new(Some(&hex));
-            lbl.add_css_class("neon-island-muted-xs");
-            row.append(&dot);
-            row.append(&lbl);
-            btn.set_child(Some(&row));
-
-            let di = self.clone();
-            let h_c = hex.clone();
-            btn.connect_clicked(move |_| {
-                di.copy_plain_text_to_clipboard(&h_c);
-            });
-            self.tools_colors_box.append(&btn);
-        }
-    }
-
     // ---- System Stats ----
 
     fn sample_and_refresh_stats(&self) {
@@ -5187,11 +5230,21 @@ impl DynamicIsland {
     // ---- Keyboard Shortcuts inside Pinned Notch ----
 
     fn handle_key_pressed(&self, key: gdk::Key, mods: gdk::ModifierType) -> glib::Propagation {
-        let pinned = self.state.borrow().pinned_open;
-        if !pinned {
+        let can_handle = {
+            let st = self.state.borrow();
+            st.pinned_open || (st.hovered && st.active_module == NotchModule::Tools)
+        };
+        if !can_handle {
             return glib::Propagation::Proceed;
         }
         if key == gdk::Key::Escape {
+            if self.state.borrow().active_module == NotchModule::Tools
+                && !self.tools_calc_entry.text().is_empty()
+            {
+                self.tools_calc_entry.set_text("");
+                self.tools_calc_entry.grab_focus();
+                return glib::Propagation::Stop;
+            }
             self.close_pinned();
             return glib::Propagation::Stop;
         }
@@ -5258,6 +5311,9 @@ impl DynamicIsland {
                 HoverAction::Dwell(st.hover_gen)
             } else {
                 st.hovered = true;
+                if st.obscured {
+                    st.peek_over_obscured = true;
+                }
                 if st.active_module == NotchModule::Home {
                     if st.timer_running {
                         st.active_module = NotchModule::Timer;
@@ -5276,6 +5332,9 @@ impl DynamicIsland {
                 self.prepare_module_data(m);
                 self.rebuild_dock_bar();
                 self.sync_ui();
+                if m == NotchModule::Tools {
+                    self.focus_tools_calculator();
+                }
             }
             HoverAction::Dwell(epoch) => {
                 let di = self.clone();
@@ -5300,6 +5359,9 @@ impl DynamicIsland {
                         di.prepare_module_data(m);
                         di.rebuild_dock_bar();
                         di.sync_ui();
+                        if m == NotchModule::Tools {
+                            di.focus_tools_calculator();
+                        }
                     }
                 });
             }
@@ -5322,7 +5384,7 @@ impl DynamicIsland {
             st.hover_gen
         };
         let di = self.clone();
-        glib::timeout_add_local_once(Duration::from_millis(340), move || {
+        glib::timeout_add_local_once(Duration::from_millis(200), move || {
             let should_collapse = {
                 let mut st = di.state.borrow_mut();
                 if st.hover_gen == epoch
@@ -5343,6 +5405,9 @@ impl DynamicIsland {
                 }
             };
             if should_collapse {
+                if gtk4_layer_shell::is_supported() {
+                    di.window.set_keyboard_mode(KeyboardMode::None);
+                }
                 di.sync_ui();
             }
         });
@@ -5461,7 +5526,7 @@ impl DynamicIsland {
             "files" => (604.0, 226.0, 32.0),
             "notes" => (580.0, 238.0, 32.0),
             "calendar" => (548.0, 254.0, 32.0),
-            "tools" => (534.0, 208.0, 32.0),
+            "tools" => (534.0, 184.0, 32.0),
             "stats" => (588.0, 176.0, 32.0),
             "battery" => (512.0, 176.0, 32.0),
             "awake" => (472.0, 168.0, 32.0),
@@ -5656,7 +5721,7 @@ impl DynamicIsland {
             self.shell_box.set_size_request(wi, hi);
         }
 
-        let (stealth, outgoing, show_dock_allowed, top_off) = {
+        let (wants_stealth, stealth_settled, outgoing, show_dock_allowed, top_off) = {
             let st = self.state.borrow();
             let top_off = if st.prefs.appearance.is_top_flush_notch() {
                 0
@@ -5664,6 +5729,7 @@ impl DynamicIsland {
                 SHELL_TOP_OFFSET
             };
             (
+                st.wants_stealth_sensor(),
                 st.is_stealth_sensor(),
                 st.outgoing_drag,
                 st.active_notif.is_none() && !st.recording_active && !st.outgoing_drag,
@@ -5671,7 +5737,7 @@ impl DynamicIsland {
             )
         };
 
-        if stealth {
+        if stealth_settled {
             if !self.compact_layer.is_visible() {
                 self.compact_layer.set_visible(true);
             }
@@ -5692,6 +5758,8 @@ impl DynamicIsland {
         let raw_compact_op = (1.0 - smoothstep((alpha / 0.44).clamp(0.0, 1.0))).clamp(0.0, 1.0);
         let compact_op = if outgoing {
             0.55
+        } else if wants_stealth {
+            0.0
         } else if raw_compact_op > 0.99 {
             1.0
         } else if raw_compact_op < 0.01 {
@@ -5725,7 +5793,7 @@ impl DynamicIsland {
             self.expanded_clip.set_visible(show_expanded);
         }
         self.expanded_clip.set_opacity(expanded_op);
-        self.expanded_clip.set_can_target(!outgoing && expanded_op > 0.35);
+        self.expanded_clip.set_can_target(!outgoing && !wants_stealth && expanded_op > 0.35);
         if self.expanded_clip.vadjustment().value() != 0.0 {
             self.expanded_clip.vadjustment().set_value(0.0);
         }
@@ -5736,7 +5804,7 @@ impl DynamicIsland {
             self.dock_pill.set_visible(show_dock);
         }
         self.dock_pill.set_opacity(dock_op);
-        self.dock_pill.set_can_target(dock_op > 0.45);
+        self.dock_pill.set_can_target(!wants_stealth && dock_op > 0.45);
 
         if target_expanded {
             self.shell_box.add_css_class("expanded");
@@ -5750,6 +5818,8 @@ impl DynamicIsland {
         }
         if outgoing {
             apply_passthrough_input_region(&self.window);
+        } else if wants_stealth {
+            apply_sensor_input_region(&self.window);
         } else {
             apply_input_region(&self.window, top_off, f64::from(wi), f64::from(hi), show_dock);
         }
@@ -5758,7 +5828,8 @@ impl DynamicIsland {
     fn sync_ui(&self) {
         let (
             base_visible,
-            stealth_sensor,
+            wants_stealth,
+            stealth_settled,
             outgoing_drag,
             desktop_drag_active,
             pinned_open,
@@ -5785,9 +5856,11 @@ impl DynamicIsland {
                 && !st.locked
                 && !st.overview_open
                 && !st.workspaces_open;
-            let stealth = st.is_stealth_sensor();
+            let wants_stealth = st.wants_stealth_sensor();
+            let stealth_settled = st.is_stealth_sensor();
             let base_vis = allowed
                 && (!st.obscured
+                    || st.hovered
                     || st.peek_over_obscured
                     || st.desktop_drag_active
                     || st.drag_hover
@@ -5798,7 +5871,8 @@ impl DynamicIsland {
             }
             (
                 base_vis,
-                stealth,
+                wants_stealth,
+                stealth_settled,
                 st.outgoing_drag,
                 st.desktop_drag_active,
                 st.pinned_open,
@@ -5823,7 +5897,7 @@ impl DynamicIsland {
 
         let hud_active = hud_popup.is_some();
         let visible =
-            !locked && (base_visible || stealth_sensor || pinned_open || hud_active || outgoing_drag);
+            !locked && (base_visible || wants_stealth || pinned_open || hud_active || outgoing_drag);
 
         if !visible {
             let currently_shown = self.window.is_visible();
@@ -5987,7 +6061,7 @@ impl DynamicIsland {
 
         // Expanded page selection (`outgoing_drag` forces compact tuck-away!)
         let should_expand =
-            !outgoing_drag && !stealth_sensor && (pinned_open || active_notif.is_some() || hovered || force_exp);
+            !outgoing_drag && !wants_stealth && (pinned_open || active_notif.is_some() || hovered || force_exp);
         let (page_name, aura_kind) = if let Some(ref item) = active_notif
             && !pinned_open
         {
@@ -6093,7 +6167,7 @@ impl DynamicIsland {
         {
             let mut st = self.state.borrow_mut();
             st.aura_kind = aura_kind;
-            let show_neon = !stealth_sensor
+            let show_neon = !wants_stealth
                 && media_active
                 && ((!should_expand && !hud_active && !rec_active && !timer_running)
                     || (should_expand && page_name == "media"));
@@ -6150,7 +6224,7 @@ impl DynamicIsland {
         }
 
         self.retarget_morph(tw, th, tbr, ter, should_expand, false);
-        if stealth_sensor || outgoing_drag {
+        if stealth_settled || outgoing_drag {
             let (cw, ch, ca, te) = {
                 let st = self.state.borrow();
                 (
@@ -6179,7 +6253,7 @@ impl DynamicIsland {
             };
             if outgoing_drag {
                 apply_passthrough_input_region(&self.window);
-            } else if stealth_sensor {
+            } else if wants_stealth {
                 apply_sensor_input_region(&self.window);
             } else {
                 apply_input_region(&self.window, top_off, cw, ch, a > 0.25);
