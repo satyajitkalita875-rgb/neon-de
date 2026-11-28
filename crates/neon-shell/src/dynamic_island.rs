@@ -1066,7 +1066,7 @@ impl DynamicIsland {
         // ---------------------------------------------------------------------
         let clipboard_page = GtkBox::new(Orientation::Vertical, 10);
         clipboard_page.add_css_class("neon-island-page-pad");
-        clipboard_page.set_size_request(604, 240);
+        clipboard_page.set_size_request(604, 246);
 
         let clip_bar = GtkBox::new(Orientation::Horizontal, 8);
         clip_bar.set_valign(Align::Center);
@@ -1094,13 +1094,15 @@ impl DynamicIsland {
         let clip_scroller = ScrolledWindow::builder()
             .hscrollbar_policy(PolicyType::Automatic)
             .vscrollbar_policy(PolicyType::Never)
+            .overlay_scrolling(false)
             .propagate_natural_height(false)
             .kinetic_scrolling(true)
-            .min_content_height(166)
-            .max_content_height(166)
+            .min_content_height(172)
+            .max_content_height(172)
             .hexpand(true)
             .build();
         clip_scroller.add_css_class("neon-island-hscroller");
+        attach_vertical_wheel_to_horizontal_scroll(&clip_scroller);
 
         let clip_cards_wrap = GtkBox::new(Orientation::Horizontal, 0);
         let clip_cards_box = GtkBox::new(Orientation::Horizontal, 9);
@@ -1148,13 +1150,15 @@ impl DynamicIsland {
         let shelf_scroller = ScrolledWindow::builder()
             .hscrollbar_policy(PolicyType::Automatic)
             .vscrollbar_policy(PolicyType::Never)
+            .overlay_scrolling(false)
             .propagate_natural_height(false)
             .kinetic_scrolling(true)
-            .min_content_height(108)
-            .max_content_height(108)
+            .min_content_height(114)
+            .max_content_height(114)
             .hexpand(true)
             .build();
         shelf_scroller.add_css_class("neon-island-hscroller");
+        attach_vertical_wheel_to_horizontal_scroll(&shelf_scroller);
         let shelf_wrap = GtkBox::new(Orientation::Horizontal, 0);
         let shelf_strip_box = GtkBox::new(Orientation::Horizontal, 10);
         shelf_strip_box.add_css_class("neon-island-shelf-strip");
@@ -3737,14 +3741,14 @@ impl DynamicIsland {
             let st = self.state.borrow();
             (st.prefs.pinned.clone(), st.active_module)
         };
-        for (idx, module) in pinned.into_iter().enumerate() {
+        for module in pinned {
             let is_active = module == active;
             let btn = Button::new();
             btn.add_css_class("neon-notch-dock-btn");
             if is_active {
                 btn.add_css_class("active");
             }
-            btn.set_tooltip_text(Some(&format!("{} (Alt+{})", module.title(), idx + 1)));
+            btn.set_tooltip_text(Some(module.title()));
 
             let hovered = Rc::new(Cell::new(false));
             let canvas = DrawingArea::new();
@@ -4254,7 +4258,7 @@ impl DynamicIsland {
         self.clip_empty_lbl.set_visible(false);
 
         let now = now_unix_secs();
-        for (idx, entry) in entries.into_iter().enumerate() {
+        for entry in entries {
             let kind = classify_clipboard_text(&entry.text);
             let is_copied = copied_id == Some(entry.id);
 
@@ -4266,7 +4270,7 @@ impl DynamicIsland {
             if is_copied {
                 card.add_css_class("copied");
             }
-            card.set_size_request(156, 152);
+            card.set_size_request(158, 146);
 
             let body_btn = Button::new();
             body_btn.add_css_class("neon-island-clip-body-btn");
@@ -4332,13 +4336,11 @@ impl DynamicIsland {
                 body_btn.connect_clicked(move |_| di.copy_clipboard_entry(&e_c));
             }
 
-            let foot = GtkBox::new(Orientation::Horizontal, 4);
+            let foot = GtkBox::new(Orientation::Horizontal, 3);
             foot.set_valign(Align::Center);
             let age = format_relative_age(entry.copied_at_unix, now);
             let meta = Label::new(Some(&if is_copied {
                 "Copied!".into()
-            } else if idx < 9 {
-                format!("Alt+{} · {age}", idx + 1)
             } else {
                 age
             }));
@@ -4356,7 +4358,7 @@ impl DynamicIsland {
 
             let pin_btn = build_round_pin_btn(
                 entry.pinned,
-                22,
+                20,
                 accent,
                 if entry.pinned { "Unpin" } else { "Pin snippet" },
             );
@@ -4370,7 +4372,7 @@ impl DynamicIsland {
                 });
             }
 
-            let del_btn = build_round_close_btn(22, "Remove snippet");
+            let del_btn = build_round_close_btn(20, "Remove snippet");
             {
                 let di = self.clone();
                 let id = entry.id;
@@ -5522,8 +5524,8 @@ impl DynamicIsland {
             "home" => (496.0, 166.0, EXPANDED_BOTTOM_R),
             "media" => (416.0, 198.0, EXPANDED_BOTTOM_R),
             "timer" => (520.0, 178.0, EXPANDED_BOTTOM_R),
-            "clipboard" => (604.0, 242.0, 32.0),
-            "files" => (604.0, 226.0, 32.0),
+            "clipboard" => (604.0, 248.0, 32.0),
+            "files" => (604.0, 232.0, 32.0),
             "notes" => (580.0, 238.0, 32.0),
             "calendar" => (548.0, 254.0, 32.0),
             "tools" => (534.0, 184.0, 32.0),
@@ -6163,16 +6165,19 @@ impl DynamicIsland {
             (sname, aura)
         };
 
-        // Animated album-art neon gradient rim glows when media is playing in compact OR Now Playing view!
+        // Wandering dark-AMOLED song-color gradient glows across all panels whenever media is playing.
         {
             let mut st = self.state.borrow_mut();
             st.aura_kind = aura_kind;
-            let show_neon = !wants_stealth
-                && media_active
-                && ((!should_expand && !hud_active && !rec_active && !timer_running)
-                    || (should_expand && page_name == "media"));
+            let show_neon = !wants_stealth && media_active;
             st.target_neon_intensity = if show_neon {
-                if media.playing { 1.0 } else { 0.35 }
+                if media.playing {
+                    1.0
+                } else if !should_expand || page_name == "media" {
+                    0.35
+                } else {
+                    0.0
+                }
             } else {
                 0.0
             };
@@ -6260,6 +6265,30 @@ impl DynamicIsland {
             }
         }
     }
+}
+
+fn attach_vertical_wheel_to_horizontal_scroll(scroller: &ScrolledWindow) {
+    let scroll = EventControllerScroll::new(EventControllerScrollFlags::VERTICAL);
+    scroll.set_propagation_phase(gtk4::PropagationPhase::Capture);
+    let sc = scroller.clone();
+    scroll.connect_scroll(move |ctrl, _dx, dy| {
+        if dy.abs() <= 0.001 {
+            return glib::Propagation::Proceed;
+        }
+        let hadj = sc.hadjustment();
+        let max_val = (hadj.upper() - hadj.page_size()).max(hadj.lower());
+        if max_val <= hadj.lower() {
+            return glib::Propagation::Proceed;
+        }
+        let delta = match ctrl.unit() {
+            gdk::ScrollUnit::Surface => dy,
+            _ => dy * 112.0,
+        };
+        let next = (hadj.value() + delta).clamp(hadj.lower(), max_val);
+        hadj.set_value(next);
+        glib::Propagation::Stop
+    });
+    scroller.add_controller(scroll);
 }
 
 fn build_vector_ui_canvas(

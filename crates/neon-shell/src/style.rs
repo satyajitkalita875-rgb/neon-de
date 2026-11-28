@@ -4614,10 +4614,34 @@ button.neon-island-filter-pill.active {{
     border: none;
 }}
 
+.neon-island-clip-cards,
+.neon-island-shelf-strip {{
+    padding-bottom: 8px;
+}}
+
+.neon-island-hscroller scrollbar {{
+    background-color: transparent;
+    border: none;
+    box-shadow: none;
+    margin-top: 2px;
+}}
+
+.neon-island-hscroller scrollbar trough {{
+    background-color: transparent;
+    border: none;
+    min-height: 4px;
+}}
+
 .neon-island-hscroller scrollbar slider {{
-    background-color: #3A3A3C;
+    background-color: rgba(255, 255, 255, 0.24);
+    border: none;
     border-radius: 4px;
     min-height: 4px;
+    min-width: 28px;
+}}
+
+.neon-island-hscroller scrollbar slider:hover {{
+    background-color: rgba(255, 255, 255, 0.42);
 }}
 
 .neon-notch-clip-card {{
@@ -4995,10 +5019,6 @@ flowbox.neon-notch-store-grid > flowboxchild {{
 .neon-notch-store-card:hover {{
     background-color: #262629;
     border-color: rgba(255, 255, 255, 0.16);
-}}
-
-.neon-notch-store-card.pinned {{
-    border-color: alpha({accent}, 0.52);
 }}
 
 .neon-notch-store-title {{
