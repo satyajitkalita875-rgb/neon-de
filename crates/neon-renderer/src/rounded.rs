@@ -98,6 +98,19 @@ pub(crate) fn compute_uv_to_dst(
     transform: Transform,
     y_inverted: bool,
 ) -> Option<([f32; 2], [f32; 4])> {
+    compute_uv_transform(src, dst_size, tex_size, transform, y_inverted)
+        .map(|(uv0, inv, _fwd)| (uv0, inv))
+}
+
+/// Computes `(u_uv0, u_inv_mat, u_fwd_mat)` mapping both texture `v_coords -> dst_local`
+/// and screen-space `delta_px -> delta_uv` (used for curved optical lens refraction).
+pub(crate) fn compute_uv_transform(
+    src: Rectangle<f64, BufferCoord>,
+    dst_size: Size<i32, Physical>,
+    tex_size: Size<i32, BufferCoord>,
+    transform: Transform,
+    y_inverted: bool,
+) -> Option<([f32; 2], [f32; 4], [f32; 4])> {
     if src.size.w <= 0.0
         || src.size.h <= 0.0
         || dst_size.w <= 0
@@ -130,7 +143,16 @@ pub(crate) fn compute_uv_to_dst(
     let m10 = (-duy * inv_det * dh) as f32;
     let m11 = (dux * inv_det * dh) as f32;
 
-    Some(([uv0.0 as f32, uv0.1 as f32], [m00, m01, m10, m11]))
+    let f00 = (dux / dw) as f32;
+    let f01 = (dvx / dh) as f32;
+    let f10 = (duy / dw) as f32;
+    let f11 = (dvy / dh) as f32;
+
+    Some((
+        [uv0.0 as f32, uv0.1 as f32],
+        [m00, m01, m10, m11],
+        [f00, f01, f10, f11],
+    ))
 }
 
 impl Element for RoundedSurfaceElement {

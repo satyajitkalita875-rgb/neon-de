@@ -34,7 +34,7 @@ use gtk4::{
     glib, prelude::*,
 };
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
-use neon_ipc::{DesktopSnapshot, IpcRequest, WindowInfo};
+use neon_ipc::{DesktopSnapshot, GlassShapeRect, IpcRequest, WindowInfo};
 use neon_system::{
     SystemAction, SystemActionSender, SystemSnapshot,
     clipboard::{
@@ -57,11 +57,12 @@ use crate::{
         save_persisted_shelf_items,
     },
     island_visuals::{
-        IslandAuraKind, NeonPalette, NotchAppearance, Rgb, Spring1D, UiVectorIcon,
-        draw_apple_battery_glyph, draw_apple_fallback_art, draw_apple_silent_pill,
+        IslandAuraKind, LiquidGlassPaint, NeonPalette, NotchAppearance, Rgb, Spring1D,
+        UiVectorIcon, draw_apple_battery_glyph, draw_apple_fallback_art, draw_apple_silent_pill,
         draw_audio_waveform, draw_battery_ring, draw_cpu_bars, draw_dock_pill_backdrop,
-        draw_hud_bar, draw_media_progress_bar, draw_module_badge_tile, draw_module_vector_icon,
-        draw_network_sparkline, draw_notch_backdrop, draw_round_circle_button,
+        draw_dock_pill_liquid_glass, draw_hud_bar, draw_media_progress_bar,
+        draw_module_badge_tile, draw_module_vector_icon, draw_network_sparkline,
+        draw_notch_backdrop, draw_notch_liquid_glass, draw_round_circle_button,
         draw_round_pin_button, draw_sf_airplay_icon, draw_sf_play_pause_icon, draw_sf_skip_icon,
         draw_timer_ring, draw_timer_ruler, draw_ui_vector_icon, extract_neon_palette_from_texture,
     },
@@ -230,6 +231,18 @@ struct IslandState {
     awake_duration_choice: Option<u64>,
     // Morph springs
     morph: IslandMorph,
+    // Apple Liquid Glass state (GPU protocol rev >= 7 + pre-restart Cairo wallpaper crop fallback)
+    gpu_glass_supported: bool,
+    test_force_cairo_glass: bool,
+    last_wp_hint: Option<String>,
+    last_is_light: bool,
+    output_w: i32,
+    output_h: i32,
+    last_wallpaper_key: Option<(Option<String>, bool, i32, i32)>,
+    glass_wp_surface: Option<cairo::ImageSurface>,
+    glass_wp_avg_lum: f64,
+    shell_top_off_px: i32,
+    shell_cur_h_px: i32,
 }
 
 impl IslandState {
@@ -316,6 +329,17 @@ impl IslandState {
             awake_remaining_secs: Some(3600),
             awake_duration_choice: Some(3600),
             morph: IslandMorph::default(),
+            gpu_glass_supported: false,
+            test_force_cairo_glass: false,
+            last_wp_hint: None,
+            last_is_light: false,
+            output_w: 1920,
+            output_h: 1080,
+            last_wallpaper_key: None,
+            glass_wp_surface: None,
+            glass_wp_avg_lum: 0.35,
+            shell_top_off_px: SHELL_TOP_OFFSET,
+            shell_cur_h_px: 38,
         }
     }
 
@@ -355,6 +379,7 @@ impl IslandState {
 pub struct DynamicIsland {
     window: ApplicationWindow,
     backdrop_window: ApplicationWindow,
+    stage: GtkOverlay,
     bg_canvas: DrawingArea,
     hover_column: GtkBox,
     shell_box: GtkOverlay,
@@ -506,6 +531,8 @@ pub struct DynamicIsland {
     motion_enabled: Rc<Cell<bool>>,
     speed_scale: Rc<Cell<f64>>,
     suppress_hud_sliders: Rc<Cell<bool>>,
+    last_sent_glass: Rc<RefCell<Vec<GlassShapeRect>>>,
+    hover_motion: EventControllerMotion,
 }
 
 impl DynamicIsland {
@@ -1244,6 +1271,8 @@ impl DynamicIsland {
             .hexpand(true)
             .build();
         notes_ed_scroll.add_css_class("neon-island-clip-scroller");
+        notes_ed_scroll.add_css_class("neon-notch-note-scroll");
+        notes_ed_scroll.set_overflow(gtk4::Overflow::Hidden);
         let notes_editor = TextView::new();
         notes_editor.add_css_class("neon-island-note-editor");
         notes_editor.set_wrap_mode(WrapMode::WordChar);
@@ -1690,7 +1719,7 @@ impl DynamicIsland {
         // ---------------------------------------------------------------------
         let notif_page = GtkBox::new(Orientation::Vertical, 8);
         notif_page.add_css_class("neon-ios-notif-page");
-        notif_page.set_width_request(396);
+        notif_page.set_width_request(368);
 
         let notif_row = GtkBox::new(Orientation::Horizontal, 12);
         notif_row.set_valign(Align::Center);
@@ -1868,10 +1897,12 @@ impl DynamicIsland {
         let state = Rc::new(RefCell::new(IslandState::new()));
         let telemetry_sampler = Rc::new(RefCell::new(TelemetrySampler::new()));
         let keep_awake = Arc::new(KeepAwakeInhibitor::new());
+        let hover_motion = EventControllerMotion::new();
 
         let island = Self {
             window,
             backdrop_window,
+            stage,
             bg_canvas,
             hover_column,
             shell_box,
@@ -2006,6 +2037,8 @@ impl DynamicIsland {
             motion_enabled: Rc::new(Cell::new(true)),
             speed_scale: Rc::new(Cell::new(1.0)),
             suppress_hud_sliders: Rc::new(Cell::new(false)),
+            last_sent_glass: Rc::new(RefCell::new(Vec::new())),
+            hover_motion,
         };
 
         // =====================================================================
@@ -2037,23 +2070,46 @@ impl DynamicIsland {
                 if close_fade < 0.996 {
                     cr.push_group();
                 }
-                draw_notch_backdrop(
-                    cr,
-                    f64::from(w),
-                    f64::from(SHELL_TOP_OFFSET),
-                    st.morph.w.value,
-                    st.morph.h.value,
-                    st.morph.br.value,
-                    st.morph.er.value,
-                    st.prefs.appearance,
-                    st.aura_kind,
-                    st.morph.alpha.value.clamp(0.0, 1.0),
-                    st.cur_palette,
-                    st.neon_intensity,
-                    st.neon_phase,
-                    st.accent,
-                    st.drag_hover || st.desktop_drag_active,
-                );
+                if st.prefs.appearance == NotchAppearance::LiquidGlass {
+                    let paint = LiquidGlassPaint {
+                        wallpaper_crop: st.glass_wp_surface.as_ref(),
+                        wallpaper_avg_lum: st.glass_wp_avg_lum,
+                        gpu_backed: st.gpu_glass_supported,
+                        aura_kind: st.aura_kind,
+                        expanded_alpha: st.morph.alpha.value.clamp(0.0, 1.0),
+                        palette: st.cur_palette,
+                        neon_intensity: st.neon_intensity,
+                        neon_phase: st.neon_phase,
+                        drag_hover: st.drag_hover || st.desktop_drag_active,
+                    };
+                    draw_notch_liquid_glass(
+                        cr,
+                        f64::from(w),
+                        f64::from(SHELL_TOP_OFFSET),
+                        st.morph.w.value,
+                        st.morph.h.value,
+                        st.morph.br.value,
+                        &paint,
+                    );
+                } else {
+                    draw_notch_backdrop(
+                        cr,
+                        f64::from(w),
+                        f64::from(SHELL_TOP_OFFSET),
+                        st.morph.w.value,
+                        st.morph.h.value,
+                        st.morph.br.value,
+                        st.morph.er.value,
+                        st.prefs.appearance,
+                        st.aura_kind,
+                        st.morph.alpha.value.clamp(0.0, 1.0),
+                        st.cur_palette,
+                        st.neon_intensity,
+                        st.neon_phase,
+                        st.accent,
+                        st.drag_hover || st.desktop_drag_active,
+                    );
+                }
                 if close_fade < 0.996 {
                     let _ = cr.pop_group_to_source();
                     let _ = cr.paint_with_alpha(close_fade);
@@ -2063,8 +2119,34 @@ impl DynamicIsland {
         {
             let st_rc = Rc::clone(&island.state);
             island.dock_bg_canvas.set_draw_func(move |_, cr, w, h| {
-                let appearance = st_rc.borrow().prefs.appearance;
-                draw_dock_pill_backdrop(cr, f64::from(w), f64::from(h), appearance);
+                let st = st_rc.borrow();
+                let appearance = st.prefs.appearance;
+                if appearance == NotchAppearance::LiquidGlass {
+                    let wp_offset_x = ((f64::from(CANVAS_W) - f64::from(w)) * 0.5).round();
+                    let wp_offset_y =
+                        f64::from(st.shell_top_off_px + st.shell_cur_h_px + DOCK_GAP);
+                    let paint = LiquidGlassPaint {
+                        wallpaper_crop: st.glass_wp_surface.as_ref(),
+                        wallpaper_avg_lum: st.glass_wp_avg_lum,
+                        gpu_backed: st.gpu_glass_supported,
+                        aura_kind: IslandAuraKind::Idle,
+                        expanded_alpha: st.morph.alpha.value.clamp(0.0, 1.0),
+                        palette: st.cur_palette,
+                        neon_intensity: 0.0,
+                        neon_phase: st.neon_phase,
+                        drag_hover: false,
+                    };
+                    draw_dock_pill_liquid_glass(
+                        cr,
+                        f64::from(w),
+                        f64::from(h),
+                        wp_offset_x,
+                        wp_offset_y,
+                        &paint,
+                    );
+                } else {
+                    draw_dock_pill_backdrop(cr, f64::from(w), f64::from(h), appearance);
+                }
             });
         }
         {
@@ -2085,10 +2167,12 @@ impl DynamicIsland {
             island.dock_store_btn.add_controller(mot);
 
             let st_rc = Rc::clone(&island.state);
-            island.dock_store_canvas.set_draw_func(move |_, cr, w, h| {
+            island.dock_store_canvas.set_draw_func(move |area, cr, w, h| {
                 let active = st_rc.borrow().active_module == NotchModule::Store;
                 let rgba = if active || store_hover.get() {
                     (1.0, 1.0, 1.0, 0.98)
+                } else if widget_in_liquid_glass(area) {
+                    (0.90, 0.94, 1.0, 0.84)
                 } else {
                     (0.62, 0.62, 0.66, 0.95)
                 };
@@ -2422,7 +2506,7 @@ impl DynamicIsland {
 
         // Unified Hover Controller covering Island Body + 8px gap + Floating Bottom Dock Pill!
         {
-            let motion = EventControllerMotion::new();
+            let motion = island.hover_motion.clone();
             let di_in = island.clone();
             motion.connect_enter(move |_, _, _| di_in.on_hover_enter());
             let di_out = island.clone();
@@ -2665,6 +2749,7 @@ impl DynamicIsland {
                     st.media_drag_frac
                 };
                 di_de.seek_media_to_fraction(frac);
+                di_de.finish_pointer_drag(|_| {});
             });
             island.media_progress_area.add_controller(drag);
         }
@@ -2782,7 +2867,7 @@ impl DynamicIsland {
             });
             let di_e = island.clone();
             r_drag.connect_drag_end(move |_, _, _| {
-                di_e.state.borrow_mut().timer_dragging = false;
+                di_e.finish_pointer_drag(|st| st.timer_dragging = false);
                 di_e.timer_ruler_area.queue_draw();
             });
             island.timer_ruler_area.add_controller(r_drag);
@@ -2807,12 +2892,7 @@ impl DynamicIsland {
                 di.state.borrow_mut().clip_query = entry.text().to_string();
                 di.refresh_clipboard_ui();
             });
-            let click_pin = GestureClick::new();
-            let di_p = island.clone();
-            click_pin.connect_pressed(move |_, _, _, _| {
-                di_p.promote_to_pinned();
-            });
-            clip_search.add_controller(click_pin);
+            attach_hover_focus_click(&island, &clip_search, true);
 
             let di = island.clone();
             island.clip_clear_btn.clone().connect_clicked(move |_| {
@@ -2880,8 +2960,7 @@ impl DynamicIsland {
                 let id = di.state.borrow_mut().notes_store.create();
                 di.state.borrow_mut().active_note_id = id;
                 di.refresh_notes_ui();
-                di.promote_to_pinned();
-                di.notes_editor.grab_focus();
+                di.focus_text_input(&di.notes_editor, false);
             });
             let di = island.clone();
             note_del_btn.connect_clicked(move |_| {
@@ -2900,12 +2979,7 @@ impl DynamicIsland {
             let di = island.clone();
             note_h_btn.connect_clicked(move |_| di.insert_note_snippet("\n## "));
 
-            let click_pin = GestureClick::new();
-            let di_p = island.clone();
-            click_pin.connect_pressed(move |_, _, _, _| {
-                di_p.promote_to_pinned();
-            });
-            island.notes_editor.add_controller(click_pin);
+            attach_hover_focus_click(&island, &island.notes_editor, false);
 
             let di = island.clone();
             island.notes_editor.buffer().connect_changed(move |buf| {
@@ -2929,10 +3003,7 @@ impl DynamicIsland {
 
         // Calendar quick-add entry
         {
-            let click_pin = GestureClick::new();
-            let di_p = island.clone();
-            click_pin.connect_pressed(move |_, _, _, _| di_p.promote_to_pinned());
-            cal_add_entry.add_controller(click_pin);
+            attach_hover_focus_click(&island, &cal_add_entry, true);
 
             let di = island.clone();
             cal_add_entry.connect_activate(move |entry| {
@@ -2970,12 +3041,7 @@ impl DynamicIsland {
             let di = island.clone();
             tool_files_btn.connect_clicked(move |_| di.switch_module(NotchModule::Files, true));
 
-            let click_focus = GestureClick::new();
-            let di_f = island.clone();
-            click_focus.connect_pressed(move |_, _, _, _| {
-                di_f.focus_tools_calculator();
-            });
-            island.tools_calc_entry.add_controller(click_focus);
+            attach_hover_focus_click(&island, &island.tools_calc_entry, true);
 
             let di = island.clone();
             island.tools_calc_entry.connect_changed(move |entry| {
@@ -3227,30 +3293,53 @@ impl DynamicIsland {
         if gtk4_layer_shell::is_supported() {
             self.window.set_keyboard_mode(KeyboardMode::Exclusive);
         }
+        self.bg_canvas.queue_draw();
         self.sync_ui();
     }
 
-    /// Promotes a hover-expanded island into pinned interactive mode (e.g. when typing in Search/Notes).
-    fn promote_to_pinned(&self) {
-        let already = self.state.borrow().pinned_open;
-        if already {
-            return;
-        }
-        let module = self.state.borrow().active_module;
-        self.open_pinned_module(module);
-    }
-
-    /// Grants keyboard focus to the Quick Calculator without pinning the island, so hovering out
+    /// Grants keyboard focus to an island text input without pinning the island, so hovering out
     /// still collapses cleanly and returns keyboard focus to the active app.
-    fn focus_tools_calculator(&self) {
+    fn focus_text_input<W: gtk4::glib::object::IsA<gtk4::Widget> + Clone + 'static>(
+        &self,
+        widget: &W,
+        caret_end: bool,
+    ) {
         if gtk4_layer_shell::is_supported() {
             self.window.set_keyboard_mode(KeyboardMode::Exclusive);
         }
-        let entry = self.tools_calc_entry.clone();
+        self.bg_canvas.queue_draw();
+        let w = widget.clone();
         glib::idle_add_local_once(move || {
-            entry.grab_focus();
-            entry.set_position(-1);
+            let wid = gtk4::prelude::Cast::upcast_ref::<gtk4::Widget>(&w);
+            if !wid.is_visible() || !wid.is_sensitive() {
+                return;
+            }
+            if !wid.has_focus() {
+                wid.grab_focus();
+                if caret_end
+                    && let Some(entry) = gtk4::prelude::Cast::dynamic_cast_ref::<Entry>(wid)
+                {
+                    entry.set_position(-1);
+                }
+            }
         });
+    }
+
+    /// Releases GTK widget focus and returns layer-shell keyboard focus to the active window.
+    fn release_keyboard_focus(&self) {
+        gtk4::prelude::GtkWindowExt::set_focus(&self.window, None::<&gtk4::Widget>);
+        if gtk4_layer_shell::is_supported() {
+            self.window.set_keyboard_mode(KeyboardMode::None);
+        }
+        self.bg_canvas.queue_draw();
+    }
+
+    /// Clears drag tracking and triggers hover-leave collapse if the pointer already exited during drag.
+    fn finish_pointer_drag(&self, clear_flag: impl FnOnce(&mut IslandState)) {
+        clear_flag(&mut self.state.borrow_mut());
+        if !self.hover_motion.contains_pointer() {
+            self.on_hover_leave();
+        }
     }
 
     /// Closes pinned or hover-expanded mode and cleanly returns keyboard focus to the active app.
@@ -3266,9 +3355,7 @@ impl DynamicIsland {
             prev
         };
         if was_active {
-            if gtk4_layer_shell::is_supported() {
-                self.window.set_keyboard_mode(KeyboardMode::None);
-            }
+            self.release_keyboard_focus();
             self.backdrop_window.set_visible(false);
             self.sync_ui();
         }
@@ -3311,11 +3398,191 @@ impl DynamicIsland {
         self.sync_ui();
     }
 
+    /// Updates compositor protocol capability & cached wallpaper glass surface cleanly even
+    /// when `--open-island-test` freezes normal state machine updates.
+    pub fn sync_compositor_backdrop_caps(&self, snapshot: &DesktopSnapshot) {
+        let gpu_ok = snapshot.appearance.protocol_rev >= neon_ipc::APPEARANCE_PROTOCOL_REV;
+        let is_light =
+            snapshot.appearance.theme == "neon_light" || snapshot.appearance.theme == "light";
+        let (out_w, out_h) = snapshot
+            .outputs
+            .first()
+            .map(|o| (o.width.max(CANVAS_W), o.height.max(CANVAS_H)))
+            .unwrap_or((1920, 1080));
+        let became_gpu_capable = {
+            let mut st = self.state.borrow_mut();
+            let effective_gpu = gpu_ok && !st.test_force_cairo_glass;
+            let prev = st.gpu_glass_supported;
+            st.gpu_glass_supported = effective_gpu;
+            st.last_wp_hint = snapshot.appearance.wallpaper.clone();
+            st.last_is_light = is_light;
+            st.output_w = out_w;
+            st.output_h = out_h;
+            !prev && effective_gpu
+        };
+        if became_gpu_capable {
+            self.sync_appearance_layout();
+        }
+        self.ensure_liquid_glass_wallpaper_cache();
+    }
+
+    fn ensure_liquid_glass_wallpaper_cache(&self) {
+        let key_opt = {
+            let mut st = self.state.borrow_mut();
+            if st.prefs.appearance != NotchAppearance::LiquidGlass {
+                return;
+            }
+            if st.gpu_glass_supported {
+                if st.glass_wp_surface.is_some() {
+                    st.glass_wp_surface = None;
+                    st.last_wallpaper_key = None;
+                }
+                return;
+            }
+            let key = (
+                st.last_wp_hint.clone(),
+                st.last_is_light,
+                st.output_w,
+                st.output_h,
+            );
+            if st.last_wallpaper_key.as_ref() == Some(&key) && st.glass_wp_surface.is_some() {
+                return;
+            }
+            Some(key)
+        };
+        let Some(key) = key_opt else {
+            return;
+        };
+        let loaded = crate::wallpaper::resolve_wallpaper_path(key.0.as_deref(), key.1).and_then(
+            |wp_path| {
+                crate::wallpaper::load_top_center_blurred_glass_surface(
+                    &wp_path, key.2, key.3, CANVAS_W, CANVAS_H, 8,
+                )
+            },
+        );
+        {
+            let mut st = self.state.borrow_mut();
+            st.last_wallpaper_key = Some(key);
+            if let Some((surf, avg_lum)) = loaded {
+                st.glass_wp_surface = Some(surf);
+                st.glass_wp_avg_lum = avg_lum;
+            }
+        }
+        self.bg_canvas.queue_draw();
+        self.dock_bg_canvas.queue_draw();
+    }
+
+    fn sync_glass_regions_clear(&self) {
+        if !self.state.borrow().gpu_glass_supported {
+            return;
+        }
+        let mut last = self.last_sent_glass.borrow_mut();
+        if !last.is_empty() {
+            last.clear();
+            self.ipc
+                .send(IpcRequest::SetDynamicIslandGlass { regions: Vec::new() });
+        }
+    }
+
+    fn sync_glass_regions(
+        &self,
+        top_off: i32,
+        cur_w: f64,
+        cur_h: f64,
+        cur_br: f64,
+        close_fade: f64,
+        show_dock: bool,
+        dock_op: f64,
+    ) {
+        let (gpu_ok, is_liquid, palette, neon, hi_snapped) = {
+            let st = self.state.borrow();
+            (
+                st.gpu_glass_supported,
+                st.prefs.appearance == NotchAppearance::LiquidGlass,
+                st.cur_palette,
+                st.neon_intensity,
+                st.shell_cur_h_px,
+            )
+        };
+        if !gpu_ok {
+            return;
+        }
+        if !is_liquid || close_fade <= 0.004 || !self.window.is_visible() {
+            self.sync_glass_regions_clear();
+            return;
+        }
+
+        let w = (((cur_w * 0.5).round()) * 2.0).max(112.0) as f32;
+        let h = cur_h.round().max(30.0) as f32;
+        let x = ((f32::from(CANVAS_W as i16) - w) * 0.5).round();
+        let y = top_off as f32;
+        let r = (cur_br as f32).clamp(14.0, (h * 0.5).min(w * 0.5));
+        let (tint_rgb, tint_strength) = if neon > 0.02 {
+            (
+                [
+                    palette.primary.r as f32,
+                    palette.primary.g as f32,
+                    palette.primary.b as f32,
+                ],
+                (neon * 0.85) as f32,
+            )
+        } else {
+            ([0.0, 0.0, 0.0], 0.0)
+        };
+
+        let mut regions = Vec::with_capacity(2);
+        regions.push(GlassShapeRect {
+            x,
+            y,
+            width: w,
+            height: h,
+            top_radius: r,
+            bottom_radius: r,
+            ear_radius: 0.0,
+            alpha: close_fade.clamp(0.0, 1.0) as f32,
+            tint_rgb,
+            tint_strength,
+        });
+
+        let dock_a = (close_fade * dock_op).clamp(0.0, 1.0) as f32;
+        if show_dock && dock_a > 0.015 {
+            let (_, nat) = self.dock_pill.preferred_size();
+            let raw_w = self.dock_pill.width().max(nat.width());
+            if raw_w > 40 {
+                let vis_w = (raw_w as f32 - 24.0).max(40.0).round();
+                let vis_h = (DOCK_H as f32 - 18.0).max(24.0).round();
+                let vis_x = ((f32::from(CANVAS_W as i16) - vis_w) * 0.5).round();
+                let vis_y = (top_off + hi_snapped + DOCK_GAP) as f32 + 4.0;
+                let vis_r = (vis_h * 0.5).clamp(12.0, 20.0);
+                regions.push(GlassShapeRect {
+                    x: vis_x,
+                    y: vis_y,
+                    width: vis_w,
+                    height: vis_h,
+                    top_radius: vis_r,
+                    bottom_radius: vis_r,
+                    ear_radius: 0.0,
+                    alpha: dock_a,
+                    tint_rgb: [0.0, 0.0, 0.0],
+                    tint_strength: 0.0,
+                });
+            }
+        }
+
+        let mut last = self.last_sent_glass.borrow_mut();
+        if *last != regions {
+            *last = regions.clone();
+            self.ipc.send(IpcRequest::SetDynamicIslandGlass { regions });
+        }
+    }
+
     pub fn update_desktop(&self, snapshot: &DesktopSnapshot, combined_mode: bool) {
         self.motion_enabled
             .set(snapshot.effects.enabled && !snapshot.effects.reduced_motion);
         self.speed_scale
             .set(snapshot.effects.speed_scale.clamp(0.5, 2.5));
+
+        self.sync_compositor_backdrop_caps(snapshot);
 
         let obscured = is_island_obscured_by_windows(snapshot);
         let obscured_fullscreen = is_island_obscured_by_fullscreen(snapshot);
@@ -3583,8 +3850,20 @@ impl DynamicIsland {
 
     /// Preview helper for automated visual verification (`compact`, `charging`, `silent`, `notif`,
     /// `home`, `media`, `timer`, `clipboard`, `files`, `notes`, `calendar`, `tools`, `stats`,
-    /// `battery`, `awake`, `store`).
+    /// `battery`, `awake`, `store`, or `liquid-*` to preview Apple Liquid Glass).
     pub fn open_for_test(&self, mode: &str) {
+        let (force_liquid, force_cairo, effective_mode) =
+            if let Some(rest) = mode.strip_prefix("liquid-cairo-") {
+                (true, true, rest)
+            } else if mode == "liquid-cairo" {
+                (true, true, "home")
+            } else if let Some(rest) = mode.strip_prefix("liquid-") {
+                (true, false, rest)
+            } else if mode == "liquid" {
+                (true, false, "home")
+            } else {
+                (false, false, mode)
+            };
         {
             let mut st = self.state.borrow_mut();
             st.combined_mode = true;
@@ -3595,10 +3874,17 @@ impl DynamicIsland {
             st.workspaces_open = false;
             st.hud_popup = None;
             st.active_notif = None;
-            let is_compact_preview = matches!(mode, "compact" | "charging" | "silent");
+            if force_liquid {
+                st.prefs.appearance = NotchAppearance::LiquidGlass;
+            }
+            if force_cairo {
+                st.test_force_cairo_glass = true;
+                st.gpu_glass_supported = false;
+            }
+            let is_compact_preview = matches!(effective_mode, "compact" | "charging" | "silent");
             st.test_force_expand = !is_compact_preview;
             st.hovered = !is_compact_preview;
-            st.active_module = match mode {
+            st.active_module = match effective_mode {
                 "charging" => {
                     st.hud_popup = Some(LivePillPopup {
                         kind: LivePillKind::Charging {
@@ -3680,6 +3966,7 @@ impl DynamicIsland {
         self.prepare_module_data(active);
         self.rebuild_dock_bar();
         self.sync_ui();
+        self.sync_appearance_layout();
     }
 
     // =========================================================================
@@ -3700,10 +3987,10 @@ impl DynamicIsland {
         self.rebuild_dock_bar();
         if module == NotchModule::Tools {
             self.sync_ui();
-            self.focus_tools_calculator();
+            self.focus_text_input(&self.tools_calc_entry, true);
         } else {
-            if !self.state.borrow().pinned_open && gtk4_layer_shell::is_supported() {
-                self.window.set_keyboard_mode(KeyboardMode::None);
+            if !self.state.borrow().pinned_open {
+                self.release_keyboard_focus();
             }
             self.sync_ui();
         }
@@ -3757,10 +4044,15 @@ impl DynamicIsland {
             canvas.set_valign(Align::Center);
             canvas.set_can_target(false);
 
+            let st_rc_dock = Rc::clone(&self.state);
             let hov_draw = Rc::clone(&hovered);
-            canvas.set_draw_func(move |_, cr, w, h| {
+            canvas.set_draw_func(move |area, cr, w, h| {
+                let is_lg = st_rc_dock.borrow().prefs.appearance == NotchAppearance::LiquidGlass
+                    || widget_in_liquid_glass(area);
                 let rgba = if is_active || hov_draw.get() {
                     (1.0, 1.0, 1.0, 0.98)
+                } else if is_lg {
+                    (0.90, 0.94, 1.0, 0.84)
                 } else {
                     (0.62, 0.62, 0.66, 0.95)
                 };
@@ -3797,6 +4089,11 @@ impl DynamicIsland {
         }
         self.dock_store_canvas.queue_draw();
         self.dock_bg_canvas.queue_draw();
+        if self.state.borrow().prefs.appearance == NotchAppearance::LiquidGlass
+            && self.window.is_visible()
+        {
+            self.sync_appearance_layout();
+        }
     }
 
     fn rebuild_store_ui(&self) {
@@ -3917,15 +4214,18 @@ impl DynamicIsland {
     }
 
     fn sync_appearance_layout(&self) {
-        let (is_notch, stealth, outgoing, w, h, alpha) = {
+        let (is_notch, is_liquid_glass, stealth, outgoing, w, h, br, alpha, target_exp) = {
             let st = self.state.borrow();
             (
                 st.prefs.appearance.is_top_flush_notch(),
+                st.prefs.appearance == NotchAppearance::LiquidGlass,
                 st.is_stealth_sensor(),
                 st.outgoing_drag,
                 st.morph.w.value,
                 st.morph.h.value,
+                st.morph.br.value,
                 st.morph.alpha.value,
+                st.morph.target_expanded,
             )
         };
         let top_off = if is_notch { 0 } else { SHELL_TOP_OFFSET };
@@ -3935,8 +4235,22 @@ impl DynamicIsland {
         } else {
             self.shell_box.remove_css_class("notch-flush");
         }
+        if is_liquid_glass {
+            self.stage.add_css_class("liquid-glass");
+            self.ensure_liquid_glass_wallpaper_cache();
+        } else {
+            self.stage.remove_css_class("liquid-glass");
+            self.sync_glass_regions_clear();
+        }
         self.bg_canvas.queue_draw();
         self.dock_bg_canvas.queue_draw();
+        if is_liquid_glass && !stealth && !outgoing && self.window.is_visible() {
+            let show_dock = self.dock_pill.is_visible();
+            self.sync_glass_regions(top_off, w, h, br, 1.0, show_dock, self.dock_pill.opacity());
+        } else if stealth {
+            self.sync_glass_regions_clear();
+        }
+        let _ = target_exp;
         if outgoing {
             apply_passthrough_input_region(&self.window);
         } else if stealth {
@@ -4750,10 +5064,9 @@ impl DynamicIsland {
     // ---- Quick Notes ----
 
     fn insert_note_snippet(&self, snippet: &str) {
-        self.promote_to_pinned();
         let buf = self.notes_editor.buffer();
         buf.insert_at_cursor(snippet);
-        self.notes_editor.grab_focus();
+        self.focus_text_input(&self.notes_editor, false);
     }
 
     fn refresh_notes_sidebar_only(&self) {
@@ -5234,7 +5547,7 @@ impl DynamicIsland {
     fn handle_key_pressed(&self, key: gdk::Key, mods: gdk::ModifierType) -> glib::Propagation {
         let can_handle = {
             let st = self.state.borrow();
-            st.pinned_open || (st.hovered && st.active_module == NotchModule::Tools)
+            st.pinned_open || st.hovered
         };
         if !can_handle {
             return glib::Propagation::Proceed;
@@ -5335,7 +5648,7 @@ impl DynamicIsland {
                 self.rebuild_dock_bar();
                 self.sync_ui();
                 if m == NotchModule::Tools {
-                    self.focus_tools_calculator();
+                    self.focus_text_input(&self.tools_calc_entry, true);
                 }
             }
             HoverAction::Dwell(epoch) => {
@@ -5362,7 +5675,7 @@ impl DynamicIsland {
                         di.rebuild_dock_bar();
                         di.sync_ui();
                         if m == NotchModule::Tools {
-                            di.focus_tools_calculator();
+                            di.focus_text_input(&di.tools_calc_entry, true);
                         }
                     }
                 });
@@ -5374,13 +5687,7 @@ impl DynamicIsland {
         let epoch = {
             let mut st = self.state.borrow_mut();
             st.hover_gen = st.hover_gen.wrapping_add(1);
-            if st.test_force_expand
-                || st.pinned_open
-                || st.media_dragging
-                || st.timer_dragging
-                || st.drag_hover
-                || st.outgoing_drag
-            {
+            if !should_collapse_on_leave(&st) {
                 return;
             }
             st.hover_gen
@@ -5389,14 +5696,7 @@ impl DynamicIsland {
         glib::timeout_add_local_once(Duration::from_millis(200), move || {
             let should_collapse = {
                 let mut st = di.state.borrow_mut();
-                if st.hover_gen == epoch
-                    && !st.pinned_open
-                    && !st.test_force_expand
-                    && !st.media_dragging
-                    && !st.timer_dragging
-                    && !st.drag_hover
-                    && !st.outgoing_drag
-                {
+                if st.hover_gen == epoch && should_collapse_on_leave(&st) {
                     st.hovered = false;
                     if !st.desktop_drag_active {
                         st.peek_over_obscured = false;
@@ -5407,9 +5707,7 @@ impl DynamicIsland {
                 }
             };
             if should_collapse {
-                if gtk4_layer_shell::is_supported() {
-                    di.window.set_keyboard_mode(KeyboardMode::None);
-                }
+                di.release_keyboard_focus();
                 di.sync_ui();
             }
         });
@@ -5535,9 +5833,9 @@ impl DynamicIsland {
             "hud" => (468.0, 164.0, 32.0),
             "store" => (628.0, 308.0, 32.0),
             "notif" => {
-                let (_, nat_h, _, _) = self.notif_page.measure(Orientation::Vertical, 368);
+                let (_, nat_h, _, _) = self.notif_page.measure(Orientation::Vertical, 396);
                 let nh = f64::from((((nat_h + 11) / 2) * 2).clamp(74, 152));
-                (396.0, nh, (nh * 0.5).min(36.0))
+                (404.0, nh, (nh * 0.5).min(36.0))
             }
             "recording" => {
                 let (_, nat_h, _, _) = self.rec_page.measure(Orientation::Vertical, 348);
@@ -5723,19 +6021,22 @@ impl DynamicIsland {
             self.shell_box.set_size_request(wi, hi);
         }
 
-        let (wants_stealth, stealth_settled, outgoing, show_dock_allowed, top_off) = {
-            let st = self.state.borrow();
+        let (wants_stealth, stealth_settled, outgoing, show_dock_allowed, top_off, cur_br) = {
+            let mut st = self.state.borrow_mut();
             let top_off = if st.prefs.appearance.is_top_flush_notch() {
                 0
             } else {
                 SHELL_TOP_OFFSET
             };
+            st.shell_top_off_px = top_off;
+            st.shell_cur_h_px = hi;
             (
                 st.wants_stealth_sensor(),
                 st.is_stealth_sensor(),
                 st.outgoing_drag,
                 st.active_notif.is_none() && !st.recording_active && !st.outgoing_drag,
                 top_off,
+                st.morph.br.value,
             )
         };
 
@@ -5753,6 +6054,7 @@ impl DynamicIsland {
             }
             self.shell_box.remove_css_class("expanded");
             self.bg_canvas.queue_draw();
+            self.sync_glass_regions_clear();
             apply_sensor_input_region(&self.window);
             return;
         }
@@ -5818,6 +6120,12 @@ impl DynamicIsland {
         if show_dock {
             self.dock_bg_canvas.queue_draw();
         }
+        let close_fade = if wants_stealth {
+            smoothstep((alpha / 0.55).clamp(0.0, 1.0))
+        } else {
+            1.0
+        };
+        self.sync_glass_regions(top_off, w, h, cur_br, close_fade, show_dock, dock_op);
         if outgoing {
             apply_passthrough_input_region(&self.window);
         } else if wants_stealth {
@@ -5922,6 +6230,7 @@ impl DynamicIsland {
             self.dock_pill.set_visible(false);
             self.shell_box.remove_css_class("expanded");
             self.window.set_visible(false);
+            self.sync_glass_regions_clear();
             return;
         }
 
@@ -6267,6 +6576,34 @@ impl DynamicIsland {
     }
 }
 
+/// Returns `true` when hover-out should collapse the Dynamic Island (unpinned and idle).
+fn should_collapse_on_leave(st: &IslandState) -> bool {
+    !(st.test_force_expand
+        || st.pinned_open
+        || st.media_dragging
+        || st.timer_dragging
+        || st.drag_hover
+        || st.outgoing_drag)
+}
+
+/// Grants keyboard focus in capture phase when clicking an island text control without pinning
+/// the Dynamic Island, so `GtkText`/`TextView` child gestures never swallow keyboard activation
+/// and hovering out still collapses cleanly.
+fn attach_hover_focus_click<W: gtk4::glib::object::IsA<gtk4::Widget> + Clone + 'static>(
+    island: &DynamicIsland,
+    widget: &W,
+    caret_end: bool,
+) {
+    let click_focus = GestureClick::new();
+    click_focus.set_propagation_phase(gtk4::PropagationPhase::Capture);
+    let di_f = island.clone();
+    let w_f = widget.clone();
+    click_focus.connect_pressed(move |_, _, _, _| {
+        di_f.focus_text_input(&w_f, caret_end);
+    });
+    widget.add_controller(click_focus);
+}
+
 fn attach_vertical_wheel_to_horizontal_scroll(scroller: &ScrolledWindow) {
     let scroll = EventControllerScroll::new(EventControllerScrollFlags::VERTICAL);
     scroll.set_propagation_phase(gtk4::PropagationPhase::Capture);
@@ -6335,6 +6672,20 @@ fn build_module_badge_canvas(module: NotchModule, size: i32) -> DrawingArea {
     area
 }
 
+fn widget_in_liquid_glass(widget: &impl IsA<gtk4::Widget>) -> bool {
+    let mut cur = widget.upcast_ref::<gtk4::Widget>().parent();
+    for _ in 0..12 {
+        let Some(w) = cur else {
+            break;
+        };
+        if w.has_css_class("liquid-glass") {
+            return true;
+        }
+        cur = w.parent();
+    }
+    false
+}
+
 fn build_round_pin_btn(pinned: bool, size: i32, accent: Rgb, tooltip: &str) -> Button {
     let btn = Button::new();
     btn.add_css_class("neon-ios-frameless-btn");
@@ -6351,8 +6702,29 @@ fn build_round_pin_btn(pinned: bool, size: i32, accent: Rgb, tooltip: &str) -> B
     canvas.set_can_target(false);
 
     let hov_draw = Rc::clone(&hovered);
-    canvas.set_draw_func(move |_, cr, w, h| {
-        draw_round_pin_button(cr, f64::from(w), f64::from(h), pinned, hov_draw.get(), accent);
+    canvas.set_draw_func(move |area, cr, w, h| {
+        if !pinned && widget_in_liquid_glass(area) {
+            let bg = (1.0, 1.0, 1.0, if hov_draw.get() { 0.28 } else { 0.16 });
+            let fg = (1.0, 1.0, 1.0, 0.94);
+            draw_round_circle_button(
+                cr,
+                f64::from(w),
+                f64::from(h),
+                bg,
+                fg,
+                UiVectorIcon::Pin { pinned: false },
+            );
+            let cw = f64::from(w);
+            let ch = f64::from(h);
+            let r = (cw.min(ch) * 0.5 - 0.5).max(8.0);
+            cr.new_sub_path();
+            cr.arc(cw * 0.5, ch * 0.5, r, 0.0, std::f64::consts::TAU);
+            cr.set_source_rgba(1.0, 1.0, 1.0, if hov_draw.get() { 0.44 } else { 0.30 });
+            cr.set_line_width(0.95);
+            let _ = cr.stroke();
+        } else {
+            draw_round_pin_button(cr, f64::from(w), f64::from(h), pinned, hov_draw.get(), accent);
+        }
     });
 
     let h_in = Rc::clone(&hovered);
@@ -6389,13 +6761,26 @@ fn build_round_close_btn(size: i32, tooltip: &str) -> Button {
     canvas.set_can_target(false);
 
     let hov_draw = Rc::clone(&hovered);
-    canvas.set_draw_func(move |_, cr, w, h| {
+    canvas.set_draw_func(move |area, cr, w, h| {
+        let liquid_glass = widget_in_liquid_glass(area);
         let (bg, fg) = if hov_draw.get() {
-            ((1.0, 0.23, 0.19, 0.92), (1.0, 1.0, 1.0, 0.98))
+            ((1.0, 0.23, 0.19, 0.88), (1.0, 1.0, 1.0, 0.98))
+        } else if liquid_glass {
+            ((1.0, 1.0, 1.0, 0.16), (1.0, 1.0, 1.0, 0.90))
         } else {
             ((0.20, 0.20, 0.22, 0.92), (0.72, 0.72, 0.75, 0.95))
         };
         draw_round_circle_button(cr, f64::from(w), f64::from(h), bg, fg, UiVectorIcon::Close);
+        if liquid_glass && !hov_draw.get() {
+            let cw = f64::from(w);
+            let ch = f64::from(h);
+            let r = (cw.min(ch) * 0.5 - 0.5).max(6.0);
+            cr.new_sub_path();
+            cr.arc(cw * 0.5, ch * 0.5, r, 0.0, std::f64::consts::TAU);
+            cr.set_source_rgba(1.0, 1.0, 1.0, 0.30);
+            cr.set_line_width(0.9);
+            let _ = cr.stroke();
+        }
     });
 
     let h_in = Rc::clone(&hovered);
@@ -6917,5 +7302,40 @@ mod tests {
         assert_eq!(format_duration_us(3_665_000_000), "1:01:05");
         assert_eq!(format_mm_ss(1505), "25:05");
         assert_eq!(format_hh_mm_ss(7199), "1:59:59");
+    }
+}
+
+#[cfg(test)]
+mod hover_leave_tests {
+    use super::*;
+
+    #[test]
+    fn hover_leave_allows_collapse_unless_pinned_or_dragging() {
+        let mut st = IslandState::new();
+        st.hovered = true;
+        assert!(should_collapse_on_leave(&st));
+
+        st.pinned_open = true;
+        assert!(!should_collapse_on_leave(&st));
+        st.pinned_open = false;
+
+        st.media_dragging = true;
+        assert!(!should_collapse_on_leave(&st));
+        st.media_dragging = false;
+
+        st.timer_dragging = true;
+        assert!(!should_collapse_on_leave(&st));
+        st.timer_dragging = false;
+
+        st.drag_hover = true;
+        assert!(!should_collapse_on_leave(&st));
+        st.drag_hover = false;
+
+        st.outgoing_drag = true;
+        assert!(!should_collapse_on_leave(&st));
+        st.outgoing_drag = false;
+
+        st.test_force_expand = true;
+        assert!(!should_collapse_on_leave(&st));
     }
 }

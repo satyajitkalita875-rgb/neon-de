@@ -721,6 +721,7 @@ fn main() {
                     notification_center.set_anchor_bottom(combined_mode, bar_margin);
                     toast_overlay.set_anchor_bottom(combined_mode, bar_margin);
                     toast_overlay.set_island_routed(island_active);
+                    dynamic_island.sync_compositor_backdrop_caps(&snapshot);
                     if open_island_timer.is_none() {
                         dynamic_island.update_desktop(&snapshot, combined_mode);
                     }

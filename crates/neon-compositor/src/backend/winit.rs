@@ -384,6 +384,7 @@ fn render_frame(
         speed_scale: state.effects.config.speed_scale as f32,
     };
     neon_renderer.set_motion_config(blur.animations_enabled, blur.speed_scale);
+    neon_renderer.set_dynamic_island_glass(&state.dynamic_island_glass_regions);
     neon_renderer.sync_cursor_config(
         &state.config.appearance.cursor_theme,
         state.config.appearance.cursor_size,

@@ -865,9 +865,11 @@ impl Dock {
                 let wave_c = Rc::clone(&wave_state);
                 let cont_c = container.clone();
                 let lbl_c = dock_label.clone();
+                let prev_c = dock_preview.clone();
                 wave_motion.connect_leave(move |_| {
                     clear_dock_wave(&wave_c, &cont_c);
                     lbl_c.hide_immediate();
+                    prev_c.on_dock_item_leave();
                 });
             }
             container.add_controller(wave_motion);
@@ -1073,6 +1075,7 @@ impl Dock {
     fn rebuild_pinned_buttons(&self, favorites: &[DesktopApp], icon_size: i32) {
         invalidate_dock_wave(&self.wave_state, &self.container);
         self.dock_label.hide_immediate();
+        self.dock_preview.on_dock_item_leave();
         while let Some(child) = self.pinned_box.first_child() {
             self.pinned_box.remove(&child);
         }
@@ -1631,6 +1634,7 @@ impl Dock {
 
         invalidate_dock_wave(&self.wave_state, &self.container);
         self.dock_label.hide_immediate();
+        self.dock_preview.on_dock_item_leave();
         while let Some(child) = self.running_box.first_child() {
             self.running_box.remove(&child);
         }

@@ -630,6 +630,9 @@ fn render_all_drm_outputs(rt: &mut DrmRuntime, state: &mut NeonState) {
         active
             .neon_renderer
             .set_motion_config(blur.animations_enabled, blur.speed_scale);
+        active
+            .neon_renderer
+            .set_dynamic_island_glass(&state.dynamic_island_glass_regions);
     }
     if !state.pending_overlay_anims.is_empty() {
         let anims = std::mem::take(&mut state.pending_overlay_anims);

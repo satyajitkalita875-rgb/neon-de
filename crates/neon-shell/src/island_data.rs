@@ -322,6 +322,9 @@ impl QuickNote {
     }
 }
 
+const LEGACY_INITIAL_NOTE_BODY: &str =
+    "# Quick Scratchpad\n- [ ] Jot ideas without leaving your app\n- [ ] Press Super+N anytime";
+
 /// Persistent local store for Little Notch Quick Notes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QuickNotesStore {
@@ -333,12 +336,20 @@ pub struct QuickNotesStore {
 
 impl QuickNotesStore {
     pub fn load() -> Self {
-        let path = notch_data_dir().join("notch-notes.json");
+        Self::load_from(notch_data_dir().join("notch-notes.json"))
+    }
+
+    pub fn load_from(path: PathBuf) -> Self {
         if let Ok(raw) = fs::read_to_string(&path)
             && let Ok(mut parsed) = serde_json::from_str::<Self>(&raw)
         {
             parsed.path = Some(path);
-            if parsed.notes.is_empty() {
+            let cleared_legacy =
+                parsed.notes.len() == 1 && parsed.notes[0].body == LEGACY_INITIAL_NOTE_BODY;
+            if cleared_legacy {
+                parsed.notes[0].body.clear();
+                parsed.save();
+            } else if parsed.notes.is_empty() {
                 parsed.ensure_initial_note();
             }
             return parsed;
@@ -352,28 +363,27 @@ impl QuickNotesStore {
         store
     }
 
+    fn new_empty_note(&mut self) -> QuickNote {
+        let id = self.next_id;
+        self.next_id += 1;
+        QuickNote {
+            id,
+            body: String::new(),
+            updated_unix: now_unix(),
+        }
+    }
+
     fn ensure_initial_note(&mut self) {
         if self.notes.is_empty() {
-            self.notes.push(QuickNote {
-                id: self.next_id,
-                body: "# Quick Scratchpad\n- [ ] Jot ideas without leaving your app\n- [ ] Press Super+N anytime".into(),
-                updated_unix: now_unix(),
-            });
-            self.next_id += 1;
+            let note = self.new_empty_note();
+            self.notes.push(note);
         }
     }
 
     pub fn create(&mut self) -> u64 {
-        let id = self.next_id;
-        self.next_id += 1;
-        self.notes.insert(
-            0,
-            QuickNote {
-                id,
-                body: "# New Note\n".into(),
-                updated_unix: now_unix(),
-            },
-        );
+        let note = self.new_empty_note();
+        let id = note.id;
+        self.notes.insert(0, note);
         self.save();
         id
     }
@@ -1085,5 +1095,56 @@ mod tests {
             percent_decode_uri_path("/home/user/My%20File%20%281%29.png"),
             "/home/user/My File (1).png"
         );
+    }
+
+    #[test]
+    fn quick_notes_store_defaults_to_empty_and_preserves_user_notes() {
+        let dir = std::env::temp_dir().join(format!("neon-notes-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("notch-notes.json");
+
+        // Fresh load starts with an empty note body.
+        let mut store = QuickNotesStore::load_from(path.clone());
+        assert_eq!(store.notes.len(), 1);
+        assert_eq!(store.notes[0].body, "");
+        assert_eq!(store.notes[0].title_line(), "Untitled Note");
+        assert_eq!(store.notes[0].preview_line(), "Empty note");
+
+        // Creating a new note starts empty too; deleting the last note resets to empty.
+        let new_id = store.create();
+        assert_eq!(store.notes[0].id, new_id);
+        assert_eq!(store.notes[0].body, "");
+        let prev_id = store.notes[1].id;
+        let next = store.delete(new_id);
+        assert_eq!(next, Some(prev_id));
+        let reset_id = store.delete(prev_id).unwrap();
+        assert_eq!(store.notes.len(), 1);
+        assert_eq!(store.notes[0].id, reset_id);
+        assert_eq!(store.notes[0].body, "");
+
+        // Legacy untouched default scratchpad migrates to empty on load.
+        let legacy = QuickNotesStore {
+            next_id: 7,
+            notes: vec![QuickNote {
+                id: 6,
+                body: LEGACY_INITIAL_NOTE_BODY.into(),
+                updated_unix: 100,
+            }],
+            path: Some(path.clone()),
+        };
+        legacy.save();
+        let migrated = QuickNotesStore::load_from(path.clone());
+        assert_eq!(migrated.notes.len(), 1);
+        assert_eq!(migrated.notes[0].body, "");
+
+        // Real user note text is preserved untouched.
+        let mut custom = migrated;
+        let cid = custom.notes[0].id;
+        custom.update_body(cid, "Shopping list".into());
+        let reloaded = QuickNotesStore::load_from(path);
+        assert_eq!(reloaded.notes[0].body, "Shopping list");
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

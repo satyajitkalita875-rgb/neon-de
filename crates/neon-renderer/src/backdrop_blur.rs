@@ -499,3 +499,236 @@ impl RenderElement<GlesRenderer> for BlurredBackdropElement {
         )
     }
 }
+
+/// Screen-space Liquid Glass region descriptor consumed by `NeonRenderer` to composite
+/// real-time refractive Apple Liquid Glass behind `neon-dynamic-island`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DynamicIslandGlassRect {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+    pub top_radius: f32,
+    pub bottom_radius: f32,
+    pub ear_radius: f32,
+    pub alpha: f32,
+    pub tint_rgb: [f32; 3],
+    pub tint_strength: f32,
+}
+
+/// Renders an Apple Liquid Glass Dynamic Island capsule or floating Dock Switcher pill over the
+/// blurred desktop scene texture with Snell rim refraction, R/G/B chromatic dispersion, adaptive
+/// luminance glazing, 3D specular edge bevels, and a soft ambient Mac elevation shadow.
+#[derive(Debug)]
+pub struct LiquidGlassElement {
+    id: Id,
+    commit: CommitCounter,
+    texture: GlesTexture,
+    src_rect: Rectangle<f64, BufferCoord>,
+    dst_rect: Rectangle<i32, Physical>,
+    shape_rect: Rectangle<i32, Physical>,
+    top_radius_phys: f32,
+    bottom_radius_phys: f32,
+    scale_factor: f32,
+    tint_rgba: [f32; 4],
+    program: Option<GlesTexProgram>,
+    alpha: f32,
+}
+
+impl LiquidGlassElement {
+    /// Creates a `LiquidGlassElement` for one glass pill (`shape_rect` in physical output coords).
+    /// Adds outer padding for a soft Mac ambient elevation shadow while sampling `texture` strictly
+    /// within its half-texel safe UV bounds.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        id: Id,
+        commit: CommitCounter,
+        texture: GlesTexture,
+        output_phys: Size<i32, Physical>,
+        shape_rect: Rectangle<i32, Physical>,
+        top_radius_phys: f32,
+        bottom_radius_phys: f32,
+        scale_factor: f32,
+        tint_rgba: [f32; 4],
+        program: Option<GlesTexProgram>,
+        alpha: f32,
+    ) -> Option<Self> {
+        if shape_rect.size.w <= 0
+            || shape_rect.size.h <= 0
+            || output_phys.w <= 0
+            || output_phys.h <= 0
+            || alpha <= 0.001
+        {
+            return None;
+        }
+        let shadow_pad = (9.0 * scale_factor.max(1.0)).ceil() as i32;
+        let full_rect = Rectangle::new(
+            Point::from((shape_rect.loc.x - shadow_pad, shape_rect.loc.y - shadow_pad)),
+            Size::from((
+                shape_rect.size.w + shadow_pad * 2,
+                shape_rect.size.h + shadow_pad * 2,
+            )),
+        );
+        let screen_rect = Rectangle::from_size(output_phys);
+        let visible_dst = full_rect.intersection(screen_rect)?;
+        if visible_dst.size.w <= 0 || visible_dst.size.h <= 0 {
+            return None;
+        }
+
+        let tex_size = texture.size();
+        if tex_size.w <= 0 || tex_size.h <= 0 {
+            return None;
+        }
+        let scale_x = tex_size.w as f64 / output_phys.w as f64;
+        let scale_y = tex_size.h as f64 / output_phys.h as f64;
+        let max_u = (tex_size.w as f64 - 0.5).max(0.5);
+        let max_v = (tex_size.h as f64 - 0.5).max(0.5);
+        let x0 = (visible_dst.loc.x as f64 * scale_x).clamp(0.5, max_u);
+        let y0 = (visible_dst.loc.y as f64 * scale_y).clamp(0.5, max_v);
+        let x1 = ((visible_dst.loc.x + visible_dst.size.w) as f64 * scale_x)
+            .clamp(x0 + 0.01, max_u + 0.01);
+        let y1 = ((visible_dst.loc.y + visible_dst.size.h) as f64 * scale_y)
+            .clamp(y0 + 0.01, max_v + 0.01);
+        let src_rect = Rectangle::new(Point::from((x0, y0)), Size::from((x1 - x0, y1 - y0)));
+
+        Some(Self {
+            id,
+            commit,
+            texture,
+            src_rect,
+            dst_rect: visible_dst,
+            shape_rect,
+            top_radius_phys,
+            bottom_radius_phys,
+            scale_factor: scale_factor.max(1.0),
+            tint_rgba,
+            program,
+            alpha,
+        })
+    }
+}
+
+impl Element for LiquidGlassElement {
+    fn id(&self) -> &Id {
+        &self.id
+    }
+
+    fn current_commit(&self) -> CommitCounter {
+        self.commit
+    }
+
+    fn location(&self, _scale: Scale<f64>) -> Point<i32, Physical> {
+        self.dst_rect.loc
+    }
+
+    fn src(&self) -> Rectangle<f64, BufferCoord> {
+        self.src_rect
+    }
+
+    fn transform(&self) -> Transform {
+        Transform::Normal
+    }
+
+    fn geometry(&self, _scale: Scale<f64>) -> Rectangle<i32, Physical> {
+        self.dst_rect
+    }
+
+    fn damage_since(
+        &self,
+        _scale: Scale<f64>,
+        commit: Option<CommitCounter>,
+    ) -> DamageSet<i32, Physical> {
+        if commit == Some(self.commit) {
+            DamageSet::default()
+        } else {
+            DamageSet::from_slice(&[Rectangle::from_size(self.dst_rect.size)])
+        }
+    }
+
+    fn opaque_regions(&self, _scale: Scale<f64>) -> OpaqueRegions<i32, Physical> {
+        OpaqueRegions::default()
+    }
+
+    fn alpha(&self) -> f32 {
+        self.alpha
+    }
+
+    fn kind(&self) -> Kind {
+        Kind::Unspecified
+    }
+}
+
+impl RenderElement<GlesRenderer> for LiquidGlassElement {
+    fn underlying_storage(&self, _renderer: &mut GlesRenderer) -> Option<UnderlyingStorage<'_>> {
+        None
+    }
+
+    fn draw(
+        &self,
+        frame: &mut GlesFrame<'_, '_>,
+        src: Rectangle<f64, BufferCoord>,
+        dst: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
+        _opaque_regions: &[Rectangle<i32, Physical>],
+    ) -> Result<(), GlesError> {
+        let tex_size = self.texture.size();
+        if let Some(ref prog) = self.program
+            && let Some((uv0, inv_mat, fwd_mat)) = crate::rounded::compute_uv_transform(
+                src,
+                dst.size,
+                tex_size,
+                Transform::Normal,
+                self.texture.is_y_inverted(),
+            )
+            && tex_size.w > 0
+            && tex_size.h > 0
+        {
+            let tw = tex_size.w as f32;
+            let th = tex_size.h as f32;
+            let uv_bounds = [0.5 / tw, 0.5 / th, (tw - 0.5) / tw, (th - 0.5) / th];
+            let dst_offset = [
+                (dst.loc.x - self.shape_rect.loc.x) as f32,
+                (dst.loc.y - self.shape_rect.loc.y) as f32,
+            ];
+            let win_size = [
+                self.shape_rect.size.w.max(1) as f32,
+                self.shape_rect.size.h.max(1) as f32,
+            ];
+            let uniforms = [
+                Uniform::new("u_uv0", uv0),
+                Uniform::new("u_inv_mat", inv_mat),
+                Uniform::new("u_fwd_mat", fwd_mat),
+                Uniform::new("u_uv_bounds", uv_bounds),
+                Uniform::new("u_dst_offset", dst_offset),
+                Uniform::new("u_win_size", win_size),
+                Uniform::new("u_radii", [self.top_radius_phys, self.bottom_radius_phys]),
+                Uniform::new("u_scale", self.scale_factor),
+                Uniform::new("u_opacity", 1.0_f32),
+                Uniform::new("u_tint", self.tint_rgba),
+            ];
+            return frame.render_texture_from_to(
+                &self.texture,
+                src,
+                dst,
+                damage,
+                &[],
+                Transform::Normal,
+                self.alpha,
+                Some(prog),
+                &uniforms,
+            );
+        }
+
+        frame.render_texture_from_to(
+            &self.texture,
+            src,
+            dst,
+            damage,
+            &[],
+            Transform::Normal,
+            self.alpha,
+            None,
+            &[],
+        )
+    }
+}

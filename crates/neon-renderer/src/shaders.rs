@@ -491,6 +491,151 @@ void main() {
 }
 "#;
 
+/// Apple Liquid Glass shader for floating Mac Dynamic Island capsules & Dock Switcher pills.
+/// Combines blurred backdrop Snell-edge refraction, R/G/B chromatic rim dispersion, adaptive
+/// luminance-aware frosted clarity + vibrancy boost, sculpted 3D overhead/caustic specular
+/// bevels, and a soft ambient Mac elevation shadow around the outer capsule contour.
+pub const LIQUID_GLASS_FRAGMENT_SHADER: &str = r#"
+#version 100
+
+//_DEFINES_
+
+#if defined(EXTERNAL)
+#extension GL_OES_EGL_image_external : require
+#endif
+
+#ifdef GL_FRAGMENT_PRECISION_HIGH
+precision highp float;
+#else
+precision mediump float;
+#endif
+
+#if defined(EXTERNAL)
+uniform samplerExternalOES tex;
+#else
+uniform sampler2D tex;
+#endif
+
+uniform float alpha;
+varying vec2 v_coords;
+
+#if defined(DEBUG_FLAGS)
+uniform float tint;
+#endif
+
+uniform vec2 u_uv0;
+uniform vec4 u_inv_mat;
+uniform vec4 u_fwd_mat;
+uniform vec4 u_uv_bounds;
+uniform vec2 u_dst_offset;
+uniform vec2 u_win_size;
+uniform vec2 u_radii;
+uniform float u_scale;
+uniform float u_opacity;
+uniform vec4 u_tint;
+
+void main() {
+    vec2 d_uv = v_coords - u_uv0;
+    vec2 win_pos = u_dst_offset + vec2(dot(u_inv_mat.xy, d_uv), dot(u_inv_mat.zw, d_uv));
+
+    float s = max(u_scale, 1.0);
+    vec2 half_size = max(u_win_size * 0.5, vec2(1.0));
+    vec2 p = win_pos - half_size;
+    float r = (p.y < 0.0) ? u_radii.x : u_radii.y;
+    r = clamp(r, 0.0, min(half_size.x, half_size.y));
+
+    vec2 q = abs(p) - half_size + vec2(r);
+    float sdf = length(max(q, vec2(0.0))) + min(max(q.x, q.y), 0.0) - r;
+
+    // Outward SDF normal (pure GLSL ES 1.00 without derivative extensions)
+    vec2 sgn = vec2(p.x < 0.0 ? -1.0 : 1.0, p.y < 0.0 ? -1.0 : 1.0);
+    vec2 n_local = (q.x > 0.0 && q.y > 0.0)
+        ? normalize(q)
+        : ((q.x > q.y) ? vec2(1.0, 0.0) : vec2(0.0, 1.0));
+    vec2 norm = n_local * sgn;
+
+    // Soft ambient Mac elevation shadow just outside the capsule
+    float outer_d = max(sdf, 0.0);
+    float shadow_falloff = exp(-outer_d / (3.4 * s)) * (1.0 - smoothstep(4.5 * s, 8.5 * s, outer_d));
+    float shadow_dir = mix(0.65, 1.20, clamp(norm.y * 0.5 + 0.5, 0.0, 1.0));
+    float shadow_a = 0.28 * shadow_falloff * shadow_dir * u_opacity * alpha;
+
+    float glass_mask = 1.0 - smoothstep(-0.75, 0.75, sdf);
+    if (glass_mask <= 0.002) {
+        gl_FragColor = vec4(0.0, 0.0, 0.0, shadow_a);
+        return;
+    }
+
+    float depth = max(-sdf, 0.0) / s;
+    float min_half_log = min(half_size.x, half_size.y) / s;
+    float bevel_w = clamp(min_half_log * 0.72, 9.0, 24.0);
+    float t = clamp(1.0 - depth / bevel_w, 0.0, 1.0);
+
+    // Snell-inspired curved meniscus edge refraction + gentle spherical dome lensing
+    float rim_bend = pow(t, 1.70) * (22.0 * s);
+    vec2 norm_pos = p / half_size;
+    vec2 dome_bend = -norm_pos * (2.6 * s * (1.0 - t * 0.45));
+    vec2 refract_px = -norm * rim_bend + dome_bend;
+
+    // Subtle Apple prismatic R/G/B dispersion localized to the high-curvature rim
+    float disp_scale = 0.30 * pow(t, 1.30);
+    vec2 off_g = vec2(dot(u_fwd_mat.xy, refract_px), dot(u_fwd_mat.zw, refract_px));
+    vec2 off_r = off_g * (1.0 + disp_scale);
+    vec2 off_b = off_g * (1.0 - disp_scale);
+
+    vec2 lo = u_uv_bounds.xy;
+    vec2 hi = u_uv_bounds.zw;
+    vec3 bg_r = texture2D(tex, clamp(v_coords + off_r, lo, hi)).rgb;
+    vec3 bg_g = texture2D(tex, clamp(v_coords + off_g, lo, hi)).rgb;
+    vec3 bg_b = texture2D(tex, clamp(v_coords + off_b, lo, hi)).rgb;
+    vec3 refracted = vec3(bg_r.r, bg_g.g, bg_b.b);
+
+    // Jewel-like vibrancy boost so underlying wallpaper/windows stay luminous through glass
+    float lum = dot(refracted, vec3(0.2126, 0.7152, 0.0722));
+    vec3 vibrant = clamp(mix(vec3(lum), refracted, 1.30), 0.0, 1.0);
+
+    // Adaptive luminance-aware smoky optical glaze for crisp white text legibility
+    float scrim_a = mix(0.20, 0.50, smoothstep(0.16, 0.75, lum));
+    vec3 glass_tint = mix(vec3(0.15, 0.19, 0.27), vec3(0.05, 0.07, 0.12), smoothstep(0.18, 0.75, lum));
+    vec3 body = mix(vibrant, glass_tint, scrim_a);
+
+    // Optional ambient palette tint (e.g. active music artwork sweep)
+    if (u_tint.a > 0.001) {
+        body = mix(body, u_tint.rgb * 0.85 + vec3(0.10), clamp(u_tint.a * 0.28, 0.0, 0.35));
+    }
+
+    // Subtle upper dome illumination + inner Fresnel rim glow
+    float vertical_grad = clamp(win_pos.y / max(u_win_size.y, 1.0), 0.0, 1.0);
+    body += vec3(0.10, 0.12, 0.16) * pow(1.0 - vertical_grad, 2.1) * (0.45 + 0.55 * t);
+    body += vec3(0.14, 0.16, 0.20) * pow(t, 2.8);
+
+    // Sculpted 3D overhead studio specular rim highlight + bottom caustic bounce
+    float rim_band = 1.0 - smoothstep(0.45, 2.2, depth);
+    float sharp_lip = 1.0 - smoothstep(0.0, 1.2, depth);
+    float top_light = max(dot(norm, normalize(vec2(-0.28, -0.96))), 0.0);
+    float bottom_bounce = max(dot(norm, normalize(vec2(0.22, 0.97))), 0.0);
+    float spec = sharp_lip * (0.20 + 0.54 * pow(top_light, 1.35) + 0.28 * pow(bottom_bounce, 1.7))
+               + rim_band  * (0.06 + 0.16 * pow(top_light, 1.8) + 0.10 * pow(bottom_bounce, 2.0));
+    body = mix(body, vec3(0.97, 0.99, 1.0), clamp(spec, 0.0, 0.78));
+
+    // Faint dark hairline at the extreme outer boundary for crisp contrast on bright wallpapers
+    float edge_contrast = (1.0 - smoothstep(0.0, 0.75, depth)) * 0.16;
+    body = mix(body, vec3(0.02, 0.03, 0.05), edge_contrast);
+
+    float g_a = glass_mask * u_opacity * alpha;
+    float s_a = (1.0 - glass_mask) * shadow_a;
+    vec3 premul = body * g_a;
+    float out_a = clamp(g_a + s_a, 0.0, 1.0);
+
+#if defined(DEBUG_FLAGS)
+    if (tint == 1.0)
+        premul = vec3(0.0, 0.2, 0.0) + premul * 0.8;
+#endif
+
+    gl_FragColor = vec4(premul, out_a);
+}
+"#;
+
 /// Compiled NEON DE custom shader suite cached for the lifetime of a `GlesRenderer`.
 #[derive(Debug, Clone)]
 pub struct NeonShaders {
@@ -502,6 +647,7 @@ pub struct NeonShaders {
     pub rounded_rect: GlesPixelProgram,
     pub rounded_window: GlesTexProgram,
     pub blur_pass: GlesTexProgram,
+    pub liquid_glass: GlesTexProgram,
 }
 
 impl NeonShaders {
@@ -591,6 +737,22 @@ impl NeonShaders {
             ],
         )?;
 
+        let liquid_glass = renderer.compile_custom_texture_shader(
+            LIQUID_GLASS_FRAGMENT_SHADER,
+            &[
+                UniformName::new("u_uv0", UniformType::_2f),
+                UniformName::new("u_inv_mat", UniformType::_4f),
+                UniformName::new("u_fwd_mat", UniformType::_4f),
+                UniformName::new("u_uv_bounds", UniformType::_4f),
+                UniformName::new("u_dst_offset", UniformType::_2f),
+                UniformName::new("u_win_size", UniformType::_2f),
+                UniformName::new("u_radii", UniformType::_2f),
+                UniformName::new("u_scale", UniformType::_1f),
+                UniformName::new("u_opacity", UniformType::_1f),
+                UniformName::new("u_tint", UniformType::_4f),
+            ],
+        )?;
+
         Ok(Self {
             shadow,
             border,
@@ -600,6 +762,7 @@ impl NeonShaders {
             rounded_rect,
             rounded_window,
             blur_pass,
+            liquid_glass,
         })
     }
 }

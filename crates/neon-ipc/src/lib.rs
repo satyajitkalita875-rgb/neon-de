@@ -222,7 +222,32 @@ impl Default for EffectsInfo {
 /// Appearance & effects payload revision emitted by current `neon-compositor` builds.
 /// Older pre-restart compositors omit or emit a lower revision, allowing `neon-shell`
 /// to gracefully overlay newly added shell preferences from XDG config until next login.
-pub const APPEARANCE_PROTOCOL_REV: u32 = 6;
+pub const APPEARANCE_PROTOCOL_REV: u32 = 7;
+
+/// Screen-space Liquid Glass region reported by `neon-shell` for `neon-dynamic-island`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GlassShapeRect {
+    /// Horizontal offset inside the `neon-dynamic-island` layer surface (logical px).
+    pub x: f32,
+    /// Vertical offset inside the `neon-dynamic-island` layer surface (logical px).
+    pub y: f32,
+    /// Width of the glass capsule (logical px).
+    pub width: f32,
+    /// Height of the glass capsule (logical px).
+    pub height: f32,
+    /// Top corner radius (logical px).
+    pub top_radius: f32,
+    /// Bottom corner radius (logical px).
+    pub bottom_radius: f32,
+    /// Optional concave top outer ear radius (`0.0` for floating Mac pills).
+    pub ear_radius: f32,
+    /// Overall visibility alpha (`0.0..=1.0`).
+    pub alpha: f32,
+    /// Optional subtle accent/album RGB tint (`0.0..=1.0` per channel).
+    pub tint_rgb: [f32; 3],
+    /// Strength of `tint_rgb` blend (`0.0..=1.0`).
+    pub tint_strength: f32,
+}
 
 fn default_blur_strength() -> f32 {
     1.0
@@ -722,6 +747,10 @@ pub enum IpcRequest {
     },
     Subscribe {
         topics: Vec<EventTopic>,
+    },
+    /// Set screen-space Liquid Glass shapes for the `neon-dynamic-island` layer surface.
+    SetDynamicIslandGlass {
+        regions: Vec<GlassShapeRect>,
     },
 }
 

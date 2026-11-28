@@ -4754,6 +4754,13 @@ button.neon-notch-note-item.active {{
     border-color: rgba(255, 214, 10, 0.42);
 }}
 
+scrolledwindow.neon-notch-note-scroll {{
+    background-color: #1C1C1E;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 13px;
+    padding: 6px 8px;
+}}
+
 textview.neon-island-note-editor,
 textview.neon-island-note-editor > text {{
     background-color: transparent;
@@ -5050,6 +5057,301 @@ flowbox.neon-notch-store-grid > flowboxchild {{
 .neon-notch-mod-badge.badge-green {{ background-color: #30D158; }}
 .neon-notch-mod-badge.badge-orange {{ background-color: #FF9500; }}
 .neon-notch-mod-badge.badge-cyan {{ background-color: #32ADE6; }}
+
+/* =========================================================================
+ * APPLE LIQUID GLASS THEME OVERRIDES (.neon-island-canvas.liquid-glass)
+ * Cohesive macOS Tahoe translucent glass hierarchy across every module
+ * ========================================================================= */
+.neon-island-canvas.liquid-glass label {{
+    text-shadow: 0 1px 3px rgba(0, 0, 0, 0.36);
+}}
+
+.neon-island-canvas.liquid-glass .neon-island-hero-clock,
+.neon-island-canvas.liquid-glass .neon-island-hero-time,
+.neon-island-canvas.liquid-glass .neon-island-timer-hero {{
+    text-shadow: 0 2px 10px rgba(0, 0, 0, 0.42);
+}}
+
+.neon-island-canvas.liquid-glass .neon-notch-store-sub,
+.neon-island-canvas.liquid-glass .neon-island-eyebrow,
+.neon-island-canvas.liquid-glass .neon-island-muted-xs,
+.neon-island-canvas.liquid-glass .neon-island-sub-lbl,
+.neon-island-canvas.liquid-glass .neon-island-clip-meta,
+.neon-island-canvas.liquid-glass .neon-island-media-artist,
+.neon-island-canvas.liquid-glass .neon-island-media-time,
+.neon-island-canvas.liquid-glass .neon-island-time-tag,
+.neon-island-canvas.liquid-glass .neon-ios-notif-eyebrow,
+.neon-island-canvas.liquid-glass .neon-ios-notif-body,
+.neon-island-canvas.liquid-glass .neon-island-empty-icon,
+.neon-island-canvas.liquid-glass .neon-ios-silent-lbl.muted-off {{
+    color: rgba(242, 246, 255, 0.84);
+}}
+
+.neon-island-canvas.liquid-glass entry.neon-island-calc-entry {{
+    color: #FFFFFF;
+    text-shadow: 0 1px 4px rgba(0, 0, 0, 0.40);
+}}
+
+.neon-island-canvas.liquid-glass entry.neon-island-calc-entry text placeholder {{
+    color: rgba(242, 246, 255, 0.64);
+}}
+
+.neon-island-canvas.liquid-glass .neon-island-calc-eq {{
+    color: rgba(242, 246, 255, 0.78);
+}}
+
+.neon-island-canvas.liquid-glass .neon-island-calc-hero,
+.neon-island-canvas.liquid-glass .neon-island-calc-hero.empty {{
+    color: #FFFFFF;
+    text-shadow: 0 2px 6px rgba(0, 0, 0, 0.42);
+}}
+
+/* Floating Bottom Dock Switcher Pill */
+.neon-island-canvas.liquid-glass button.neon-notch-dock-btn {{
+    background-image: none;
+    background-color: transparent;
+    border: 1px solid transparent;
+    outline: none;
+    box-shadow: none;
+    color: rgba(240, 244, 255, 0.86);
+}}
+
+.neon-island-canvas.liquid-glass button.neon-notch-dock-btn:hover {{
+    background-image: linear-gradient(180deg, rgba(255, 255, 255, 0.22) 0%, rgba(255, 255, 255, 0.09) 100%);
+    background-color: rgba(255, 255, 255, 0.14);
+    border-color: rgba(255, 255, 255, 0.24);
+    color: #FFFFFF;
+}}
+
+.neon-island-canvas.liquid-glass button.neon-notch-dock-btn.active {{
+    background-image: linear-gradient(180deg, rgba(255, 255, 255, 0.32) 0%, rgba(255, 255, 255, 0.15) 100%);
+    background-color: rgba(255, 255, 255, 0.22);
+    border: 1px solid rgba(255, 255, 255, 0.44);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.50);
+    color: #FFFFFF;
+}}
+
+.neon-island-canvas.liquid-glass .neon-notch-dock-sep {{
+    background-color: rgba(255, 255, 255, 0.26);
+}}
+
+.neon-island-canvas.liquid-glass .neon-island-vsep {{
+    background-color: rgba(255, 255, 255, 0.20);
+}}
+
+/* Unified Secondary Glass Card / Tile / Input Well Token (consistent across Tools, Calc, Store, Clipboard, Notes, Files, Calendar, Battery, Notifs) */
+.neon-island-canvas.liquid-glass .neon-island-clip-row,
+.neon-island-canvas.liquid-glass .neon-notch-clip-card,
+.neon-island-canvas.liquid-glass button.neon-notch-file-tile,
+.neon-island-canvas.liquid-glass .neon-notch-cal-event,
+.neon-island-canvas.liquid-glass button.neon-notch-tool-tile,
+.neon-island-canvas.liquid-glass .neon-notch-store-card,
+.neon-island-canvas.liquid-glass .neon-island-calc-input-box,
+.neon-island-canvas.liquid-glass button.neon-island-calc-ans-box,
+.neon-island-canvas.liquid-glass entry.neon-island-search,
+.neon-island-canvas.liquid-glass searchentry.neon-island-search,
+.neon-island-canvas.liquid-glass scrolledwindow.neon-notch-note-scroll,
+.neon-island-canvas.liquid-glass .neon-island-mini-strip,
+.neon-island-canvas.liquid-glass .neon-ios-notif-avatar,
+.neon-island-canvas.liquid-glass .neon-island-art,
+.neon-island-canvas.liquid-glass .neon-island-mini-art,
+.neon-island-canvas.liquid-glass .neon-island-clip-emblem {{
+    background-image: linear-gradient(160deg, rgba(255, 255, 255, 0.16) 0%, rgba(255, 255, 255, 0.06) 100%);
+    background-color: rgba(18, 24, 38, 0.18);
+    border: 1px solid rgba(255, 255, 255, 0.24);
+    outline: none;
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.28);
+}}
+
+.neon-island-canvas.liquid-glass .neon-island-clip-row:hover,
+.neon-island-canvas.liquid-glass .neon-notch-clip-card:hover,
+.neon-island-canvas.liquid-glass button.neon-notch-file-tile:hover,
+.neon-island-canvas.liquid-glass button.neon-notch-note-item:hover,
+.neon-island-canvas.liquid-glass button.neon-notch-tool-tile:hover,
+.neon-island-canvas.liquid-glass .neon-notch-store-card:hover,
+.neon-island-canvas.liquid-glass button.neon-island-calc-ans-box:hover,
+.neon-island-canvas.liquid-glass entry.neon-island-search:focus,
+.neon-island-canvas.liquid-glass searchentry.neon-island-search:focus,
+.neon-island-canvas.liquid-glass .neon-island-calc-input-box:focus-within,
+.neon-island-canvas.liquid-glass button.neon-island-notif-body-btn:hover {{
+    background-image: linear-gradient(160deg, rgba(255, 255, 255, 0.24) 0%, rgba(255, 255, 255, 0.10) 100%);
+    background-color: rgba(18, 24, 38, 0.22);
+    border-color: rgba(255, 255, 255, 0.42);
+}}
+
+.neon-island-canvas.liquid-glass textview.neon-island-note-editor,
+.neon-island-canvas.liquid-glass textview.neon-island-note-editor > text {{
+    background-image: none;
+    background-color: transparent;
+    border: none;
+    box-shadow: none;
+}}
+
+.neon-island-canvas.liquid-glass button.neon-notch-note-item {{
+    background-image: none;
+    background-color: transparent;
+    border: 1px solid transparent;
+    box-shadow: none;
+}}
+
+.neon-island-canvas.liquid-glass button.neon-notch-note-item.active,
+.neon-island-canvas.liquid-glass button.neon-notch-file-tile.selected,
+.neon-island-canvas.liquid-glass .neon-island-clip-row.selected {{
+    background-image: none;
+    background-color: alpha({accent}, 0.28);
+    border-color: alpha({accent}, 0.78);
+}}
+
+/* Apple Segmented Control Tray + Transparent Inactive Filter / Style Buttons */
+.neon-island-canvas.liquid-glass .neon-notch-style-seg {{
+    background-image: linear-gradient(180deg, rgba(255, 255, 255, 0.10) 0%, rgba(255, 255, 255, 0.04) 100%);
+    background-color: rgba(18, 24, 38, 0.18);
+    border: 1px solid rgba(255, 255, 255, 0.22);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.22);
+}}
+
+.neon-island-canvas.liquid-glass button.neon-island-filter-pill {{
+    background-image: none;
+    background-color: transparent;
+    border: 1px solid transparent;
+    box-shadow: none;
+    outline: none;
+    color: rgba(240, 244, 255, 0.76);
+}}
+
+.neon-island-canvas.liquid-glass button.neon-island-filter-pill:hover {{
+    background-image: none;
+    background-color: rgba(255, 255, 255, 0.12);
+    border-color: rgba(255, 255, 255, 0.18);
+    color: #FFFFFF;
+}}
+
+.neon-island-canvas.liquid-glass button.neon-island-filter-pill.active {{
+    background-image: linear-gradient(180deg, rgba(255, 255, 255, 0.30) 0%, rgba(255, 255, 255, 0.15) 100%);
+    background-color: rgba(255, 255, 255, 0.22);
+    border: 1px solid rgba(255, 255, 255, 0.46);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.50);
+    color: #FFFFFF;
+}}
+
+/* Unified Interactive Glass Pills & Buttons across All Modules */
+.neon-island-canvas.liquid-glass button.neon-island-mode-chip,
+.neon-island-canvas.liquid-glass button.neon-island-timer-start,
+.neon-island-canvas.liquid-glass button.neon-island-mini-btn,
+.neon-island-canvas.liquid-glass button.neon-island-mini-strip-btn,
+.neon-island-canvas.liquid-glass button.neon-island-action-pill,
+.neon-island-canvas.liquid-glass button.neon-island-icon-pill,
+.neon-island-canvas.liquid-glass button.neon-island-awake-btn,
+.neon-island-canvas.liquid-glass button.neon-island-close-btn,
+.neon-island-canvas.liquid-glass button.neon-island-clear-btn,
+.neon-island-canvas.liquid-glass button.neon-notch-cal-day,
+.neon-island-canvas.liquid-glass button.neon-ios-transport-btn {{
+    background-image: linear-gradient(180deg, rgba(255, 255, 255, 0.16) 0%, rgba(255, 255, 255, 0.06) 100%);
+    background-color: rgba(18, 24, 38, 0.16);
+    border: 1px solid rgba(255, 255, 255, 0.24);
+    outline: none;
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.26);
+    color: #FFFFFF;
+}}
+
+.neon-island-canvas.liquid-glass button.neon-island-mode-chip:hover,
+.neon-island-canvas.liquid-glass button.neon-island-timer-start:hover,
+.neon-island-canvas.liquid-glass button.neon-island-mini-btn:hover,
+.neon-island-canvas.liquid-glass button.neon-island-mini-strip-btn:hover,
+.neon-island-canvas.liquid-glass button.neon-island-action-pill:hover,
+.neon-island-canvas.liquid-glass button.neon-island-icon-pill:hover,
+.neon-island-canvas.liquid-glass button.neon-island-awake-btn:hover,
+.neon-island-canvas.liquid-glass button.neon-island-close-btn:hover,
+.neon-island-canvas.liquid-glass button.neon-island-clear-btn:hover,
+.neon-island-canvas.liquid-glass button.neon-notch-cal-day:hover,
+.neon-island-canvas.liquid-glass button.neon-ios-transport-btn:hover {{
+    background-image: linear-gradient(180deg, rgba(255, 255, 255, 0.26) 0%, rgba(255, 255, 255, 0.12) 100%);
+    background-color: rgba(18, 24, 38, 0.20);
+    border-color: rgba(255, 255, 255, 0.42);
+}}
+
+.neon-island-canvas.liquid-glass button.neon-island-action-pill.active,
+.neon-island-canvas.liquid-glass button.neon-island-icon-pill.active,
+.neon-island-canvas.liquid-glass button.neon-island-mini-strip-btn.active,
+.neon-island-canvas.liquid-glass button.neon-notch-cal-day.today,
+.neon-island-canvas.liquid-glass button.neon-notch-cal-day.selected {{
+    background-image: linear-gradient(180deg, rgba(255, 255, 255, 0.30) 0%, rgba(255, 255, 255, 0.15) 100%);
+    background-color: rgba(255, 255, 255, 0.22);
+    border-color: rgba(255, 255, 255, 0.56);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.52);
+}}
+
+.neon-island-canvas.liquid-glass button.neon-island-mode-chip.focus-active {{
+    background-image: none;
+    background-color: rgba(255, 159, 10, 0.26);
+    border-color: rgba(255, 159, 10, 0.62);
+    color: #FFB340;
+}}
+
+.neon-island-canvas.liquid-glass button.neon-island-mode-chip.break-active {{
+    background-image: none;
+    background-color: rgba(48, 209, 88, 0.24);
+    border-color: rgba(48, 209, 88, 0.60);
+    color: #5CE67E;
+}}
+
+.neon-island-canvas.liquid-glass button.neon-island-awake-btn.active {{
+    background-image: none;
+    background-color: rgba(255, 159, 10, 0.88);
+    border-color: rgba(255, 224, 166, 0.72);
+    color: #0B0E14;
+}}
+
+.neon-island-canvas.liquid-glass button.neon-island-clip-pin-btn,
+.neon-island-canvas.liquid-glass button.neon-island-clip-del-btn {{
+    background-image: none;
+    background-color: transparent;
+    border: 1px solid transparent;
+    color: rgba(240, 244, 255, 0.76);
+}}
+
+.neon-island-canvas.liquid-glass button.neon-island-clip-pin-btn:hover {{
+    background-color: rgba(255, 255, 255, 0.18);
+    color: #FFFFFF;
+}}
+
+.neon-island-canvas.liquid-glass button.neon-island-clip-pin-btn.pinned {{
+    background-color: alpha({accent}, 0.28);
+    border-color: alpha({accent}, 0.56);
+    color: #FFFFFF;
+}}
+
+.neon-island-canvas.liquid-glass button.neon-island-clip-del-btn:hover {{
+    background-color: rgba(255, 59, 48, 0.30);
+    color: #FF8A80;
+}}
+
+.neon-island-canvas.liquid-glass .neon-island-timer-pill,
+.neon-island-canvas.liquid-glass .neon-island-count-chip,
+.neon-island-canvas.liquid-glass .neon-island-kbd-chip,
+.neon-island-canvas.liquid-glass .neon-island-status-chip,
+.neon-island-canvas.liquid-glass .neon-notch-type-tag,
+.neon-island-canvas.liquid-glass .neon-notch-clip-code,
+.neon-island-canvas.liquid-glass .neon-island-stat-track {{
+    background-image: none;
+    background-color: rgba(255, 255, 255, 0.16);
+    border: 1px solid rgba(255, 255, 255, 0.24);
+    color: #FFFFFF;
+}}
+
+.neon-island-canvas.liquid-glass .neon-island-clip-scroller scrollbar slider {{
+    background-color: rgba(255, 255, 255, 0.28);
+}}
+
+.neon-island-canvas.liquid-glass .neon-island-clip-scroller scrollbar slider:hover {{
+    background-color: rgba(255, 255, 255, 0.48);
+}}
+
+.neon-island-canvas.liquid-glass scale.neon-island-slider > trough {{
+    background-image: none;
+    background-color: rgba(255, 255, 255, 0.22);
+    border: 1px solid rgba(255, 255, 255, 0.24);
+}}
 
 /* =========================================================================
  * DOCK HOVER LIVE WINDOW PREVIEW POPUP (Unified Single-Box Frosted Glass)

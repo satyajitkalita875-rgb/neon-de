@@ -100,6 +100,125 @@ pub fn load_blurred_texture(
     Some(tex.upcast())
 }
 
+/// Loads the wallpaper cover-cropped to `output_w × output_h` and returns a blurred top-center
+/// `crop_w × crop_h` `cairo::ImageSurface` (`Format::ARgb32`) + average luminance (`0.0..=1.0`) for
+/// immediate Cairo Apple Liquid Glass optical refraction when running on a pre-restart compositor.
+pub fn load_top_center_blurred_glass_surface(
+    path: &Path,
+    output_w: i32,
+    output_h: i32,
+    crop_w: i32,
+    crop_h: i32,
+    blur_radius: usize,
+) -> Option<(gtk4::cairo::ImageSurface, f64)> {
+    if output_w <= 0 || output_h <= 0 || crop_w <= 0 || crop_h <= 0 {
+        return None;
+    }
+    let (_, orig_w, orig_h) = gdk_pixbuf::Pixbuf::file_info(path)?;
+    if orig_w <= 0 || orig_h <= 0 {
+        return None;
+    }
+    let half_out_w = (output_w.max(crop_w) / 2).max((crop_w / 2).max(1));
+    let half_out_h = (output_h.max(crop_h) / 2).max((crop_h / 2).max(1));
+    let cover_scale = (f64::from(half_out_w) / f64::from(orig_w))
+        .max(f64::from(half_out_h) / f64::from(orig_h));
+    let scaled_w = ((f64::from(orig_w) * cover_scale).round() as i32).max(half_out_w);
+    let scaled_h = ((f64::from(orig_h) * cover_scale).round() as i32).max(half_out_h);
+
+    let raw_pb = gdk_pixbuf::Pixbuf::from_file_at_scale(path, scaled_w, scaled_h, false).ok()?;
+    let pb = if raw_pb.has_alpha() {
+        raw_pb
+    } else {
+        raw_pb.add_alpha(false, 0, 0, 0).ok()?
+    };
+    let pb_w = pb.width() as usize;
+    let pb_h = pb.height() as usize;
+    let ch_w = ((crop_w / 2).max(1) as usize).min(pb_w);
+    let ch_h = ((crop_h / 2).max(1) as usize).min(pb_h);
+    if ch_w == 0 || ch_h == 0 {
+        return None;
+    }
+    let stride = pb.rowstride() as usize;
+    let src_pixels = unsafe { pb.pixels() };
+
+    // Top-center screen crop inside cover-scaled wallpaper (`y0` aligns screen top edge).
+    let x0 = (pb_w.saturating_sub(ch_w)) / 2;
+    let y0 = (pb_h.saturating_sub(half_out_h as usize)) / 2;
+    let mut buf = vec![0u8; ch_w * ch_h * 4];
+    for y in 0..ch_h {
+        let sy = (y0 + y).min(pb_h - 1);
+        let src_row = &src_pixels[sy * stride + x0 * 4..sy * stride + (x0 + ch_w) * 4];
+        let dst_row = &mut buf[y * ch_w * 4..(y + 1) * ch_w * 4];
+        dst_row.copy_from_slice(src_row);
+    }
+
+    if blur_radius > 0 {
+        let mut tmp = vec![0u8; ch_w * ch_h * 4];
+        for _ in 0..3 {
+            box_blur_h(&buf, &mut tmp, ch_w, ch_h, blur_radius);
+            box_blur_v(&tmp, &mut buf, ch_w, ch_h, blur_radius);
+        }
+    }
+
+    // Apply vibrant Liquid Glass chroma lift + compute average perceptual luminance.
+    let mut lum_sum = 0.0_f64;
+    let px_count = (ch_w * ch_h).max(1) as f64;
+    for px in buf.chunks_exact_mut(4) {
+        let r = f32::from(px[0]);
+        let g = f32::from(px[1]);
+        let b = f32::from(px[2]);
+        let luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+        lum_sum += f64::from(luma) / 255.0;
+        px[0] = (luma + (r - luma) * 1.24).clamp(0.0, 255.0) as u8;
+        px[1] = (luma + (g - luma) * 1.24).clamp(0.0, 255.0) as u8;
+        px[2] = (luma + (b - luma) * 1.24).clamp(0.0, 255.0) as u8;
+        px[3] = 255;
+    }
+    let avg_lum = (lum_sum / px_count).clamp(0.0, 1.0);
+
+    // Bilinearly upsample 2× into crisp `crop_w × crop_h` ARGB32 Cairo ImageSurface.
+    let mut surf =
+        gtk4::cairo::ImageSurface::create(gtk4::cairo::Format::ARgb32, crop_w, crop_h).ok()?;
+    let dst_stride = surf.stride() as usize;
+    {
+        let mut data = surf.data().ok()?;
+        let out_w_u = crop_w as usize;
+        let out_h_u = crop_h as usize;
+        for dy in 0..out_h_u {
+            let fy = ((dy as f32 + 0.5) * (ch_h as f32 / out_h_u as f32) - 0.5)
+                .clamp(0.0, (ch_h - 1) as f32);
+            let y_lo = fy.floor() as usize;
+            let y_hi = (y_lo + 1).min(ch_h - 1);
+            let wy = fy - y_lo as f32;
+            let row_bytes = &mut data[dy * dst_stride..dy * dst_stride + out_w_u * 4];
+            for dx in 0..out_w_u {
+                let fx = ((dx as f32 + 0.5) * (ch_w as f32 / out_w_u as f32) - 0.5)
+                    .clamp(0.0, (ch_w - 1) as f32);
+                let x_lo = fx.floor() as usize;
+                let x_hi = (x_lo + 1).min(ch_w - 1);
+                let wx = fx - x_lo as f32;
+
+                let p00 = &buf[(y_lo * ch_w + x_lo) * 4..][..4];
+                let p10 = &buf[(y_lo * ch_w + x_hi) * 4..][..4];
+                let p01 = &buf[(y_hi * ch_w + x_lo) * 4..][..4];
+                let p11 = &buf[(y_hi * ch_w + x_hi) * 4..][..4];
+
+                let interp = |c: usize| -> u32 {
+                    let top = f32::from(p00[c]) * (1.0 - wx) + f32::from(p10[c]) * wx;
+                    let bot = f32::from(p01[c]) * (1.0 - wx) + f32::from(p11[c]) * wx;
+                    (top * (1.0 - wy) + bot * wy).clamp(0.0, 255.0).round() as u32
+                };
+                let r = interp(0);
+                let g = interp(1);
+                let b = interp(2);
+                let pixel = (255u32 << 24) | (r << 16) | (g << 8) | b;
+                row_bytes[dx * 4..dx * 4 + 4].copy_from_slice(&pixel.to_ne_bytes());
+            }
+        }
+    }
+    Some((surf, avg_lum))
+}
+
 fn box_blur_h(src: &[u8], dst: &mut [u8], w: usize, h: usize, r: usize) {
     let win = (2 * r + 1) as u32;
     let wm1 = (w - 1) as isize;

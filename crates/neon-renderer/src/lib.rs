@@ -11,6 +11,8 @@ pub mod rounded;
 pub mod screenshot;
 pub mod shaders;
 
+pub use backdrop_blur::DynamicIslandGlassRect;
+
 use std::{
     collections::{HashMap, HashSet},
     time::Instant,
@@ -50,7 +52,8 @@ use tracing::{info, warn};
 
 use crate::{
     backdrop_blur::{
-        BlurTargets, BlurredBackdropElement, CHROME_BLUR_CACHE_TTL, OVERLAY_BLUR_CACHE_TTL,
+        BlurTargets, BlurredBackdropElement, CHROME_BLUR_CACHE_TTL, LiquidGlassElement,
+        OVERLAY_BLUR_CACHE_TTL,
     },
     close_ghost::{ClosingGhost, ClosingGhostElement},
     cursor::CursorCache,
@@ -176,6 +179,7 @@ render_elements! {
     RoundedWayland=RoundedSurfaceElement,
     RescaledRoundedWayland=RescaleRenderElement<RoundedSurfaceElement>,
     BlurredBackdrop=BlurredBackdropElement,
+    LiquidGlass=LiquidGlassElement,
     ClosingGhost=ClosingGhostElement,
     Memory=MemoryRenderBufferRenderElement<GlesRenderer>,
     Shader=PixelShaderElement,
@@ -252,6 +256,9 @@ pub struct NeonRenderer {
     blur_element_ids: HashMap<String, Id>,
     ws_slide_layer_ids: HashMap<String, Vec<Id>>,
     mapped_blur_overlays: HashSet<String>,
+    island_glass_regions: Vec<DynamicIslandGlassRect>,
+    island_glass_commit: CommitCounter,
+    last_glass_blur_commit: CommitCounter,
     overlay_anims: HashMap<String, OverlayAnim>,
     overlay_motion_enabled: bool,
     overlay_speed_scale: f32,
@@ -300,6 +307,9 @@ impl NeonRenderer {
             blur_element_ids: HashMap::new(),
             ws_slide_layer_ids: HashMap::new(),
             mapped_blur_overlays: HashSet::new(),
+            island_glass_regions: Vec::new(),
+            island_glass_commit: CommitCounter::default(),
+            last_glass_blur_commit: CommitCounter::default(),
             overlay_anims: HashMap::new(),
             overlay_motion_enabled: true,
             overlay_speed_scale: 1.0,
@@ -319,6 +329,15 @@ impl NeonRenderer {
     pub fn set_motion_config(&mut self, animations_enabled: bool, speed_scale: f32) {
         self.overlay_motion_enabled = animations_enabled;
         self.overlay_speed_scale = speed_scale.clamp(0.5, 2.5);
+    }
+
+    /// Updates screen-space Liquid Glass capsule geometry for `neon-dynamic-island`.
+    pub fn set_dynamic_island_glass(&mut self, regions: &[DynamicIslandGlassRect]) {
+        if self.island_glass_regions.as_slice() != regions {
+            self.island_glass_regions.clear();
+            self.island_glass_regions.extend_from_slice(regions);
+            self.island_glass_commit.increment();
+        }
     }
 
     pub fn has_shaders(&self) -> bool {
@@ -1558,9 +1577,16 @@ impl NeonRenderer {
             with_chrome
         };
 
+        let has_island_glass = !self.island_glass_regions.is_empty()
+            && front_overlays
+                .iter()
+                .any(|(l, _)| l.namespace() == "neon-dynamic-island");
+
         // Fast path when no `Layer::Overlay` surfaces are mapped (0 extra allocations / GPU passes).
         if blur_overlays.is_empty() {
-            self.blur_targets.invalidate();
+            if !has_island_glass {
+                self.blur_targets.invalidate();
+            }
             self.mapped_blur_overlays.clear();
             // Keep any fresh IPC PendingOpen / Opening trigger until GTK commits its first buffer.
             self.overlay_anims.retain(|_, anim| {
@@ -1582,14 +1608,24 @@ impl NeonRenderer {
         }
 
         // Pre-compute cached lightweight GPU Gaussian backdrop blur when Quick Settings,
-        // Workspaces Sidebar, or Power Menu is open and unified System Blur is active (> 0%).
-        let blurred_backdrop = if !blur_overlays.is_empty()
-            && active_blur_strength > 0.01
+        // Workspaces Sidebar, Power Menu, or Liquid Glass Dynamic Island is active.
+        let blurred_backdrop = if (!blur_overlays.is_empty() && active_blur_strength > 0.01
+            || has_island_glass)
             && let Some(shaders) = self.shaders.clone()
         {
             let heavy = blur_overlays
                 .iter()
                 .any(|(l, _, _, _)| l.namespace() == "neon-power-menu");
+            let strength = if !blur_overlays.is_empty() {
+                active_blur_strength
+            } else {
+                active_blur_strength.max(0.55)
+            };
+            let ttl = if !blur_overlays.is_empty() {
+                OVERLAY_BLUR_CACHE_TTL
+            } else {
+                CHROME_BLUR_CACHE_TTL
+            };
             self.blur_targets
                 .render_blurred_scene(
                     renderer,
@@ -1597,28 +1633,83 @@ impl NeonRenderer {
                     &shaders,
                     &elements,
                     heavy,
-                    active_blur_strength,
-                    OVERLAY_BLUR_CACHE_TTL,
+                    strength,
+                    ttl,
                 )
                 .map(|(tex, out_phys, commit, blend_alpha)| {
                     (tex, out_phys, commit, shaders.rounded_window, blend_alpha)
                 })
         } else {
-            if active_blur_strength <= 0.01 {
+            if active_blur_strength <= 0.01 && !has_island_glass {
                 self.blur_targets.invalidate();
             }
             None
         };
 
-        let mut final_elements: Vec<NeonRenderElement> =
-            Vec::with_capacity(elements.len() + front_overlays.len() * 2 + blur_overlays.len() * 3 + 4);
+        let mut final_elements: Vec<NeonRenderElement> = Vec::with_capacity(
+            elements.len()
+                + front_overlays.len() * 2
+                + self.island_glass_regions.len()
+                + blur_overlays.len() * 3
+                + 4,
+        );
 
         for (layer, loc) in &front_overlays {
             let phys_loc: Point<i32, Physical> = loc.to_physical_precise_round(scale_f);
             let layer_elements = AsRenderElements::<GlesRenderer>::render_elements::<
                 WaylandSurfaceRenderElement<GlesRenderer>,
             >(layer, renderer, phys_loc, scale, 1.0);
+            let had_surface = !layer_elements.is_empty();
             final_elements.extend(layer_elements.into_iter().map(NeonRenderElement::from));
+
+            if had_surface
+                && layer.namespace() == "neon-dynamic-island"
+                && has_island_glass
+                && let Some((ref blur_tex, out_phys, commit, _, _)) = blurred_backdrop
+                && let Some(ref shaders) = self.shaders
+            {
+                if commit != self.last_glass_blur_commit {
+                    self.last_glass_blur_commit = commit;
+                    self.island_glass_commit.increment();
+                }
+                for (idx, rect) in self.island_glass_regions.iter().enumerate() {
+                    if rect.width <= 1.0 || rect.height <= 1.0 || rect.alpha <= 0.002 {
+                        continue;
+                    }
+                    let sx = ((f64::from(loc.x) + f64::from(rect.x)) * scale_f).round() as i32;
+                    let sy = ((f64::from(loc.y) + f64::from(rect.y)) * scale_f).round() as i32;
+                    let sw = (f64::from(rect.width) * scale_f).round().max(1.0) as i32;
+                    let sh = (f64::from(rect.height) * scale_f).round().max(1.0) as i32;
+                    let shape_rect = Rectangle::new((sx, sy).into(), (sw, sh).into());
+                    let top_r = rect.top_radius * scale_f as f32;
+                    let bot_r = rect.bottom_radius * scale_f as f32;
+                    let glass_id = self
+                        .blur_element_ids
+                        .entry(format!("neon-dynamic-island-glass-{idx}"))
+                        .or_insert_with(Id::new)
+                        .clone();
+                    if let Some(glass_elem) = LiquidGlassElement::new(
+                        glass_id,
+                        self.island_glass_commit,
+                        blur_tex.clone(),
+                        out_phys,
+                        shape_rect,
+                        top_r,
+                        bot_r,
+                        scale_f as f32,
+                        [
+                            rect.tint_rgb[0],
+                            rect.tint_rgb[1],
+                            rect.tint_rgb[2],
+                            rect.tint_strength,
+                        ],
+                        Some(shaders.liquid_glass.clone()),
+                        rect.alpha.clamp(0.0, 1.0),
+                    ) {
+                        final_elements.push(NeonRenderElement::from(glass_elem));
+                    }
+                }
+            }
         }
         let front_overlay_elem_count = final_elements.len();
 

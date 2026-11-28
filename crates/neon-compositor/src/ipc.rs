@@ -1232,6 +1232,30 @@ fn handle_ipc_request(
                 },
             }
         }
+        IpcRequest::SetDynamicIslandGlass { regions } => {
+            let mapped: Vec<neon_renderer::DynamicIslandGlassRect> = regions
+                .into_iter()
+                .map(|r| neon_renderer::DynamicIslandGlassRect {
+                    x: r.x,
+                    y: r.y,
+                    width: r.width,
+                    height: r.height,
+                    top_radius: r.top_radius,
+                    bottom_radius: r.bottom_radius,
+                    ear_radius: r.ear_radius,
+                    alpha: r.alpha,
+                    tint_rgb: r.tint_rgb,
+                    tint_strength: r.tint_strength,
+                })
+                .collect();
+            if state.dynamic_island_glass_regions != mapped {
+                state.dynamic_island_glass_regions = mapped;
+                state.needs_redraw = true;
+            }
+            IpcResult::Ok {
+                payload: IpcPayload::Ack,
+            }
+        }
     }
 }
 

@@ -516,8 +516,9 @@ pub fn draw_notch_backdrop(
         }
         NotchAppearance::LiquidGlass => {
             let g = cairo::LinearGradient::new(x, y, x, y + h);
-            g.add_color_stop_rgba(0.0, 0.06, 0.07, 0.10, 0.90);
-            g.add_color_stop_rgba(1.0, 0.03, 0.04, 0.06, 0.86);
+            g.add_color_stop_rgba(0.0, 0.16, 0.21, 0.30, 0.44);
+            g.add_color_stop_rgba(0.55, 0.10, 0.13, 0.20, 0.38);
+            g.add_color_stop_rgba(1.0, 0.06, 0.08, 0.14, 0.46);
             let _ = cr.set_source(&g);
             cr.rectangle(x - 2.0, y - 2.0, w + 4.0, h + 4.0);
             let _ = cr.fill();
@@ -554,15 +555,262 @@ pub fn draw_notch_backdrop(
         cr.set_source_rgba(1.0, 0.23, 0.19, 0.28);
         cr.set_line_width(1.0);
         let _ = cr.stroke();
+    } else if matches!(appearance, NotchAppearance::LiquidGlass) {
+        let rim = cairo::LinearGradient::new(x, y, x + w * 0.35, y + h);
+        rim.add_color_stop_rgba(0.0, 1.0, 1.0, 1.0, 0.72);
+        rim.add_color_stop_rgba(0.32, 1.0, 1.0, 1.0, 0.22);
+        rim.add_color_stop_rgba(0.75, 1.0, 1.0, 1.0, 0.12);
+        rim.add_color_stop_rgba(1.0, 1.0, 1.0, 1.0, 0.38);
+        let _ = cr.set_source(&rim);
+        cr.set_line_width(1.2);
+        let _ = cr.stroke();
     } else {
-        let rim_a = match appearance {
-            NotchAppearance::LiquidGlass => 0.22,
-            _ => 0.11,
-        };
-        cr.set_source_rgba(1.0, 1.0, 1.0, rim_a);
+        cr.set_source_rgba(1.0, 1.0, 1.0, 0.11);
         cr.set_line_width(1.0);
         let _ = cr.stroke();
     }
+}
+
+/// Parameters controlling Apple Liquid Glass rendering across both GPU-composited mode
+/// (`gpu_backed = true`) and immediate pre-restart wallpaper-refraction fallback.
+pub struct LiquidGlassPaint<'a> {
+    pub wallpaper_crop: Option<&'a cairo::ImageSurface>,
+    pub wallpaper_avg_lum: f64,
+    pub gpu_backed: bool,
+    pub aura_kind: IslandAuraKind,
+    pub expanded_alpha: f64,
+    pub palette: NeonPalette,
+    pub neon_intensity: f64,
+    pub neon_phase: f64,
+    pub drag_hover: bool,
+}
+
+fn draw_liquid_glass_capsule(
+    cr: &cairo::Context,
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+    r: f64,
+    wp_offset_x: f64,
+    wp_offset_y: f64,
+    paint: &LiquidGlassPaint<'_>,
+) {
+    cr.set_antialias(cairo::Antialias::Best);
+    let r = r.clamp(12.0, (h * 0.5).min(w * 0.5));
+
+    if paint.gpu_backed {
+        // Real-time GPU `LIQUID_GLASS_FRAGMENT_SHADER` paints blur + Snell refraction + 3D rim.
+        // Only draw active state outlines (drag target / live recording) in Cairo to avoid double borders.
+        if paint.drag_hover {
+            rounded_rect_path(cr, x + 0.75, y + 0.75, w - 1.5, h - 1.5, (r - 0.75).max(8.0));
+            cr.set_source_rgba(0.04, 0.52, 1.0, 0.92);
+            cr.set_line_width(1.5);
+            let _ = cr.stroke();
+        } else if paint.aura_kind == IslandAuraKind::Recording {
+            rounded_rect_path(cr, x + 0.75, y + 0.75, w - 1.5, h - 1.5, (r - 0.75).max(8.0));
+            cr.set_source_rgba(1.0, 0.27, 0.23, 0.74);
+            cr.set_line_width(1.25);
+            let _ = cr.stroke();
+        }
+        return;
+    }
+
+    // 1. Soft ambient Mac floating elevation shadow.
+    let exp_t = paint.expanded_alpha.clamp(0.0, 1.0);
+    let shadow_scale = 0.45 + 0.55 * exp_t;
+    for i in (1..=14).rev() {
+        let t = f64::from(i) / 14.0;
+        let spread = (0.8 + 16.0 * t * t) * shadow_scale;
+        let dy = (1.0 + 6.0 * t) * shadow_scale;
+        let a = 0.014 * (-2.6 * t * t).exp() * shadow_scale;
+        if a > 0.001 {
+            rounded_rect_path(
+                cr,
+                x - spread * 0.5,
+                y + dy - spread * 0.25,
+                w + spread,
+                h + spread * 0.70,
+                (r + spread * 0.40).max(8.0),
+            );
+            cr.set_source_rgba(0.0, 0.0, 0.0, a);
+            let _ = cr.fill();
+        }
+    }
+
+    // 2. Optical Glass Body + Radial Rim Refraction clipped inside capsule.
+    let _ = cr.save();
+    rounded_rect_path(cr, x, y, w, h, r);
+    cr.clip();
+
+    if let Some(wp) = paint.wallpaper_crop {
+        let pat = cairo::SurfacePattern::create(wp);
+        pat.set_extend(cairo::Extend::Pad);
+        pat.set_filter(cairo::Filter::Bilinear);
+        let mut m = cairo::Matrix::identity();
+        m.translate(wp_offset_x, wp_offset_y);
+        pat.set_matrix(m);
+        let _ = cr.set_source(&pat);
+        let _ = cr.paint();
+
+        // Outer curved meniscus refraction ring (`EvenOdd` band radially magnified around center).
+        let bevel = (w.min(h) * 0.26).clamp(7.0, 17.0);
+        if w > bevel * 2.5 && h > bevel * 2.5 {
+            let _ = cr.save();
+            cr.set_fill_rule(cairo::FillRule::EvenOdd);
+            rounded_rect_path(cr, x, y, w, h, r);
+            rounded_rect_path(
+                cr,
+                x + bevel,
+                y + bevel,
+                w - bevel * 2.0,
+                h - bevel * 2.0,
+                (r - bevel).max(4.0),
+            );
+            cr.clip();
+
+            let cx = x + w * 0.5 + wp_offset_x;
+            let cy = y + h * 0.5 + wp_offset_y;
+            let refract_pat = cairo::SurfacePattern::create(wp);
+            refract_pat.set_extend(cairo::Extend::Pad);
+            refract_pat.set_filter(cairo::Filter::Bilinear);
+            let mut rm = cairo::Matrix::identity();
+            rm.translate(cx, cy);
+            rm.scale(0.90, 0.88);
+            rm.translate(-cx + wp_offset_x, -cy + wp_offset_y);
+            refract_pat.set_matrix(rm);
+            let _ = cr.set_source(&refract_pat);
+            let _ = cr.paint();
+
+            // Subtle prismatic spectral shimmer inside the curved edge bevel.
+            let prism = cairo::LinearGradient::new(x, y, x + w, y + h);
+            prism.add_color_stop_rgba(0.0, 0.55, 0.85, 1.0, 0.14);
+            prism.add_color_stop_rgba(0.5, 1.0, 1.0, 1.0, 0.04);
+            prism.add_color_stop_rgba(1.0, 1.0, 0.68, 0.88, 0.11);
+            rounded_rect_path(cr, x + 0.8, y + 0.8, w - 1.6, h - 1.6, (r - 0.8).max(8.0));
+            let _ = cr.set_source(&prism);
+            cr.set_line_width(2.6);
+            let _ = cr.stroke();
+            let _ = cr.restore();
+        }
+    } else {
+        let base = cairo::LinearGradient::new(x, y, x, y + h);
+        base.add_color_stop_rgba(0.0, 0.16, 0.21, 0.30, 0.44);
+        base.add_color_stop_rgba(1.0, 0.07, 0.10, 0.16, 0.46);
+        let _ = cr.set_source(&base);
+        let _ = cr.paint();
+    }
+
+    // 3. Adaptive luminance-aware polarizing frost + media jewel tint + upper convex sheen.
+    let lum = paint.wallpaper_avg_lum.clamp(0.0, 1.0);
+    let scrim = 0.20 + 0.28 * lum;
+    let tint_r = 0.14 - 0.08 * lum;
+    let tint_g = 0.18 - 0.10 * lum;
+    let tint_b = 0.26 - 0.13 * lum;
+    let frost = cairo::LinearGradient::new(x, y, x, y + h);
+    frost.add_color_stop_rgba(0.0, tint_r, tint_g, tint_b, scrim);
+    frost.add_color_stop_rgba(1.0, tint_r * 0.55, tint_g * 0.55, tint_b * 0.65, scrim + 0.06);
+    let _ = cr.set_source(&frost);
+    let _ = cr.paint();
+
+    if paint.neon_intensity > 0.01 {
+        let _ = cr.save();
+        cr.push_group();
+        draw_amoled_media_sweep(
+            cr,
+            x,
+            y,
+            w,
+            h,
+            0.0,
+            paint.neon_phase,
+            paint.palette,
+            paint.neon_intensity,
+        );
+        let _ = cr.pop_group_to_source();
+        let _ = cr.paint_with_alpha(0.45);
+        let _ = cr.restore();
+    }
+
+    let dome = cairo::LinearGradient::new(x, y, x, y + h * 0.48);
+    dome.add_color_stop_rgba(0.0, 1.0, 1.0, 1.0, 0.16);
+    dome.add_color_stop_rgba(1.0, 1.0, 1.0, 1.0, 0.0);
+    let _ = cr.set_source(&dome);
+    let _ = cr.paint();
+
+    rounded_rect_path(cr, x + 1.5, y + 1.5, w - 3.0, h - 3.0, (r - 1.5).max(8.0));
+    cr.set_source_rgba(1.0, 1.0, 1.0, 0.15);
+    cr.set_line_width(2.2);
+    let _ = cr.stroke();
+    let _ = cr.restore();
+
+    // 4. Sculpted 3D overhead studio specular bevel + bottom bounce caustic + outer hairline contrast.
+    rounded_rect_path(cr, x, y, w, h, r);
+    cr.set_source_rgba(0.0, 0.0, 0.0, 0.28);
+    cr.set_line_width(0.8);
+    let _ = cr.stroke();
+
+    rounded_rect_path(cr, x + 0.65, y + 0.65, w - 1.3, h - 1.3, (r - 0.65).max(8.0));
+    if paint.drag_hover {
+        cr.set_source_rgba(0.04, 0.52, 1.0, 0.95);
+        cr.set_line_width(1.6);
+    } else if paint.aura_kind == IslandAuraKind::Recording {
+        cr.set_source_rgba(1.0, 0.27, 0.23, 0.76);
+        cr.set_line_width(1.3);
+    } else if paint.aura_kind == IslandAuraKind::Charging {
+        cr.set_source_rgba(0.19, 0.82, 0.35, 0.42);
+        cr.set_line_width(1.1);
+    } else if paint.aura_kind == IslandAuraKind::Silent {
+        cr.set_source_rgba(1.0, 0.23, 0.19, 0.38);
+        cr.set_line_width(1.1);
+    } else {
+        let rim = cairo::LinearGradient::new(x, y, x + w * 0.34, y + h);
+        rim.add_color_stop_rgba(0.0, 1.0, 1.0, 1.0, 0.78);
+        rim.add_color_stop_rgba(0.30, 1.0, 1.0, 1.0, 0.24);
+        rim.add_color_stop_rgba(0.75, 1.0, 1.0, 1.0, 0.14);
+        rim.add_color_stop_rgba(1.0, 1.0, 1.0, 1.0, 0.44);
+        let _ = cr.set_source(&rim);
+        cr.set_line_width(1.25);
+    }
+    let _ = cr.stroke();
+}
+
+/// Draws Apple Liquid Glass backdrop for the floating Mac Dynamic Island capsule.
+pub fn draw_notch_liquid_glass(
+    cr: &cairo::Context,
+    canvas_w: f64,
+    top_offset: f64,
+    w: f64,
+    h: f64,
+    radius: f64,
+    paint: &LiquidGlassPaint<'_>,
+) {
+    let w = (((w * 0.5).round()) * 2.0).max(112.0);
+    let h = h.round().max(30.0);
+    let x = ((canvas_w - w) * 0.5).round();
+    let y = top_offset.round();
+    let r = radius.clamp(14.0, (h * 0.5).min(w * 0.5));
+    draw_liquid_glass_capsule(cr, x, y, w, h, r, 0.0, 0.0, paint);
+}
+
+/// Draws Apple Liquid Glass backdrop for the floating Mac Dock Switcher capsule.
+pub fn draw_dock_pill_liquid_glass(
+    cr: &cairo::Context,
+    canvas_w: f64,
+    canvas_h: f64,
+    wp_offset_x: f64,
+    wp_offset_y: f64,
+    paint: &LiquidGlassPaint<'_>,
+) {
+    let pad_x = 12.0;
+    let pad_top = 4.0;
+    let pad_bot = 14.0;
+    let w = (canvas_w - pad_x * 2.0).max(40.0).round();
+    let h = (canvas_h - pad_top - pad_bot).max(24.0).round();
+    let x = pad_x;
+    let y = pad_top;
+    let r = (h * 0.5).clamp(12.0, 20.0);
+    draw_liquid_glass_capsule(cr, x, y, w, h, r, wp_offset_x, wp_offset_y, paint);
 }
 
 // =============================================================================
@@ -1409,23 +1657,23 @@ pub fn draw_dock_pill_backdrop(
 
     rounded_rect_path(cr, x, y, w, h, r);
     match appearance {
-        NotchAppearance::LiquidGlass => cr.set_source_rgba(0.05, 0.06, 0.09, 0.88),
+        NotchAppearance::LiquidGlass => cr.set_source_rgba(0.11, 0.15, 0.22, 0.44),
         _ => cr.set_source_rgba(0.0, 0.0, 0.0, 1.0),
     }
     let _ = cr.fill();
 
     rounded_rect_path(cr, x + 0.5, y + 0.5, w - 1.0, h - 1.0, (r - 0.5).max(8.0));
-    cr.set_source_rgba(
-        1.0,
-        1.0,
-        1.0,
-        if matches!(appearance, NotchAppearance::LiquidGlass) {
-            0.22
-        } else {
-            0.12
-        },
-    );
-    cr.set_line_width(1.0);
+    if matches!(appearance, NotchAppearance::LiquidGlass) {
+        let rim = cairo::LinearGradient::new(x, y, x + w * 0.35, y + h);
+        rim.add_color_stop_rgba(0.0, 1.0, 1.0, 1.0, 0.72);
+        rim.add_color_stop_rgba(0.32, 1.0, 1.0, 1.0, 0.22);
+        rim.add_color_stop_rgba(1.0, 1.0, 1.0, 1.0, 0.40);
+        let _ = cr.set_source(&rim);
+        cr.set_line_width(1.2);
+    } else {
+        cr.set_source_rgba(1.0, 1.0, 1.0, 0.12);
+        cr.set_line_width(1.0);
+    }
     let _ = cr.stroke();
 }
 
@@ -2041,5 +2289,50 @@ mod tests {
             (1.0, 1.0, 1.0, 1.0),
             UiVectorIcon::Close,
         );
+    }
+
+    #[test]
+    fn liquid_glass_backdrop_fallback_and_gpu_modes_render_cleanly() {
+        let wp_surf = cairo::ImageSurface::create(cairo::Format::ARgb32, 684, 456).unwrap();
+        {
+            let cr_wp = cairo::Context::new(&wp_surf).unwrap();
+            cr_wp.set_source_rgba(0.25, 0.65, 0.95, 1.0);
+            let _ = cr_wp.paint();
+        }
+
+        let surf_fb = cairo::ImageSurface::create(cairo::Format::ARgb32, 684, 240).unwrap();
+        let cr_fb = cairo::Context::new(&surf_fb).unwrap();
+        let paint_fb = LiquidGlassPaint {
+            wallpaper_crop: Some(&wp_surf),
+            wallpaper_avg_lum: 0.52,
+            gpu_backed: false,
+            aura_kind: IslandAuraKind::Idle,
+            expanded_alpha: 1.0,
+            palette: NeonPalette::default(),
+            neon_intensity: 0.0,
+            neon_phase: 0.0,
+            drag_hover: false,
+        };
+        draw_notch_liquid_glass(&cr_fb, 684.0, 10.0, 520.0, 180.0, 28.0, &paint_fb);
+        draw_dock_pill_liquid_glass(&cr_fb, 260.0, 54.0, 212.0, 194.0, &paint_fb);
+
+        let mut surf_gpu = cairo::ImageSurface::create(cairo::Format::ARgb32, 684, 240).unwrap();
+        let cr_gpu = cairo::Context::new(&surf_gpu).unwrap();
+        let paint_gpu = LiquidGlassPaint {
+            wallpaper_crop: None,
+            wallpaper_avg_lum: 0.35,
+            gpu_backed: true,
+            aura_kind: IslandAuraKind::Idle,
+            expanded_alpha: 1.0,
+            palette: NeonPalette::default(),
+            neon_intensity: 0.0,
+            neon_phase: 0.0,
+            drag_hover: false,
+        };
+        draw_notch_liquid_glass(&cr_gpu, 684.0, 10.0, 520.0, 180.0, 28.0, &paint_gpu);
+        // When `gpu_backed` is true and idle, Cairo skips opaque fill so GPU optical shader shows cleanly.
+        drop(cr_gpu);
+        let data = surf_gpu.data().unwrap();
+        assert!(data.iter().all(|&b| b == 0));
     }
 }

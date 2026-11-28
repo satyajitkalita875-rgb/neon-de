@@ -277,6 +277,7 @@ pub struct NeonState {
     pub last_dock_exclusive: i32,
     /// Queued compositor-driven GPU open/close animation triggers `(namespace, opening)`.
     pub pending_overlay_anims: Vec<(String, bool)>,
+    pub dynamic_island_glass_regions: Vec<neon_renderer::DynamicIslandGlassRect>,
     /// Active drag-to-snap glass preview & Windows 11 Snap Layouts drop bar state.
     pub drag_snap: DragSnapOverlayState,
     /// `true` while the pointer is hovering an interactive Auto-Tiling split divider.
@@ -399,6 +400,7 @@ impl NeonState {
             last_panel_height: 0,
             last_dock_exclusive: 0,
             pending_overlay_anims: Vec::new(),
+            dynamic_island_glass_regions: Vec::new(),
             drag_snap: DragSnapOverlayState::default(),
             hovering_tile_divider: false,
         }
